@@ -1,0 +1,102 @@
+Commander
+1 Hei Bai, Forest Guardian (TLE) 139
+
+Deck
+1 Plains (KTK) 250
+1 Island (KTK) 252
+1 Swamp (KTK) 254
+2 Forest (KTK) 258
+1 Command Tower (ELD) 333
+1 Cavern of Souls (LCI) 269
+1 Plaza of Heroes (EOS) 33
+1 Wooded Foothills (KTK) 249
+1 Flooded Strand (KTK) 233
+1 Polluted Delta (KTK) 239
+1 Bloodstained Mire (MH3) 216
+1 Windswept Heath (KTK) 248
+1 Arid Mesa (SPG) 109
+1 Scalding Tarn (MH2) 254
+1 Misty Rainforest (MH2) 250
+1 Marsh Flats (MH2) 248
+1 Verdant Catacombs (MH2) 260
+1 Hallowed Fountain (RNA) 251
+1 Breeding Pool (RNA) 246
+1 Blood Crypt (RNA) 245
+1 Stomping Ground (RNA) 259
+1 Steam Vents (GRN) 257
+1 Godless Shrine (RNA) 248
+1 Watery Grave (GRN) 259
+1 Sacred Foundry (GRN) 254
+1 Overgrown Tomb (GRN) 253
+1 Temple Garden (GRN) 258
+1 Boseiju, Who Endures (NEO) 266
+1 Eiganjo, Seat of the Empire (NEO) 268
+1 Otawara, Soaring City (NEO) 271
+1 Lush Portico (MKM) 263
+1 Birds of Paradise (BLC) 81
+1 Deathrite Shaman (RTR) 213
+1 Noble Hierarch (CONF) 87
+1 Ignoble Hierarch (MH2) 166
+1 Delighted Halfling (LTR) 158
+1 Sanctum Weaver (MH2) 171
+1 Mox Amber (DAR) 224
+1 Arcane Signet (ELD) 331
+1 Farseek (FCA) 45
+1 Exploration (DMR) 159
+1 Lightning Bolt (FCA) 40
+1 Swords to Plowshares (STA) 10
+1 Solitude (SPG) 44
+1 Get Lost (LCI) 14
+1 Leyline Binding (DMU) 24
+1 Binding the Old Gods (KHM) 206
+1 Wash Away (VOW) 87
+1 Subtlety (SPG) 45
+1 Destiny Spinner (THB) 168
+1 Time Wipe (WAR) 223
+1 Cyclonic Rift (RTR) 35
+1 Enlightened Tutor (MIR) 14
+1 Idyllic Tutor (MOR) 12
+1 Sterling Grove (MH2) 293
+1 Mystic Remora (TLE) 16
+1 Inquisitive Glimmer (DSK) 217
+1 Jukai Naturalist (NEO) 225
+1 Setessan Champion (THB) 198
+1 Sythis, Harvest's Hand (MH2) 214
+1 Esika, God of the Tree (KHM) 168
+1 Weaver of Harmony (NEO) 213
+1 Phelia, Exuberant Shepherd (MH3) 40
+1 Displacer Kitten (HBG) 115
+1 Thassa, Deep-Dwelling (THB) 71
+1 Ephemerate (STA) 5
+1 Ragavan, Nimble Pilferer (MUL) 86
+1 Endurance (SPG) 48
+1 Uro, Titan of Nature's Wrath (THB) 229
+1 Phlage, Titan of Fire's Fury (MH3) 197
+1 Atraxa, Grand Unifier (ONE) 196
+1 Craterhoof Behemoth (JMP) 385
+1 Temporal Manipulation (SPG) 0
+1 Honden of Night's Reach (CHK) 116
+1 Honden of Infinite Rage (CHK) 172
+1 Honden of Seeing Winds (CHK) 69
+1 Sanctum of All (M21) 225
+1 Sanctum of Calm Waters (M21) 68
+1 Sanctum of Fruitful Harvest (M21) 203
+1 Sanctum of Stone Fangs (M21) 120
+1 Sanctum of Tranquil Light (M21) 33
+1 Sanctum of Shattered Heights (M21) 157
+1 Go-Shintai of Hidden Cruelty (NEO) 97
+1 Go-Shintai of Shared Purpose (NEO) 14
+1 Go-Shintai of Life's Origin (NEC) 37
+1 Go-Shintai of Ancient Wars (NEO) 144
+1 Northern Air Temple (TLA) 111
+1 Southern Air Temple (TLA) 36
+1 Crescent Island Temple (TLA) 129
+1 Kyoshi Island Plaza (TLA) 184
+1 The Spirit Oasis (TLA) 72
+1 Cultivate (M21) 177
+1 Captain Sisay (TLE) 47
+1 Force of Will (SOA) 19
+1 Reflecting Pool (EOS) 36
+1 White Lotus Hideout (TLA) 281
+1 Command Beacon (FCA) 64
+1 Counterspell (FCA) 4

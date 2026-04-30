@@ -1,0 +1,6 @@
+*.json
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+bulk-meta.txt

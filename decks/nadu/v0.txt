@@ -1,0 +1,90 @@
+Commander
+1 A-Nadu, Winged Wisdom (MH3) 193
+
+Deck
+7 Forest (KTK) 258
+7 Island (KTK) 252
+1 Counterspell (FCA) 4
+1 Swiftfoot Boots (FDN) 258
+1 Llanowar Elves (FDN) 227
+1 Octopus Form (TLA) 66
+1 Jace, Unraveler of Secrets (AKR) 65
+1 Curiosity (JMP) 147
+1 Brainstorm (STA) 13
+1 Command Tower (ELD) 333
+1 Snow-Covered Island (KHM) 278
+2 Snow-Covered Forest (KHM) 284
+1 Utopia Sprawl (WOT) 63
+1 Jace Reawakened (OTJ) 271
+1 Lotus Cobra (ZNR) 193
+1 Badgermole Cub (TLA) 167
+1 Ranger's Guile (M21) 199
+1 You Find a Cursed Idol (AFR) 213
+1 Sea Gate Restoration (ZNR) 76
+1 Tireless Tracker (SIR) 219
+1 Tatyova, Benthic Druid (FDN) 247
+1 Growth Spiral (RNA) 178
+1 Arboreal Grazer (WAR) 149
+1 Crop Rotation (ULG) 98
+1 Once Upon a Time (ELD) 169
+1 Scalding Tarn (MH2) 254
+1 Arcane Signet (ELD) 331
+1 Restless Vinestalk (WOE) 261
+1 Khalni Ambush (PIO) 181
+1 Snakeskin Veil (OTJ) 181
+1 Tireless Provisioner (MH2) 180
+1 Split the Party (AFR) 76
+1 Winterthorn Blessing (MID) 251
+1 Mox Amber (DAR) 224
+1 Ride the Shoopuf (FIN) 197
+1 Tamiyo's Safekeeping (NEO) 211
+1 Consider (PIO) 51
+1 Kami of Bamboo Groves (Y22) 24
+1 Shore Up (DMU) 64
+1 Audacity (BRO) 169
+1 Bushwhack (FDN) 215
+1 Tyvar's Stand (ONE) 190
+1 Meeting of Minds (MOM) 66
+1 Mystic Remora (TLE) 16
+1 Miscast (M21) 57
+1 Elvish Mystic (M14) 169
+1 Snapcaster Mage (SIS) 23
+1 Nissa, Resurgent Animist (MAT) 22
+1 Royal Treatment (WOE) 183
+1 Hard-Hitting Question (MKM) 164
+1 Mythweaver Poq (Y24) 19
+1 Bristly Bill, Spine Sower (OTJ) 157
+1 Lavaspur Boots (OTJ) 243
+1 Lost Jitte (BIG) 23
+1 Desert (SPG) 37
+1 Sink into Stupor (MH3) 241
+1 Tamiyo, Inquisitive Student (MH3) 242
+1 Bridgeworks Battle (MH3) 249
+1 Collective Resistance (MH3) 147
+1 Fanatic of Rhonas (MH3) 152
+1 Silent Hallcreeper (DSK) 72
+1 Reliquary Tower (M19) 254
+1 Urza's Cave (MH3) 234
+1 Birds of Paradise (BLC) 81
+1 Annul (EOE) 46
+1 Hinterland Harbor (Y25) 5
+1 Breeding Pool (EOE) 251
+1 Botanical Sanctum (KLR) 281
+1 Willowrush Verge (DFT) 270
+1 Fountainport (BLB) 253
+1 Multiversal Passage (OM1) 181
+1 Prismatic Vista (SPG) 38
+1 Gemstone Caverns (EOS) 16
+1 Boseiju, Who Endures (NEO) 266
+1 Barkchannel Pathway (KHM) 251
+1 Misty Rainforest (MH2) 250
+1 Yavimaya, Cradle of Growth (MH2) 261
+1 Fabled Passage (ELD) 244
+1 Three Steps Ahead (OTJ) 75
+1 Lightning Greaves (MRD) 199
+1 Essence Flux (SIR) 67
+1 River's Rebuke (XLN) 71
+1 Wooded Foothills (KTK) 249
+1 Windswept Heath (KTK) 248
+1 Hedge Maze (MKM) 262
+1 Sublime Epiphany (M21) 74
