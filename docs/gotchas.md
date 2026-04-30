@@ -49,6 +49,26 @@ hint exists for art selection only.
 Validator implication: a card is "Arena-legal" iff **any** printing of
 that name has `arena` in its `games` array.
 
+## 3a. Multi-face cards: MTGA wants the FULL name with ` // `
+
+For any card whose Scryfall `layout` is one of:
+
+    split | adventure | modal_dfc | transform | flip
+
+MTGA's importer requires the full name including both halves and the
+literal ` // ` separator. Examples:
+
+    1 Unholy Annex // Ritual Chamber (DSK) 118        ✅ imports
+    1 Unholy Annex (DSK) 118                          ❌ MTGA: "card not found"
+    1 Brazen Borrower // Petty Theft (ELD) 39         ✅
+    1 Fable of the Mirror-Breaker // Reflection of Kiki-Jiki (NEO) 141  ✅
+
+`tools/mtg validate` enforces this as a hard error: any deck-line whose
+resolved card has `layout ∈ {split, adventure, modal_dfc, transform,
+flip}` must spell the full `name` (with ` // `). Front-only spellings
+fail validation with `mtga-import: '<front>' must be written as
+'<full>' for Arena to accept the deck import`.
+
 ## 4. Color identity for Brawl
 
 `color_identity` is computed by Scryfall and includes:
