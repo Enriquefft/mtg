@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>MtgInject</RootNamespace>
+    <AssemblyName>mtg-inject</AssemblyName>
+    <OutputPath>..\build\injector\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- MTGA.exe is 64-bit; SharpMonoInjector's OpenProcess/ReadProcessMemory
+         calls from a 32-bit process to a 64-bit target are unreliable under
+         WoW64. Pin x64 so both processes share the same Win32 word size. -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Targeting packs for .NET Framework 4.8 are not bundled with the
+         dotnet SDK on Linux; this NuGet package provides them so the
+         build is self-sufficient inside the Nix dev shell. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\vendor\SharpMonoInjector\SharpMonoInjector.csproj" />
+  </ItemGroup>
+
+</Project>
