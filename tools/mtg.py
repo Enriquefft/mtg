@@ -772,12 +772,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     curve / per-card classification table.
     """
     _warn_if_stale()
+    if args.include_sideboard and args.sideboard_only:
+        sys.exit("--include-sideboard and --sideboard-only are mutually exclusive")
     path = Path(args.deck)
     if not path.exists():
         print(f"deck file not found: {path}", file=sys.stderr)
         return 2
     entries = parse_deck(path)
-    main_entries = [e for e in entries if e.section in {"deck", "commander"}]
+    if args.sideboard_only:
+        sections = {"sideboard"}
+    elif args.include_sideboard:
+        sections = {"deck", "commander", "sideboard"}
+    else:
+        sections = {"deck", "commander"}
+    main_entries = [e for e in entries if e.section in sections]
     total = sum(e.count for e in main_entries)
 
     role_counts: dict[str, int] = {}
@@ -803,7 +811,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             curve[cmc] = curve.get(cmc, 0) + e.count
         rows.append((e, c, tags, cmc))
 
-    print(f"deck: {path} ({total} cards)")
+    print(f"deck: {path} ({total} cards, scope={'+'.join(sorted(sections))})")
     print()
     print("composition (by type, lands+nonlands):")
     for key, label in _ROLE_TYPE:
@@ -1080,12 +1088,12 @@ def cmd_wildcards(args: argparse.Namespace) -> int:
         print(f"deck file not found: {path}", file=sys.stderr)
         return 2
     entries = parse_deck(path)
-    main = [e for e in entries if e.section in {"deck", "commander"}]
+    entries_in = [e for e in entries if e.section in {"deck", "commander", "sideboard"}]
 
     by_rarity: dict[str, int] = {}
     by_rarity_cards: dict[str, list[tuple[DeckEntry, dict]]] = {}
     unknown: list[DeckEntry] = []
-    for e in main:
+    for e in entries_in:
         c = _resolve_card(e.name)
         if c is None:
             unknown.append(e)
@@ -1094,7 +1102,7 @@ def cmd_wildcards(args: argparse.Namespace) -> int:
         by_rarity[r] = by_rarity.get(r, 0) + e.count
         by_rarity_cards.setdefault(r, []).append((e, c))
 
-    print(f"wildcards: {path}")
+    print(f"wildcards: {path} (deck + sideboard)")
     print()
     print("rarity breakdown:")
     seen_rarities = sorted(
@@ -1219,11 +1227,21 @@ def cmd_companion(args: argparse.Namespace) -> int:
         print(f"deck file not found: {path}", file=sys.stderr)
         return 2
     entries = parse_deck(path)
-    main = [e for e in entries if e.section in {"deck", "commander"}]
-    deck_total = sum(e.count for e in main)
+    is_brawl = args.format in BRAWL_FORMATS
+    if is_brawl:
+        sections = {"deck", "commander"}
+    else:
+        sections = {"deck", "commander", "sideboard"}
+    scope = [e for e in entries if e.section in sections]
+    # Yorion's threshold is starting-deck size — main + commander only,
+    # NOT including sideboard, regardless of format.
+    main_total = sum(
+        e.count for e in entries if e.section in {"deck", "commander"}
+    )
+    sb_names = {e.name for e in entries if e.section == "sideboard"}
 
     cards: list[tuple[DeckEntry, dict]] = []
-    for e in main:
+    for e in scope:
         c = _resolve_card(e.name)
         if c is not None:
             cards.append((e, c))
@@ -1235,40 +1253,68 @@ def cmd_companion(args: argparse.Namespace) -> int:
             if not predicate(c)
         ]
 
+    def _sb_check(companion: str, viols: list[str]) -> list[str]:
+        # Non-Brawl: companion must be in the sideboard at game start. Brawl
+        # has no sideboard so this rule does not apply.
+        if not is_brawl and companion not in sb_names:
+            return viols + [f"{companion} not in sideboard"]
+        return viols
+
     checks: list[tuple[str, list[str]]] = []
 
     # Lurrus: every nonland permanent card has cmc <= 2.
     bad = _violations(_lurrus_ok, "lurrus")
-    checks.append(("Lurrus of the Dream-Den (cmc<=2 nonland permanents)", bad))
+    checks.append((
+        "Lurrus of the Dream-Den (cmc<=2 nonland permanents)",
+        _sb_check("Lurrus of the Dream-Den", bad),
+    ))
 
     # Kaheera: every creature card shares a type from the whitelist.
     bad = _violations(_kaheera_ok, "kaheera")
     types_label = "/".join(sorted(_COMPANION_KAHEERA_TYPES))
-    checks.append((f"Kaheera, the Orphanguard (creatures must be: {types_label})", bad))
+    checks.append((
+        f"Kaheera, the Orphanguard (creatures must be: {types_label})",
+        _sb_check("Kaheera, the Orphanguard", bad),
+    ))
 
     # Jegantha: no card has two pips of the same color in its cost.
     bad = _violations(_jegantha_ok, "jegantha")
-    checks.append(("Jegantha, the Wellspring (no card has repeated colored pip)", bad))
+    checks.append((
+        "Jegantha, the Wellspring (no card has repeated colored pip)",
+        _sb_check("Jegantha, the Wellspring", bad),
+    ))
 
     # Yorion: starting deck has at least 80 cards.
     yorion_msg: list[str] = (
         []
-        if deck_total >= _COMPANION_YORION_MIN_DECK
-        else [f"deck has {deck_total} cards, needs >= {_COMPANION_YORION_MIN_DECK}"]
+        if main_total >= _COMPANION_YORION_MIN_DECK
+        else [f"deck has {main_total} cards, needs >= {_COMPANION_YORION_MIN_DECK}"]
     )
-    checks.append(("Yorion, Sky Nomad (>=80-card starting deck)", yorion_msg))
+    checks.append((
+        "Yorion, Sky Nomad (>=80-card starting deck)",
+        _sb_check("Yorion, Sky Nomad", yorion_msg),
+    ))
 
     # Gyruda: every nonland card has even cmc (0, 2, 4, ...).
     bad = _violations(_gyruda_ok, "gyruda")
-    checks.append(("Gyruda, Doom of Depths (nonland cards have even cmc)", bad))
+    checks.append((
+        "Gyruda, Doom of Depths (nonland cards have even cmc)",
+        _sb_check("Gyruda, Doom of Depths", bad),
+    ))
 
     # Keruga: every nonland card has cmc >= 3.
     bad = _violations(_keruga_ok, "keruga")
-    checks.append(("Keruga, the Macrosage (nonland cmc>=3)", bad))
+    checks.append((
+        "Keruga, the Macrosage (nonland cmc>=3)",
+        _sb_check("Keruga, the Macrosage", bad),
+    ))
 
     # Obosh: every nonland card has odd cmc (1, 3, 5, ...).
     bad = _violations(_obosh_ok, "obosh")
-    checks.append(("Obosh, the Preypiercer (nonland cards have odd cmc)", bad))
+    checks.append((
+        "Obosh, the Preypiercer (nonland cards have odd cmc)",
+        _sb_check("Obosh, the Preypiercer", bad),
+    ))
 
     # Umori: only one card type among nonland cards (excluding land/instant
     # /sorcery toggles? rules text says "card types other than land", which
@@ -1290,11 +1336,17 @@ def cmd_companion(args: argparse.Namespace) -> int:
         if len(nonland_types) <= 1
         else [f"nonland cards span {len(nonland_types)} types: {sorted(nonland_types)}"]
     )
-    checks.append(("Umori, the Collector (one nonland card type)", umori_msg))
+    checks.append((
+        "Umori, the Collector (one nonland card type)",
+        _sb_check("Umori, the Collector", umori_msg),
+    ))
 
     # Zirda: every permanent card has an activated ability.
     bad = _violations(_zirda_ok, "zirda")
-    checks.append(("Zirda, the Dawnwaker (every permanent has activated ability)", bad))
+    checks.append((
+        "Zirda, the Dawnwaker (every permanent has activated ability)",
+        _sb_check("Zirda, the Dawnwaker", bad),
+    ))
 
     # Lutri: no card appears more than once (singleton, ignoring basic
     # lands). Brawl is already singleton; this check is meaningful for
@@ -1312,7 +1364,10 @@ def cmd_companion(args: argparse.Namespace) -> int:
             is_basic = "basic" in t and "land" in t
             if not is_basic:
                 lutri_violations.append(f"{n}x {name}")
-    checks.append(("Lutri, the Spellchaser (singleton, basic lands exempt)", lutri_violations))
+    checks.append((
+        "Lutri, the Spellchaser (singleton, basic lands exempt)",
+        _sb_check("Lutri, the Spellchaser", lutri_violations),
+    ))
 
     print(f"companion: {path}")
     print()
@@ -1353,7 +1408,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     rc = cmd_validate(validate_args)
 
     _check_divider("analyze")
-    cmd_analyze(argparse.Namespace(deck=deck))
+    cmd_analyze(argparse.Namespace(
+        deck=deck, include_sideboard=False, sideboard_only=False,
+    ))
 
     _check_divider("manabase")
     cmd_manabase(argparse.Namespace(deck=deck))
@@ -1362,7 +1419,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     cmd_wildcards(argparse.Namespace(deck=deck, list=False))
 
     _check_divider("companion")
-    cmd_companion(argparse.Namespace(deck=deck))
+    cmd_companion(argparse.Namespace(deck=deck, format=fmt))
 
     if args.collection:
         if _load_collection() is None:
@@ -2885,6 +2942,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("analyze", help="composition breakdown (curve, role mix, CA)")
     s.add_argument("deck")
+    s.add_argument("--include-sideboard", action="store_true", default=False)
+    s.add_argument("--sideboard-only", action="store_true", default=False)
     s.set_defaults(func=cmd_analyze)
 
     s = sub.add_parser("related", help="cards sharing each keyword with the anchor card")
@@ -2911,6 +2970,7 @@ def main(argv: list[str] | None = None) -> int:
         help="check each MTGA companion's mechanical predicate against the deck",
     )
     s.add_argument("deck")
+    s.add_argument("-f", "--format", default="brawl", help="format (default: brawl)")
     s.set_defaults(func=cmd_companion)
 
     s = sub.add_parser(
