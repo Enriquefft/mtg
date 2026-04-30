@@ -27,6 +27,7 @@ Subcommands:
     gaps <deck.txt>               cards short for a deck + wildcard cost
     coverage <deck.txt>           % of deck you can build right now
     diff <a.txt> <b.txt>          per-card delta between two deck files
+    suggest-subs <deck.txt> -f F  propose owned replacements for missing cards
 
 Run `mtg <subcommand> --help` for details.
 """
@@ -433,6 +434,36 @@ MULTIFACE_LAYOUTS = frozenset({
 })
 
 
+def _write_mtga_export(path: Path, entries: list[DeckEntry]) -> None:
+    """Write a deck file in MTGA-export format.
+
+    Sections emitted in order: Commander, Deck, Sideboard. A section
+    header is emitted only when the section has at least one entry, with
+    one blank line between sections. For multi-face cards (layouts in
+    MULTIFACE_LAYOUTS) the resolved Scryfall `name` already contains the
+    `Front // Back` slash — emit it as-is so MTGA accepts the import.
+    """
+    sections = (("commander", "Commander"), ("deck", "Deck"),
+                ("sideboard", "Sideboard"))
+    chunks: list[str] = []
+    for key, header in sections:
+        rows = [e for e in entries if e.section == key]
+        if not rows:
+            continue
+        block: list[str] = [header]
+        for e in rows:
+            resolved = _resolve_card(e.name)
+            layout = (resolved.get("layout") or "") if resolved else ""
+            full = (resolved.get("name") or "") if resolved else ""
+            if layout in MULTIFACE_LAYOUTS and " // " in full:
+                name = full
+            else:
+                name = e.name
+            block.append(f"{e.count} {name} ({e.set_code}) {e.collector}")
+        chunks.append("\n".join(block))
+    path.write_text("\n\n".join(chunks) + "\n")
+
+
 def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
     """Return (exit_code, messages). 0 = clean."""
     msgs: list[str] = []
@@ -537,6 +568,12 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
                 )
 
     return (0 if not msgs else 1), msgs
+
+
+def _card_legal_in(c: dict, fmt: str) -> bool:
+    if "arena" not in (c.get("games") or []):
+        return False
+    return ((c.get("legalities") or {}).get(fmt, "not_legal") == "legal")
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -1213,6 +1250,20 @@ def _obosh_ok(c: dict) -> bool:
 
 def _zirda_ok(c: dict) -> bool:
     return not _is_permanent(c) or _has_activated_ability(c)
+
+
+# Per-card predicates only. Yorion (deck-size), Umori (single nonland
+# type), and Lutri (singleton) are aggregate constraints and don't fit a
+# per-card map.
+_COMPANION_PREDICATES = {
+    "Lurrus of the Dream-Den": _lurrus_ok,
+    "Kaheera, the Orphanguard": _kaheera_ok,
+    "Jegantha, the Wellspring": _jegantha_ok,
+    "Gyruda, Doom of Depths": _gyruda_ok,
+    "Keruga, the Macrosage": _keruga_ok,
+    "Obosh, the Preypiercer": _obosh_ok,
+    "Zirda, the Dawnwaker": _zirda_ok,
+}
 
 
 def cmd_companion(args: argparse.Namespace) -> int:
@@ -2555,6 +2606,40 @@ def _deck_gap_rows(
     return rows
 
 
+def _compute_missing(
+    idx: dict, deck_path: Path, owned_by_name: dict[str, dict]
+) -> list[dict]:
+    """Per-slot shortfall list for the suggest-subs engine.
+
+    Returns one dict per non-basic card the deck demands more copies of
+    than the collection holds. Reuses `_deck_demand` for resolution, so
+    unresolved entries are dropped silently here (the caller surfaces
+    them separately when it needs to).
+    """
+    demand, _unresolved = _deck_demand(idx, deck_path)
+    out: list[dict] = []
+    for key, d in demand.items():
+        card = d["card"]
+        if _is_basic(card):
+            continue
+        owned = (owned_by_name.get(key) or {}).get("owned", 0)
+        deficit = d["needed"] - owned
+        if deficit <= 0:
+            continue
+        out.append({
+            "name": d["name"],
+            "card": card,
+            "needed": d["needed"],
+            "owned": owned,
+            "deficit": deficit,
+            "roles": classify_card(card),
+            "cmc": float(card.get("cmc") or 0),
+            "type_line": card.get("type_line") or "",
+            "rarity": card.get("rarity") or "common",
+        })
+    return out
+
+
 def cmd_gaps(args: argparse.Namespace) -> int:
     _warn_if_collection_stale()
     snap = _load_collection()
@@ -2596,6 +2681,391 @@ def cmd_gaps(args: argparse.Namespace) -> int:
             "in this deck has appeared in a previous deck, the count is\n"
             "accurate; otherwise we may be undercounting your ownership."
         )
+    return 0
+
+
+# Primary card types — used by the suggest-subs scorer to decide whether
+# a candidate's role overlap includes a "real" card-type tag.
+_PRIMARY_CARD_TYPES = frozenset({
+    "creature", "instant", "sorcery", "enchantment",
+    "planeswalker", "artifact", "land", "battle",
+})
+
+# Supertypes — replacing a Legendary slot with another Legendary etc.
+# rewards type continuity.
+_SUPERTYPES = ("legendary", "basic", "snow", "world")
+
+
+def _suggest_subs_score(
+    c: dict,
+    cand_roles: set[str],
+    missing_roles: set[str],
+    missing_cmc: float,
+    is_rare_role,
+) -> float:
+    """Score one candidate card against one missing slot.
+
+    Components are summed, then multiplied by 1.5 if the missing slot
+    fills a role that's rare in the deck's pool (T=3, see caller).
+    """
+    inter = len(cand_roles & missing_roles)
+    role_term = 3.0 * inter / max(1, len(cand_roles))
+    cmc_term = 2.0 * max(0, 2 - abs((c.get("cmc") or 0) - missing_cmc))
+    type_term = 1.0 if (cand_roles & _PRIMARY_CARD_TYPES) & missing_roles else 0.0
+    tl = (c.get("type_line") or "").lower()
+    super_term = 1.0 if any(s in tl for s in _SUPERTYPES) else 0.0
+    score = role_term + cmc_term + type_term + super_term
+    # T=3: a role is "rare for this deck" iff fewer than 3 cards in the
+    # deck's pool tag it. Replacing a rare-role slot with a non-rare-role
+    # candidate hurts disproportionately, so we boost rare-role matches.
+    if any(is_rare_role(r) for r in (cand_roles & missing_roles)):
+        score *= 1.5
+    return score
+
+
+def cmd_suggest_subs(args: argparse.Namespace) -> int:
+    """Propose owned replacements for missing cards in a deck.
+
+    Deterministic engine: enumerate–filter–score over the user's collection.
+    No LLM, no API call.
+
+    JSON schema (--json):
+    {
+      "deck": "decks/foo/v1.txt",
+      "format": "brawl",
+      "missing": [
+        {
+          "card": "Sheoldred, the Apocalypse",
+          "needed": 1, "owned": 0, "deficit": 1,
+          "roles": ["threat"], "cmc": 4,
+          "type_line": "Legendary Creature — Phyrexian Praetor",
+          "candidates": [
+            {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
+             "cmc": 4, "type_line": "...",
+             "rare_role_boost": false, "game_changer": false}
+          ]
+        }
+      ],
+      "summary": {"missing_cards": 7, "fillable": 5, "unfilled": 2}
+    }
+    """
+    from collections import Counter
+
+    _warn_if_stale()
+    _warn_if_collection_stale()
+
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(f"unknown format: {fmt}", file=sys.stderr)
+        return 2
+    if args.max_per_card < 1:
+        print("--max-per-card must be >= 1", file=sys.stderr)
+        return 2
+    deck_path = Path(args.deck)
+    if not deck_path.exists():
+        print(f"deck file not found: {deck_path}", file=sys.stderr)
+        return 2
+    if args.apply is not None:
+        out_parent = Path(args.apply).parent
+        if not out_parent.exists():
+            print(
+                f"--apply parent directory does not exist: {out_parent}",
+                file=sys.stderr,
+            )
+            return 2
+
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    idx = _load_index()
+
+    entries = parse_deck(deck_path)
+    owned_by_name = _aggregate_by_name(idx, _cards_owned(snap))
+    missing = _compute_missing(idx, deck_path, owned_by_name)
+
+    # Build the deck's role pool for the rare-role frequency check —
+    # every resolved commander/deck/sideboard card contributes its tag
+    # set, weighted by copy count. T=3: tags carried by fewer than 3
+    # copies are rare for this deck.
+    role_freq: Counter[str] = Counter()
+    for e in entries:
+        if e.section not in {"commander", "deck", "sideboard"}:
+            continue
+        c = _resolve_deck_card(idx, e)
+        if c is None:
+            continue
+        for r in classify_card(c):
+            role_freq[r] += e.count
+
+    def _is_rare_role(r: str) -> bool:
+        return role_freq.get(r, 0) < 3  # T=3
+
+    is_brawl = fmt in BRAWL_FORMATS
+    cmdr_identity: set[str] | None = None
+    if is_brawl:
+        cmdr_entry = next(
+            (e for e in entries if e.section == "commander"), None
+        )
+        if cmdr_entry is not None:
+            cmdr = _resolve_deck_card(idx, cmdr_entry)
+            if cmdr is not None:
+                cmdr_identity = set(cmdr.get("color_identity") or [])
+
+    # Companion guard: only honored outside Brawl (Brawl decks don't run
+    # companions in the standard sideboard slot — and `_COMPANION_PREDICATES`
+    # is per-card, so aggregate companions like Yorion legitimately have
+    # no entry here.)
+    declared_companion_pred = None
+    if not is_brawl:
+        for e in entries:
+            if e.section != "sideboard":
+                continue
+            c = _resolve_deck_card(idx, e)
+            if c is None:
+                continue
+            if "Companion —" in (c.get("oracle_text") or ""):
+                declared_companion_pred = _COMPANION_PREDICATES.get(
+                    c.get("name") or ""
+                )
+                break
+
+    # Pre-compute per-name copy counts in the deck so the per-candidate
+    # copy-cap check is O(1).
+    deck_copies: Counter[str] = Counter()
+    for e in entries:
+        if e.section in {"commander", "deck", "sideboard"}:
+            deck_copies[e.name] += e.count
+    max_copies = 1 if is_brawl else 4
+
+    fillable = 0
+    unfilled = 0
+    json_missing: list[dict] = []
+    text_chunks: list[str] = []
+
+    for slot in missing:
+        miss_name = slot["name"]
+        miss_card = slot["card"]
+        miss_roles = slot["roles"]
+        miss_cmc = slot["cmc"]
+        miss_game_changer = bool(miss_card.get("game_changer"))
+
+        candidates: list[tuple[float, dict, dict, bool, bool]] = []
+        for cand_name_lc, info in owned_by_name.items():
+            cand_display = info.get("name") or ""
+            if cand_display == miss_name:
+                continue
+            c = _resolve_card(cand_display)
+            if c is None:
+                continue
+            if not _card_legal_in(c, fmt):
+                continue
+            # A- rebalanced cards are only legal in Alchemy / Brawl pools.
+            if (c.get("name") or "").startswith("A-") and not (
+                fmt == "alchemy" or fmt in BRAWL_FORMATS
+            ):
+                continue
+            if cmdr_identity is not None:
+                # spec deviation: ⊆ matches validator
+                ci = set(c.get("color_identity") or [])
+                if not ci.issubset(cmdr_identity):
+                    continue
+            cand_roles = classify_card(c)
+            if not (cand_roles & miss_roles):
+                continue
+            if abs((c.get("cmc") or 0) - miss_cmc) > 2:
+                continue
+            in_deck = deck_copies.get(cand_display, 0)
+            if not _is_basic(c) and in_deck >= max_copies:
+                continue
+            if info.get("owned", 0) < slot["deficit"]:
+                continue
+            if (
+                declared_companion_pred is not None
+                and not declared_companion_pred(c)
+            ):
+                continue
+            cand_game_changer = bool(c.get("game_changer"))
+            if is_brawl and cand_game_changer and not miss_game_changer:
+                print(
+                    f"[warn] dropping game-changer candidate "
+                    f"{cand_display!r} for non-game-changer slot "
+                    f"{miss_name!r}",
+                    file=sys.stderr,
+                )
+                continue
+            score = _suggest_subs_score(
+                c, cand_roles, miss_roles, miss_cmc, _is_rare_role
+            )
+            rare_boost = any(
+                _is_rare_role(r) for r in (cand_roles & miss_roles)
+            )
+            candidates.append((score, c, info, rare_boost, cand_game_changer))
+
+        candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
+        candidates = candidates[: args.max_per_card]
+
+        if candidates:
+            fillable += 1
+        else:
+            unfilled += 1
+
+        json_missing.append({
+            "card": miss_name,
+            "needed": slot["needed"],
+            "owned": slot["owned"],
+            "deficit": slot["deficit"],
+            "roles": sorted(miss_roles),
+            "cmc": miss_cmc,
+            "type_line": slot["type_line"],
+            "candidates": [
+                {
+                    "name": c.get("name"),
+                    "score": round(score, 3),
+                    "owned": info.get("owned", 0),
+                    "roles": sorted(classify_card(c)),
+                    "cmc": float(c.get("cmc") or 0),
+                    "type_line": c.get("type_line") or "",
+                    "rare_role_boost": rare_boost,
+                    "game_changer": gc,
+                }
+                for score, c, info, rare_boost, gc in candidates
+            ],
+        })
+
+        text_block: list[str] = []
+        text_block.append(
+            f"MISSING: {slot['deficit']}x {miss_name} "
+            f"(cmc={int(miss_cmc) if miss_cmc.is_integer() else miss_cmc}, "
+            f"roles=[{','.join(sorted(miss_roles))}])"
+        )
+        if not candidates:
+            text_block.append("  candidates (top 0): (none)")
+        else:
+            text_block.append(f"  candidates (top {len(candidates)}):")
+            for score, c, info, _rare, _gc in candidates:
+                cand_roles = sorted(classify_card(c))
+                cand_cmc = c.get("cmc") or 0
+                if isinstance(cand_cmc, float) and cand_cmc.is_integer():
+                    cand_cmc = int(cand_cmc)
+                text_block.append(
+                    f"    {score:6.3f}  {info.get('owned', 0)}x "
+                    f"{c.get('name'):<32} cmc={cand_cmc}  "
+                    f"roles=[{','.join(cand_roles)}]"
+                )
+        text_chunks.append("\n".join(text_block))
+
+    # --apply: rewrite the deck with the top-scored candidate per slot.
+    if args.apply is not None:
+        # Each candidate name can appear at most max_copies times across
+        # the substituted deck (1 in Brawl, 4 elsewhere). The same
+        # candidate could rank top in several slots, so we walk the
+        # candidate list per slot and pick the first one whose remaining
+        # capacity (after pre-existing copies in the deck and earlier
+        # picks in this loop) is ≥ this slot's deficit.
+        used: dict[str, int] = {}
+        for n, qty in deck_copies.items():
+            used[n] = qty
+        # name_lc -> (chosen_candidate_name, deficit)
+        top_by_name: dict[str, tuple[str, int]] = {}
+        for slot, json_slot in zip(missing, json_missing):
+            chosen_name: str | None = None
+            for entry in json_slot["candidates"]:
+                cname = entry["name"]
+                resolved = _resolve_card(cname)
+                # Basic lands ignore the copy cap entirely.
+                if resolved is not None and _is_basic(resolved):
+                    chosen_name = cname
+                    break
+                if max_copies - used.get(cname, 0) >= slot["deficit"]:
+                    chosen_name = cname
+                    break
+            if chosen_name is None:
+                continue
+            resolved = _resolve_card(chosen_name)
+            if resolved is None or not _is_basic(resolved):
+                used[chosen_name] = used.get(chosen_name, 0) + slot["deficit"]
+            top_by_name[json_slot["card"].lower()] = (
+                chosen_name, slot["deficit"],
+            )
+
+        new_entries: list[DeckEntry] = []
+        for e in entries:
+            key = e.name.lower()
+            # Skip commander substitution: replacing the commander
+            # changes the deck's identity envelope and invalidates every
+            # other card. The commander stays as-is; the user crafts it
+            # or picks a different deck.
+            if e.section == "commander":
+                new_entries.append(e)
+                continue
+            if key in top_by_name and e.section in {"deck", "sideboard"}:
+                cand_name, deficit = top_by_name[key]
+                # Split the original line into (count - take) original
+                # copies + take new candidate copies. `take` never
+                # exceeds e.count because deficit <= needed and a single
+                # entry's count <= needed.
+                take = min(deficit, e.count)
+                remaining = e.count - take
+                if remaining > 0:
+                    new_entries.append(DeckEntry(
+                        remaining, e.name, e.set_code, e.collector, e.section,
+                    ))
+                # Find any printing for the candidate to source (SET) NUM.
+                printings = idx["by_name"].get(cand_name.lower()) or []
+                if not printings:
+                    # Resolution above already accepted the candidate, so
+                    # this branch is unreachable; fall back to passing
+                    # the original line through to keep the deck valid.
+                    new_entries.append(e)
+                    continue
+                p = printings[0]
+                new_entries.append(DeckEntry(
+                    take,
+                    cand_name,
+                    (p.get("set") or "").upper(),
+                    str(p.get("collector_number") or ""),
+                    e.section,
+                ))
+                # Decrement the remaining deficit so multi-line splits
+                # don't double-substitute the same slot.
+                top_by_name[key] = (cand_name, deficit - take)
+                if top_by_name[key][1] <= 0:
+                    del top_by_name[key]
+            else:
+                new_entries.append(e)
+        _write_mtga_export(Path(args.apply), new_entries)
+        print(f"wrote substituted deck → {args.apply}", file=sys.stderr)
+
+    if args.json:
+        json.dump(
+            {
+                "deck": str(deck_path),
+                "format": fmt,
+                "missing": json_missing,
+                "summary": {
+                    "missing_cards": len(missing),
+                    "fillable": fillable,
+                    "unfilled": unfilled,
+                },
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(f"deck: {deck_path}  (snapshot: {snap.get('completeness')})")
+        print(f"format: {fmt}")
+        if not missing:
+            print("you own every non-basic card in this deck.")
+        else:
+            print()
+            for chunk in text_chunks:
+                print(chunk)
+                print()
+            print(
+                f"summary: missing={len(missing)}, "
+                f"fillable={fillable}, unfilled={unfilled}"
+            )
     return 0
 
 
@@ -3051,6 +3521,29 @@ def main(argv: list[str] | None = None) -> int:
         help="collapse printings: one row per name, qty = max owned across printings",
     )
     s.set_defaults(func=cmd_owned)
+
+    s = sub.add_parser(
+        "suggest-subs",
+        help="propose owned replacements for missing cards in a deck",
+    )
+    s.add_argument("deck", help="path to MTGA-export deck file")
+    s.add_argument(
+        "-f", "--format", default="brawl",
+        help="format predicate (default: brawl)",
+    )
+    s.add_argument(
+        "--max-per-card", type=int, default=5,
+        help="max candidates per missing card (default: 5)",
+    )
+    s.add_argument(
+        "--apply", default=None, metavar="OUT",
+        help="write a substituted deck to OUT (validates clean for -f)",
+    )
+    s.add_argument(
+        "--json", action="store_true",
+        help="emit JSON instead of text table",
+    )
+    s.set_defaults(func=cmd_suggest_subs)
 
     s = sub.add_parser(
         "gaps",
