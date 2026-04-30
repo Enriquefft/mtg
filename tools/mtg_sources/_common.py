@@ -9,7 +9,54 @@ re-deriving regex / section / multi-face rules. Single source of truth.
 from __future__ import annotations
 
 import re
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
+
+# Single source of truth for the toolkit's outbound User-Agent. Used by
+# `tools/mtg.py` (Scryfall JSON) and by per-source parsers fetching
+# sub-resources (e.g. mtggoldfish per-archetype pages). One constant so
+# rotating identity / version is one edit.
+USER_AGENT = "mtg-toolkit/0.1 (github.com/Enriquefft/mtg)"
+
+
+def http_get_text(
+    url: str,
+    *,
+    accept: str = "text/html,application/xhtml+xml",
+    retry_403_once: bool = False,
+    retry_sleep_secs: float = 2.0,
+) -> str:
+    """Fetch `url` as text using the shared User-Agent.
+
+    Stdlib-only thin wrapper. Exists so per-source parsers that need
+    sub-resource HTTP (mtggoldfish per-archetype pages) don't import
+    back into `tools/mtg.py` (circular) and don't grow a parallel HTTP
+    stack with a different UA / timeout policy.
+
+    `retry_403_once`: per `docs/sources.md` mtggoldfish "occasionally
+    403s; retry once". When True, a single retry with `retry_sleep_secs`
+    delay is attempted on the first 403; any second 403 (or any other
+    non-200) re-raises so the caller hard-fails per the production-
+    ready floor.
+    """
+    try:
+        return _do_http_get(url, accept=accept)
+    except urllib.error.HTTPError as e:
+        if retry_403_once and e.code == 403:
+            time.sleep(retry_sleep_secs)
+            return _do_http_get(url, accept=accept)
+        raise
+
+
+def _do_http_get(url: str, *, accept: str) -> str:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": accept}
+    )
+    with urllib.request.urlopen(req, timeout=120) as r:
+        raw = r.read()
+    return raw.decode("utf-8", errors="replace")
 
 # MTGA export deck-line: `<count> <Name> (<SET>) <NUM>`. The set code is
 # alphanumeric (Scryfall codes like `MH3`, `Y25`, `LTC`); collector

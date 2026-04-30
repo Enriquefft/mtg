@@ -60,10 +60,12 @@ from typing import Any, Iterable
 # at that path would shadow it and break the documented `tools/mtg <cmd>`
 # UX. The single-segment rename preserves SSOT and the published CLI.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mtg_sources._common import (  # noqa: E402  (import-after-sys.path)
+from mtg_sources import _common  # noqa: E402  (import-after-sys.path)
+from mtg_sources._common import (  # noqa: E402
     DECK_LINE_RE,
     SECTION_HEADERS,
     MULTIFACE_LAYOUTS,
+    USER_AGENT,
     DeckEntry,
     ParsedDeck,
     slugify,
@@ -72,6 +74,10 @@ from mtg_sources.mtgazone import (  # noqa: E402
     parse_mtgazone,
     url_for_format as mtgazone_url_for_format,
 )
+from mtg_sources.mtggoldfish import (  # noqa: E402
+    parse_mtggoldfish,
+    url_for_format as mtggoldfish_url_for_format,
+)
 
 ROOT = Path(os.environ.get("MTG_ROOT") or Path(__file__).resolve().parent.parent)
 DATA = ROOT / "data"
@@ -79,7 +85,6 @@ BULK_JSON = DATA / "default_cards.json"
 INDEX_PKL = DATA / "index.pkl"
 META_JSON = DATA / "bulk-meta.json"
 
-USER_AGENT = "mtg-toolkit/0.1 (github.com/Enriquefft/mtg)"
 SCRYFALL_BULK = "https://api.scryfall.com/bulk-data/default-cards"
 SCRYFALL_API = "https://api.scryfall.com"
 
@@ -3655,16 +3660,26 @@ def cmd_diff(args: argparse.Namespace) -> int:
 # config layer.
 _FETCH_META_PARSERS = {
     "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
+    "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
 }
 
 # Sources the spec lists in the `--source` choices but that we have not
 # wired a parser for. Listed explicitly so `argparse` accepts the choice
 # and `cmd_fetch_meta` can emit a deferred-source error message rather
 # than argparse's generic "invalid choice" — gives Claude an actionable
-# pointer to docs/sources.md.
-_FETCH_META_DEFERRED_SOURCES = ("untapped", "mtggoldfish")
+# pointer to docs/sources.md. untapped's tier-list and deck pages are a
+# Next.js SPA shell with no server-rendered decklists; the underlying
+# api.mtga.untapped.gg endpoints return 403 to anonymous calls. Stays
+# deferred until either the SPA gains SSR or a sanctioned API path opens.
+_FETCH_META_DEFERRED_SOURCES = ("untapped",)
 
 _META_CACHE_TTL_SECS = 24 * 3600
+
+# Sources where `docs/sources.md` records "occasional 403; retry once".
+# `_fetch_meta_page` honours this for the index fetch; per-archetype
+# sub-resource fetches inside `parse_mtggoldfish` use the same retry
+# helper in `_common.py`.
+_FETCH_META_RETRY_403 = frozenset({"mtggoldfish"})
 
 
 def _meta_cache_path(source: str, url: str) -> Path:
@@ -3682,8 +3697,11 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
     """Fetch HTML for `url`, honouring a 24h on-disk cache.
 
     Hard-fails on HTTP non-200 (raises HTTPError; caller catches and
-    surfaces). Cache writes are atomic-ish (write + rename) so a killed
-    process can't leave a half-written file that a later run trusts.
+    surfaces). For sources in `_FETCH_META_RETRY_403` (mtggoldfish per
+    `docs/sources.md`), a single retry with a 2s delay is attempted on
+    the first 403; any second 403 (or any other error) re-raises.
+    Cache writes are atomic-ish (write + rename) so a killed process
+    can't leave a half-written file that a later run trusts.
     """
     cache_path = _meta_cache_path(source, url)
     if not no_cache and cache_path.exists():
@@ -3691,8 +3709,10 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
         if age <= _META_CACHE_TTL_SECS:
             return cache_path.read_text(encoding="utf-8", errors="replace")
 
-    raw = _req(url, accept="text/html,application/xhtml+xml")
-    text = raw.decode("utf-8", errors="replace")
+    text = _common.http_get_text(
+        url,
+        retry_403_once=source in _FETCH_META_RETRY_403,
+    )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
@@ -3753,10 +3773,10 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     """
     source = args.source
     if source in _FETCH_META_DEFERRED_SOURCES:
+        supported = ", ".join(sorted(_FETCH_META_PARSERS))
         print(
             f"unknown source: {source} (deferred — see docs/sources.md "
-            f"bot-block table; mtgazone is the supported parser as of "
-            f"2026-04-30)",
+            f"bot-block table; supported parsers: {supported})",
             file=sys.stderr,
         )
         return 2
@@ -4102,8 +4122,9 @@ def main(argv: list[str] | None = None) -> int:
         choices=("untapped", "mtggoldfish", "mtgazone"),
         default="mtgazone",
         help=(
-            "meta source (default: mtgazone). 'untapped' and 'mtggoldfish' are "
-            "deferred — see docs/sources.md."
+            "meta source (default: mtgazone). 'untapped' is deferred — its "
+            "tier-list and deck pages are a JS shell with no server-rendered "
+            "decklists. See docs/sources.md."
         ),
     )
     s.add_argument(
