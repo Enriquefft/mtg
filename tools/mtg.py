@@ -35,6 +35,7 @@ Run `mtg <subcommand> --help` for details.
 from __future__ import annotations
 
 import argparse
+import glob as glob_mod
 import json
 import os
 import pickle
@@ -2723,61 +2724,27 @@ def _suggest_subs_score(
     return score
 
 
-def cmd_suggest_subs(args: argparse.Namespace) -> int:
-    """Propose owned replacements for missing cards in a deck.
+def _run_suggest_subs(
+    deck_path: Path,
+    fmt: str,
+    idx: dict,
+    snap: dict,
+    max_per_card: int = 5,
+) -> dict:
+    """Pure-compute core of `suggest-subs`.
 
-    Deterministic engine: enumerate–filter–score over the user's collection.
-    No LLM, no API call.
+    Returns the JSON-shaped dict the `--json` path emits. cmd_suggest_subs
+    derives text output and `--apply` rewrites from this same dict, so the
+    CLI surface and any internal caller (e.g. `coverage --with-subs`) see
+    identical scoring.
 
-    JSON schema (--json):
-    {
-      "deck": "decks/foo/v1.txt",
-      "format": "brawl",
-      "missing": [
-        {
-          "card": "Sheoldred, the Apocalypse",
-          "needed": 1, "owned": 0, "deficit": 1,
-          "roles": ["threat"], "cmc": 4,
-          "type_line": "Legendary Creature — Phyrexian Praetor",
-          "candidates": [
-            {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
-             "cmc": 4, "type_line": "...",
-             "rare_role_boost": false, "game_changer": false}
-          ]
-        }
-      ],
-      "summary": {"missing_cards": 7, "fillable": 5, "unfilled": 2}
-    }
+    Caller is responsible for:
+      - calling `_warn_if_stale()` / `_warn_if_collection_stale()`
+      - validating `fmt` against ARENA_FORMATS
+      - checking deck_path existence
+      - loading idx and snap
     """
     from collections import Counter
-
-    _warn_if_stale()
-    _warn_if_collection_stale()
-
-    fmt = args.format.lower()
-    if fmt not in ARENA_FORMATS:
-        print(f"unknown format: {fmt}", file=sys.stderr)
-        return 2
-    if args.max_per_card < 1:
-        print("--max-per-card must be >= 1", file=sys.stderr)
-        return 2
-    deck_path = Path(args.deck)
-    if not deck_path.exists():
-        print(f"deck file not found: {deck_path}", file=sys.stderr)
-        return 2
-    if args.apply is not None:
-        out_parent = Path(args.apply).parent
-        if not out_parent.exists():
-            print(
-                f"--apply parent directory does not exist: {out_parent}",
-                file=sys.stderr,
-            )
-            return 2
-
-    snap = _load_collection()
-    if snap is None:
-        sys.exit(_empty_state_message().rstrip())
-    idx = _load_index()
 
     entries = parse_deck(deck_path)
     owned_by_name = _aggregate_by_name(idx, _cards_owned(snap))
@@ -2840,7 +2807,6 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     fillable = 0
     unfilled = 0
     json_missing: list[dict] = []
-    text_chunks: list[str] = []
 
     for slot in missing:
         miss_name = slot["name"]
@@ -2902,7 +2868,7 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
             candidates.append((score, c, info, rare_boost, cand_game_changer))
 
         candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
-        candidates = candidates[: args.max_per_card]
+        candidates = candidates[:max_per_card]
 
         if candidates:
             fillable += 1
@@ -2932,25 +2898,112 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
             ],
         })
 
+    return {
+        "deck": str(deck_path),
+        "format": fmt,
+        "missing": json_missing,
+        "summary": {
+            "missing_cards": len(missing),
+            "fillable": fillable,
+            "unfilled": unfilled,
+        },
+    }
+
+
+def cmd_suggest_subs(args: argparse.Namespace) -> int:
+    """Propose owned replacements for missing cards in a deck.
+
+    Deterministic engine: enumerate–filter–score over the user's collection.
+    No LLM, no API call. Computation lives in `_run_suggest_subs`; this
+    function handles arg validation, --apply rewriting, and presentation.
+
+    JSON schema (--json):
+    {
+      "deck": "decks/foo/v1.txt",
+      "format": "brawl",
+      "missing": [
+        {
+          "card": "Sheoldred, the Apocalypse",
+          "needed": 1, "owned": 0, "deficit": 1,
+          "roles": ["threat"], "cmc": 4,
+          "type_line": "Legendary Creature — Phyrexian Praetor",
+          "candidates": [
+            {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
+             "cmc": 4, "type_line": "...",
+             "rare_role_boost": false, "game_changer": false}
+          ]
+        }
+      ],
+      "summary": {"missing_cards": 7, "fillable": 5, "unfilled": 2}
+    }
+    """
+    _warn_if_stale()
+    _warn_if_collection_stale()
+
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(f"unknown format: {fmt}", file=sys.stderr)
+        return 2
+    if args.max_per_card < 1:
+        print("--max-per-card must be >= 1", file=sys.stderr)
+        return 2
+    deck_path = Path(args.deck)
+    if not deck_path.exists():
+        print(f"deck file not found: {deck_path}", file=sys.stderr)
+        return 2
+    if args.apply is not None:
+        out_parent = Path(args.apply).parent
+        if not out_parent.exists():
+            print(
+                f"--apply parent directory does not exist: {out_parent}",
+                file=sys.stderr,
+            )
+            return 2
+
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    idx = _load_index()
+
+    result = _run_suggest_subs(deck_path, fmt, idx, snap, args.max_per_card)
+    json_missing = result["missing"]
+    summary = result["summary"]
+    missing_count = summary["missing_cards"]
+    fillable = summary["fillable"]
+    unfilled = summary["unfilled"]
+    entries = parse_deck(deck_path)
+    is_brawl = fmt in BRAWL_FORMATS
+    max_copies = 1 if is_brawl else 4
+
+    deck_copies: dict[str, int] = {}
+    for e in entries:
+        if e.section in {"commander", "deck", "sideboard"}:
+            deck_copies[e.name] = deck_copies.get(e.name, 0) + e.count
+
+    text_chunks: list[str] = []
+    for slot in json_missing:
+        miss_name = slot["card"]
+        miss_cmc = slot["cmc"]
+        miss_roles = slot["roles"]
+        slot_candidates = slot["candidates"]
         text_block: list[str] = []
         text_block.append(
             f"MISSING: {slot['deficit']}x {miss_name} "
-            f"(cmc={int(miss_cmc) if miss_cmc.is_integer() else miss_cmc}, "
-            f"roles=[{','.join(sorted(miss_roles))}])"
+            f"(cmc={int(miss_cmc) if float(miss_cmc).is_integer() else miss_cmc}, "
+            f"roles=[{','.join(miss_roles)}])"
         )
-        if not candidates:
+        if not slot_candidates:
             text_block.append("  candidates (top 0): (none)")
         else:
-            text_block.append(f"  candidates (top {len(candidates)}):")
-            for score, c, info, _rare, _gc in candidates:
-                cand_roles = sorted(classify_card(c))
-                cand_cmc = c.get("cmc") or 0
+            text_block.append(f"  candidates (top {len(slot_candidates)}):")
+            for cand in slot_candidates:
+                cand_cmc = cand["cmc"]
                 if isinstance(cand_cmc, float) and cand_cmc.is_integer():
                     cand_cmc = int(cand_cmc)
                 text_block.append(
-                    f"    {score:6.3f}  {info.get('owned', 0)}x "
-                    f"{c.get('name'):<32} cmc={cand_cmc}  "
-                    f"roles=[{','.join(cand_roles)}]"
+                    f"    {cand['score']:6.3f}  {cand['owned']}x "
+                    f"{cand['name']:<32} cmc={cand_cmc}  "
+                    f"roles=[{','.join(cand['roles'])}]"
                 )
         text_chunks.append("\n".join(text_block))
 
@@ -2967,7 +3020,8 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
             used[n] = qty
         # name_lc -> (chosen_candidate_name, deficit)
         top_by_name: dict[str, tuple[str, int]] = {}
-        for slot, json_slot in zip(missing, json_missing):
+        for json_slot in json_missing:
+            slot_deficit = json_slot["deficit"]
             chosen_name: str | None = None
             for entry in json_slot["candidates"]:
                 cname = entry["name"]
@@ -2976,16 +3030,16 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
                 if resolved is not None and _is_basic(resolved):
                     chosen_name = cname
                     break
-                if max_copies - used.get(cname, 0) >= slot["deficit"]:
+                if max_copies - used.get(cname, 0) >= slot_deficit:
                     chosen_name = cname
                     break
             if chosen_name is None:
                 continue
             resolved = _resolve_card(chosen_name)
             if resolved is None or not _is_basic(resolved):
-                used[chosen_name] = used.get(chosen_name, 0) + slot["deficit"]
+                used[chosen_name] = used.get(chosen_name, 0) + slot_deficit
             top_by_name[json_slot["card"].lower()] = (
-                chosen_name, slot["deficit"],
+                chosen_name, slot_deficit,
             )
 
         new_entries: list[DeckEntry] = []
@@ -3037,25 +3091,12 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         print(f"wrote substituted deck → {args.apply}", file=sys.stderr)
 
     if args.json:
-        json.dump(
-            {
-                "deck": str(deck_path),
-                "format": fmt,
-                "missing": json_missing,
-                "summary": {
-                    "missing_cards": len(missing),
-                    "fillable": fillable,
-                    "unfilled": unfilled,
-                },
-            },
-            sys.stdout,
-            indent=2,
-        )
+        json.dump(result, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         print(f"deck: {deck_path}  (snapshot: {snap.get('completeness')})")
         print(f"format: {fmt}")
-        if not missing:
+        if not missing_count:
             print("you own every non-basic card in this deck.")
         else:
             print()
@@ -3063,21 +3104,18 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
                 print(chunk)
                 print()
             print(
-                f"summary: missing={len(missing)}, "
+                f"summary: missing={missing_count}, "
                 f"fillable={fillable}, unfilled={unfilled}"
             )
     return 0
 
 
-def cmd_coverage(args: argparse.Namespace) -> int:
-    _warn_if_collection_stale()
-    snap = _load_collection()
-    if snap is None:
-        sys.exit(_empty_state_message().rstrip())
-    idx = _load_index()
-    demand, unresolved = _deck_demand(idx, Path(args.deck))
-    owned = _aggregate_by_name(idx, _cards_owned(snap))
-
+def _coverage_single(
+    deck_path: Path, idx: dict, owned: dict[str, dict]
+) -> tuple[int, int, list[tuple[str, int, str]], int]:
+    """Per-deck coverage compute. Returns
+    (total_have, total_need, gating, unresolved_count)."""
+    demand, unresolved = _deck_demand(idx, deck_path)
     total_need = 0
     total_have = 0
     gating: list[tuple[str, int, str]] = []
@@ -3091,19 +3129,244 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         short = need - have
         if short > 0:
             gating.append((d["name"], short, d["rarity"]))
+    return total_have, total_need, gating, len(unresolved)
 
-    pct = (100.0 * total_have / total_need) if total_need else 100.0
-    print(f"deck: {args.deck}  (snapshot: {snap.get('completeness')})")
-    print(f"coverage: {total_have}/{total_need} non-basic copies  ({pct:.1f}%)")
-    if gating:
-        print()
-        gating.sort(key=lambda r: (-_RARITY_ORDER.get(r[2], 0), -r[1], r[0]))
-        print("gating cards (need wildcards):")
-        for name, short, rarity in gating:
-            print(f"  -{short} {rarity:<8} {name}")
-    if unresolved:
-        print()
-        print(f"[warn] {len(unresolved)} unresolved deck line(s)")
+
+def _coverage_with_subs_pct(
+    deck_path: Path,
+    fmt: str,
+    idx: dict,
+    snap: dict,
+    total_have: int,
+    total_need: int,
+) -> float:
+    """Re-run suggest-subs and fold filled deficits into coverage.
+
+    `with_subs_pct = (owned_count + filled_deficit) / total_count`, where
+    `filled_deficit` only counts slots that have at least one candidate
+    (top-scored candidate fills the slot). Slots with zero candidates
+    keep their deficit unfilled.
+    """
+    if total_need == 0:
+        return 1.0
+    result = _run_suggest_subs(deck_path, fmt, idx, snap)
+    filled = 0
+    for slot in result["missing"]:
+        if slot["candidates"]:
+            filled += slot["deficit"]
+    return (total_have + filled) / total_need
+
+
+def _format_for_deck_path(p: Path) -> str:
+    """Infer Arena format from the deck file's parent directory name.
+
+    Falls back to `brawl` if the parent is not an Arena format. Caller is
+    responsible for emitting the once-per-run fallback warning, since this
+    helper has no run context.
+    """
+    parent = p.parent.name
+    if parent in ARENA_FORMATS:
+        return parent
+    return "brawl"
+
+
+def _load_deck_meta(deck_path: Path) -> dict:
+    """Return the meta.json entry for `deck_path` (or {} if absent)."""
+    meta_path = deck_path.parent / "meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    entry = meta.get(deck_path.name)
+    if isinstance(entry, dict):
+        return entry
+    return {}
+
+
+def _coverage_row(
+    deck_path: Path,
+    idx: dict,
+    snap: dict,
+    owned: dict[str, dict],
+    with_subs: bool,
+    fallback_warn: list[bool],
+) -> dict:
+    """Compute one batch-mode row. Mutates fallback_warn[0] -> True
+    when this deck's parent dir is not in ARENA_FORMATS."""
+    parent = deck_path.parent.name
+    fmt = parent if parent in ARENA_FORMATS else "brawl"
+    if parent and parent not in ARENA_FORMATS:
+        fallback_warn[0] = True
+
+    total_have, total_need, gating, _unres = _coverage_single(
+        deck_path, idx, owned,
+    )
+    owned_pct = (total_have / total_need) if total_need else 1.0
+
+    wc: dict[str, int] = {"mythic": 0, "rare": 0, "uncommon": 0, "common": 0}
+    for _name, short, rarity in gating:
+        if rarity in wc:
+            wc[rarity] += short
+
+    gating_sorted = sorted(
+        gating, key=lambda r: (-_RARITY_ORDER.get(r[2], 0), -r[1], r[0]),
+    )
+    top3 = [name for name, _short, _rarity in gating_sorted[:3]]
+
+    with_subs_pct: float | None = None
+    if with_subs:
+        with_subs_pct = _coverage_with_subs_pct(
+            deck_path, fmt, idx, snap, total_have, total_need,
+        )
+
+    meta = _load_deck_meta(deck_path)
+    tier_raw = meta.get("tier")
+    tier = tier_raw if isinstance(tier_raw, str) and tier_raw else None
+
+    return {
+        "deck": str(deck_path),
+        "archetype": deck_path.stem,
+        "tier": tier,
+        "owned_pct": round(owned_pct, 4),
+        "missing_wc": wc,
+        "with_subs_pct": (
+            round(with_subs_pct, 4) if with_subs_pct is not None else None
+        ),
+        "top3_missing": top3,
+    }
+
+
+def _print_coverage_batch_text(rows: list[dict], with_subs: bool) -> None:
+    """Render the batch-mode text table. Columns:
+    archetype(30) tier(4) owned%(6) missing-WC(12) [with-subs(7)] top3."""
+    if with_subs:
+        header = (
+            f"{'archetype':<30} {'tier':<4} {'owned':<6} "
+            f"{'missing-WC':<12} {'subs':<6} top-3 missing"
+        )
+    else:
+        header = (
+            f"{'archetype':<30} {'tier':<4} {'owned':<6} "
+            f"{'missing-WC':<12} top-3 missing"
+        )
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        wc = r["missing_wc"]
+        wc_str = (
+            f"{wc['mythic']}/{wc['rare']}/{wc['uncommon']}/{wc['common']}"
+        )
+        owned_str = f"{r['owned_pct']:.2f}"
+        tier_str = r["tier"] or "-"
+        top3_str = ", ".join(r["top3_missing"]) if r["top3_missing"] else "-"
+        if with_subs:
+            sub_pct = r["with_subs_pct"]
+            sub_str = f"{sub_pct:.2f}" if sub_pct is not None else "-"
+            print(
+                f"{r['archetype'][:30]:<30} {tier_str:<4} "
+                f"{owned_str:<6} {wc_str:<12} {sub_str:<6} {top3_str}"
+            )
+        else:
+            print(
+                f"{r['archetype'][:30]:<30} {tier_str:<4} "
+                f"{owned_str:<6} {wc_str:<12} {top3_str}"
+            )
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    idx = _load_index()
+    owned = _aggregate_by_name(idx, _cards_owned(snap))
+
+    if not args.batch:
+        if args.deck is None:
+            print(
+                "coverage: provide a deck file or use --batch --glob '<pat>'",
+                file=sys.stderr,
+            )
+            return 2
+        deck_path = Path(args.deck)
+        total_have, total_need, gating, unresolved_count = _coverage_single(
+            deck_path, idx, owned,
+        )
+        pct = (100.0 * total_have / total_need) if total_need else 100.0
+        print(f"deck: {args.deck}  (snapshot: {snap.get('completeness')})")
+        print(
+            f"coverage: {total_have}/{total_need} non-basic copies  "
+            f"({pct:.1f}%)"
+        )
+        if gating:
+            print()
+            gating.sort(
+                key=lambda r: (-_RARITY_ORDER.get(r[2], 0), -r[1], r[0]),
+            )
+            print("gating cards (need wildcards):")
+            for name, short, rarity in gating:
+                print(f"  -{short} {rarity:<8} {name}")
+        if unresolved_count:
+            print()
+            print(f"[warn] {unresolved_count} unresolved deck line(s)")
+        return 0
+
+    # Batch mode.
+    if not args.glob:
+        print(
+            "coverage --batch requires --glob '<pattern>'", file=sys.stderr,
+        )
+        return 2
+    if args.min is not None and not (0.0 <= args.min <= 1.0):
+        print("--min must be in [0, 1]", file=sys.stderr)
+        return 2
+
+    deck_paths = sorted(
+        Path(p) for p in glob_mod.glob(args.glob, recursive=True)
+        if Path(p).is_file()
+    )
+    if not deck_paths:
+        if args.json:
+            json.dump([], sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            print("no deck files matched")
+        return 0
+
+    fallback_warn = [False]
+    rows: list[dict] = []
+    for path in deck_paths:
+        rows.append(
+            _coverage_row(path, idx, snap, owned, args.with_subs, fallback_warn)
+        )
+
+    if fallback_warn[0]:
+        print(
+            "[warn] some deck paths have a parent dir not in ARENA_FORMATS; "
+            "fell back to format=brawl",
+            file=sys.stderr,
+        )
+
+    if args.with_subs:
+        rows.sort(
+            key=lambda r: (-(r["with_subs_pct"] or 0.0), r["archetype"]),
+        )
+    else:
+        rows.sort(key=lambda r: (-r["owned_pct"], r["archetype"]))
+
+    if args.min is not None:
+        key = "with_subs_pct" if args.with_subs else "owned_pct"
+        rows = [r for r in rows if (r[key] or 0.0) >= args.min]
+
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        _print_coverage_batch_text(rows, args.with_subs)
     return 0
 
 
@@ -3556,7 +3819,30 @@ def main(argv: list[str] | None = None) -> int:
         "coverage",
         help="%% of a deck buildable from your current collection",
     )
-    s.add_argument("deck", help="path to MTGA-export deck file")
+    s.add_argument(
+        "deck", nargs="?", default=None,
+        help="path to MTGA-export deck file (omit when using --batch)",
+    )
+    s.add_argument(
+        "--batch", action="store_true",
+        help="process every deck matching --glob",
+    )
+    s.add_argument(
+        "--glob", default=None, metavar="PAT",
+        help="glob pattern (e.g. 'decks/*/v1.txt'); supports ** with recursive",
+    )
+    s.add_argument(
+        "--with-subs", action="store_true",
+        help="also compute substitution-aware coverage via suggest-subs",
+    )
+    s.add_argument(
+        "--json", action="store_true",
+        help="emit JSON instead of text table (batch mode only)",
+    )
+    s.add_argument(
+        "--min", type=float, default=None, metavar="N",
+        help="filter rows below this fraction in [0,1] (ranking metric)",
+    )
     s.set_defaults(func=cmd_coverage)
 
     s = sub.add_parser(
