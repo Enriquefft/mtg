@@ -28,6 +28,7 @@ Subcommands:
     coverage <deck.txt>           % of deck you can build right now
     diff <a.txt> <b.txt>          per-card delta between two deck files
     suggest-subs <deck.txt> -f F  propose owned replacements for missing cards
+    fetch-meta <format>           scrape a meta source -> decks/<fmt>/ + meta.json
 
 Run `mtg <subcommand> --help` for details.
 """
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import glob as glob_mod
+import hashlib
 import json
 import os
 import pickle
@@ -50,6 +52,26 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+# Per-source meta parsers live alongside this file in `tools/mtg_sources/`.
+# The package isn't on sys.path by default (tools/ is a script dir, not a
+# package root), so wire it in before the import. Spec named the package
+# `tools/mtg/sources/`, but `tools/mtg` is a bash wrapper file — directory
+# at that path would shadow it and break the documented `tools/mtg <cmd>`
+# UX. The single-segment rename preserves SSOT and the published CLI.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mtg_sources._common import (  # noqa: E402  (import-after-sys.path)
+    DECK_LINE_RE,
+    SECTION_HEADERS,
+    MULTIFACE_LAYOUTS,
+    DeckEntry,
+    ParsedDeck,
+    slugify,
+)
+from mtg_sources.mtgazone import (  # noqa: E402
+    parse_mtgazone,
+    url_for_format as mtgazone_url_for_format,
+)
 
 ROOT = Path(os.environ.get("MTG_ROOT") or Path(__file__).resolve().parent.parent)
 DATA = ROOT / "data"
@@ -386,17 +408,9 @@ def cmd_legal(args: argparse.Namespace) -> int:
 
 # ---------- deck parsing + validation ------------------------------------
 
-DECK_LINE_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s+\(([A-Za-z0-9]+)\)\s+(\S+)\s*$")
-SECTION_HEADERS = {"deck", "commander", "companion", "sideboard", "maybeboard"}
-
-
-@dataclass
-class DeckEntry:
-    count: int
-    name: str
-    set_code: str
-    collector: str
-    section: str  # 'commander' | 'deck' | 'sideboard' | ...
+# DECK_LINE_RE / SECTION_HEADERS / DeckEntry / MULTIFACE_LAYOUTS are
+# imported from `mtg_sources._common` (single source of truth so per-host
+# scrapers in `tools/mtg_sources/` and the rest of this CLI can't drift).
 
 
 def parse_deck(path: Path) -> list[DeckEntry]:
@@ -421,18 +435,6 @@ def parse_deck(path: Path) -> list[DeckEntry]:
 
 
 BRAWL_FORMATS = {"brawl", "standardbrawl"}
-
-# Layouts whose Scryfall `name` is "Front // Back". MTGA's deck importer
-# rejects deck-lines that use only the front face for these — even though
-# Scryfall happily resolves either spelling. Source for layout list:
-# https://scryfall.com/docs/api/layouts
-MULTIFACE_LAYOUTS = frozenset({
-    "split",
-    "adventure",
-    "modal_dfc",
-    "transform",
-    "flip",
-})
 
 
 def _write_mtga_export(path: Path, entries: list[DeckEntry]) -> None:
@@ -3642,6 +3644,221 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- fetch-meta ---------------------------------------------------
+
+# Per-source registry. Each entry maps `--source <name>` to the parser
+# callable that turns raw HTML into `list[ParsedDeck]`. Adding a new
+# source = adding a `tools/mtg_sources/<host>.py` and registering its
+# `parse_<host>` here. **Hard rule**: every entry must also expose a
+# `url_for_format(fmt) -> str | None` so `cmd_fetch_meta` can resolve
+# the URL without hardcoding it. Keep these two-tuple to avoid a third
+# config layer.
+_FETCH_META_PARSERS = {
+    "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
+}
+
+# Sources the spec lists in the `--source` choices but that we have not
+# wired a parser for. Listed explicitly so `argparse` accepts the choice
+# and `cmd_fetch_meta` can emit a deferred-source error message rather
+# than argparse's generic "invalid choice" — gives Claude an actionable
+# pointer to docs/sources.md.
+_FETCH_META_DEFERRED_SOURCES = ("untapped", "mtggoldfish")
+
+_META_CACHE_TTL_SECS = 24 * 3600
+
+
+def _meta_cache_path(source: str, url: str) -> Path:
+    """Where to stash the raw HTML for `(source, url)`.
+
+    sha256(url)[:16] keeps filenames bounded and stable across runs;
+    `data/meta-cache/<source>/<hash>.html` namespaces by source so two
+    parsers can request the same URL without colliding.
+    """
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return DATA / "meta-cache" / source / f"{digest}.html"
+
+
+def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
+    """Fetch HTML for `url`, honouring a 24h on-disk cache.
+
+    Hard-fails on HTTP non-200 (raises HTTPError; caller catches and
+    surfaces). Cache writes are atomic-ish (write + rename) so a killed
+    process can't leave a half-written file that a later run trusts.
+    """
+    cache_path = _meta_cache_path(source, url)
+    if not no_cache and cache_path.exists():
+        age = time.time() - cache_path.stat().st_mtime
+        if age <= _META_CACHE_TTL_SECS:
+            return cache_path.read_text(encoding="utf-8", errors="replace")
+
+    raw = _req(url, accept="text/html,application/xhtml+xml")
+    text = raw.decode("utf-8", errors="replace")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, cache_path)
+    return text
+
+
+def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
+    """Materialise `decks` to `<out_dir>/<slug>.txt` + meta.json sidecar.
+
+    Sidecar is **merge-by-filename**: existing entries keyed by other
+    filenames are preserved, entries this run produced overwrite their
+    own keys. Lets the caller refresh one source without losing
+    sidecar entries written by a different source / earlier run.
+
+    Returns the merged sidecar dict so callers (incl. --json mode) can
+    print it without re-reading from disk.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "meta.json"
+    sidecar: dict[str, dict] = {}
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text())
+            if isinstance(existing, dict):
+                sidecar = existing
+        except (OSError, json.JSONDecodeError):
+            sidecar = {}
+
+    for d in decks:
+        deck_file = out_dir / f"{d.slug}.txt"
+        _write_mtga_export(deck_file, d.entries)
+        sidecar[deck_file.name] = {
+            "source": d.source,
+            "tier": d.tier,
+            "winrate": d.winrate,
+            "sample": d.sample,
+            "fetched": d.fetched,
+            "archetype": d.archetype,
+            "url": d.url,
+        }
+
+    meta_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+    return sidecar
+
+
+def cmd_fetch_meta(args: argparse.Namespace) -> int:
+    """Scrape a meta source into a directory of MTGA-export deck files.
+
+    Hard-fail policy (production-ready floor — any of these = exit 1,
+    nothing written to --out):
+      * unknown / deferred source;
+      * unsupported format for the chosen source;
+      * HTTP non-200;
+      * parser returns zero decks from a 200 page (= schema drift);
+      * resolution failures that would leave `--out` empty.
+    """
+    source = args.source
+    if source in _FETCH_META_DEFERRED_SOURCES:
+        print(
+            f"unknown source: {source} (deferred — see docs/sources.md "
+            f"bot-block table; mtgazone is the supported parser as of "
+            f"2026-04-30)",
+            file=sys.stderr,
+        )
+        return 2
+    if source not in _FETCH_META_PARSERS:
+        print(f"unknown source: {source}", file=sys.stderr)
+        return 2
+
+    parse_fn, url_fn = _FETCH_META_PARSERS[source]
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+    url = url_fn(fmt)
+    if url is None:
+        print(
+            f"{source} does not publish a tier list for format {fmt!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    _warn_if_stale()
+    fetched = time.strftime("%Y-%m-%d", time.gmtime())
+
+    try:
+        html_text = _fetch_meta_page(url, source=source, no_cache=args.no_cache)
+    except urllib.error.HTTPError as e:
+        print(f"fetch failed: {url} -> HTTP {e.code}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"fetch failed: {url} -> {e.reason}", file=sys.stderr)
+        return 1
+
+    try:
+        decks = parse_fn(
+            html_text, fmt, fetched=fetched, url=url, resolve_name=_resolve_card,
+        )
+    except ValueError as e:
+        print(f"parser drift on {url}: {e}", file=sys.stderr)
+        return 1
+
+    if not decks:
+        print(
+            f"parser drift on {url}: 0 decks extracted from a 200 response. "
+            f"Source page likely changed structure; do not write to --out.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.limit is not None and args.limit > 0:
+        decks = decks[: args.limit]
+
+    out_dir = Path(args.out) if args.out else (
+        ROOT / "decks" / fmt
+    )
+    sidecar = _write_meta_corpus(decks, out_dir)
+
+    if args.json:
+        print(json.dumps({
+            "source": source,
+            "format": fmt,
+            "url": url,
+            "fetched": fetched,
+            "out": str(out_dir),
+            "deck_count": len(decks),
+            "decks": [
+                {
+                    "slug": d.slug,
+                    "archetype": d.archetype,
+                    "tier": d.tier,
+                    "url": d.url,
+                    "main": sum(e.count for e in d.entries if e.section == "deck"),
+                    "sideboard": sum(
+                        e.count for e in d.entries if e.section == "sideboard"
+                    ),
+                }
+                for d in decks
+            ],
+        }, indent=2))
+        return 0
+
+    print(f"source : {source}")
+    print(f"url    : {url}")
+    print(f"format : {fmt}")
+    print(f"out    : {out_dir}")
+    print(f"decks  : {len(decks)}")
+    print(f"sidecar: {len(sidecar)} total entries")
+    print()
+    print(f"{'tier':<4}  {'main':>4}  {'sb':>3}  {'slug':<32}  archetype")
+    print("-" * 78)
+    for d in decks:
+        main_n = sum(e.count for e in d.entries if e.section == "deck")
+        sb_n = sum(e.count for e in d.entries if e.section == "sideboard")
+        print(
+            f"{d.tier or '-':<4}  {main_n:>4}  {sb_n:>3}  "
+            f"{d.slug[:32]:<32}  {d.archetype}"
+        )
+    return 0
+
+
 # ---------- entrypoint ---------------------------------------------------
 
 
@@ -3868,6 +4085,44 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("a", help="path to the older / left-hand deck file")
     s.add_argument("b", help="path to the newer / right-hand deck file")
     s.set_defaults(func=cmd_diff)
+
+    s = sub.add_parser(
+        "fetch-meta",
+        help="scrape a meta source into <out>/<archetype>.txt + meta.json",
+    )
+    s.add_argument(
+        "format",
+        help=(
+            "Arena format (standard/alchemy/historic/timeless/explorer/pioneer). "
+            "Brawl variants are not on mtgazone tier lists."
+        ),
+    )
+    s.add_argument(
+        "--source",
+        choices=("untapped", "mtggoldfish", "mtgazone"),
+        default="mtgazone",
+        help=(
+            "meta source (default: mtgazone). 'untapped' and 'mtggoldfish' are "
+            "deferred — see docs/sources.md."
+        ),
+    )
+    s.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="output dir (default: decks/<format>/)",
+    )
+    s.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="cap deck count after parsing (default: all)",
+    )
+    s.add_argument(
+        "--json", action="store_true",
+        help="emit JSON manifest instead of human-readable table",
+    )
+    s.add_argument(
+        "--no-cache", action="store_true",
+        help="bypass the 24h on-disk HTML cache and re-fetch",
+    )
+    s.set_defaults(func=cmd_fetch_meta)
 
     args = p.parse_args(argv)
     return args.func(args)

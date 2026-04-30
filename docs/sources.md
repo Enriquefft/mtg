@@ -17,8 +17,8 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | host | status | decision |
 |---|---|---|
 | `api.scryfall.com` | 200 | canonical, always use |
-| `mtga.untapped.gg` | 200 | primary Arena meta source |
-| `mtgazone.com` | 200 | secondary, deck articles |
+| `mtga.untapped.gg` | 200 (page) / 403 (api) | **API-only, scrape blocked as of 2026-04-30 — deferred.** Tier-list and deck pages are a Next.js SPA shell with no server-rendered decklists; the underlying `api.mtga.untapped.gg` JSON endpoints return 403 to anonymous calls. Manual research / WebFetch only. |
+| `mtgazone.com` | 200 | **primary `fetch-meta` parser.** Tier-list pages (e.g. `/<format>-bo1-metagame-tier-list/`) carry server-rendered `<div class="deck-block">` decklists; deck-article URLs do not. |
 | `mtgaassistant.net` | 200 | secondary, Brawl meta breakdown |
 | `magic.wizards.com` | 200 | official ban announcements |
 | `mtggoldfish.com` | 200 (occasional 403) | primary paper meta; retry once on 403, then fall back |
@@ -59,33 +59,34 @@ All URLs below are WebFetch-safe (return 200 to scripted requests).
 Listed primary → fallback per format.
 
 ### Historic Brawl (Scryfall key: `brawl`)
-- https://mtga.untapped.gg/constructed/historic-brawl/tier-list — tier list + win rates
+- https://mtga.untapped.gg/constructed/historic-brawl/tier-list — **API-only, scrape blocked (deferred)**; manual research only
 - https://mtgaassistant.net/Meta/Historic-Brawl/ — meta breakdown
 
 ### Standard Brawl (Scryfall key: `standardbrawl`)
-- https://mtgazone.com/standard-brawl/
+- https://mtgazone.com/standard-brawl/ — deck articles only; mtgazone publishes no Brawl tier list, so `fetch-meta` does not support this format
 - https://mtgaassistant.net/Meta/Brawl
 
 ### Standard
 - https://www.mtggoldfish.com/metagame/standard
-- https://mtga.untapped.gg/constructed/standard/tier-list
-- https://mtgazone.com/standard
+- https://mtga.untapped.gg/constructed/standard/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtgazone.com/standard-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone standard`
 
 ### Alchemy
-- https://mtga.untapped.gg/constructed/alchemy/tier-list
-- https://mtgazone.com/alchemy
+- https://mtga.untapped.gg/constructed/alchemy/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtgazone.com/alchemy-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone alchemy`
 
 ### Historic
 - https://www.mtggoldfish.com/metagame/historic
-- https://mtga.untapped.gg/constructed/historic/tier-list
-- https://mtgazone.com/historic
+- https://mtga.untapped.gg/constructed/historic/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
 
 ### Timeless
-- https://mtga.untapped.gg/constructed/timeless/tier-list
-- https://mtgazone.com/timeless
+- https://mtga.untapped.gg/constructed/timeless/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtgazone.com/timeless-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone timeless`
 
 ### Pioneer (Arena's Explorer format draws from this pool)
-- https://mtga.untapped.gg/constructed/explorer/tier-list — **Arena-native Pioneer-equivalent, prefer this for Arena deck-building**
+- https://mtga.untapped.gg/constructed/explorer/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer` (also reached via `--source mtgazone pioneer`)
 - https://www.mtggoldfish.com/metagame/pioneer — paper Pioneer; retry once on 403
 
 ## Banlist + announcements
