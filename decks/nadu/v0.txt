@@ -20,7 +20,7 @@ Deck
 1 Badgermole Cub (TLA) 167
 1 Ranger's Guile (M21) 199
 1 You Find a Cursed Idol (AFR) 213
-1 Sea Gate Restoration (ZNR) 76
+1 Sea Gate Restoration // Sea Gate, Reborn (ZNR) 76
 1 Tireless Tracker (SIR) 219
 1 Tatyova, Benthic Druid (FDN) 247
 1 Growth Spiral (RNA) 178
@@ -30,7 +30,7 @@ Deck
 1 Scalding Tarn (MH2) 254
 1 Arcane Signet (ELD) 331
 1 Restless Vinestalk (WOE) 261
-1 Khalni Ambush (PIO) 181
+1 Khalni Ambush // Khalni Territory (PIO) 181
 1 Snakeskin Veil (OTJ) 181
 1 Tireless Provisioner (MH2) 180
 1 Split the Party (AFR) 76
@@ -57,9 +57,9 @@ Deck
 1 Lavaspur Boots (OTJ) 243
 1 Lost Jitte (BIG) 23
 1 Desert (SPG) 37
-1 Sink into Stupor (MH3) 241
-1 Tamiyo, Inquisitive Student (MH3) 242
-1 Bridgeworks Battle (MH3) 249
+1 Sink into Stupor // Soporific Springs (MH3) 241
+1 Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar (MH3) 242
+1 Bridgeworks Battle // Tanglespan Bridgeworks (MH3) 249
 1 Collective Resistance (MH3) 147
 1 Fanatic of Rhonas (MH3) 152
 1 Silent Hallcreeper (DSK) 72
@@ -76,7 +76,7 @@ Deck
 1 Prismatic Vista (SPG) 38
 1 Gemstone Caverns (EOS) 16
 1 Boseiju, Who Endures (NEO) 266
-1 Barkchannel Pathway (KHM) 251
+1 Barkchannel Pathway // Tidechannel Pathway (KHM) 251
 1 Misty Rainforest (MH2) 250
 1 Yavimaya, Cradle of Growth (MH2) 261
 1 Fabled Passage (ELD) 244

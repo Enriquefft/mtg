@@ -62,7 +62,7 @@ Deck
 1 Jukai Naturalist (NEO) 225
 1 Setessan Champion (THB) 198
 1 Sythis, Harvest's Hand (MH2) 214
-1 Esika, God of the Tree (KHM) 168
+1 Esika, God of the Tree // The Prismatic Bridge (KHM) 168
 1 Weaver of Harmony (NEO) 213
 1 Phelia, Exuberant Shepherd (MH3) 40
 1 Displacer Kitten (HBG) 115
