@@ -625,7 +625,7 @@ _RX_MANA_ROCK = re.compile(
 # Tutor = library search that fetches a non-land card. Land searches —
 # both "basic land" and by-type ("Plains, Island, Swamp, or Mountain
 # card", Farseek-style) — are ramp, not tutors. The ramp regex below
-# matches all those cases; _classify suppresses `tutor` whenever `ramp`
+# matches all those cases; classify_card suppresses `tutor` whenever `ramp`
 # also matches, which is cheaper and more correct than encoding the
 # basic-type list in a negative lookahead twice.
 _RX_TUTOR = re.compile(
@@ -668,7 +668,7 @@ def _all_text(c: dict) -> str:
     return "\n".join(parts).lower()
 
 
-def _classify(c: dict) -> set[str]:
+def classify_card(c: dict) -> set[str]:
     tags: set[str] = set()
     type_line = (c.get("type_line") or "").lower()
     text = _all_text(c)
@@ -791,7 +791,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         if c is None:
             rows.append((e, None, set(), 0))
             continue
-        tags = _classify(c)
+        tags = classify_card(c)
         cmc = int(c.get("cmc") or 0)
         for t in tags:
             role_counts[t] = role_counts.get(t, 0) + e.count
@@ -1166,6 +1166,47 @@ def _jegantha_ok(c: dict) -> bool:
     return len(pips) == len(set(pips))
 
 
+def _lurrus_ok(c: dict) -> bool:
+    return (
+        "land" in (c.get("type_line") or "").lower()
+        or not _is_permanent(c)
+        or (c.get("cmc") or 0) <= _COMPANION_LURRUS_MAX_CMC
+    )
+
+
+def _kaheera_ok(c: dict) -> bool:
+    tline = (c.get("type_line") or "").lower()
+    if "creature" not in tline:
+        return True
+    tokens = set(tline.replace("—", " ").split())
+    return bool(tokens & _COMPANION_KAHEERA_TYPES)
+
+
+def _gyruda_ok(c: dict) -> bool:
+    return (
+        "land" in (c.get("type_line") or "").lower()
+        or (c.get("cmc") or 0) % 2 == 0
+    )
+
+
+def _keruga_ok(c: dict) -> bool:
+    return (
+        "land" in (c.get("type_line") or "").lower()
+        or (c.get("cmc") or 0) >= _COMPANION_KERUGA_MIN_CMC
+    )
+
+
+def _obosh_ok(c: dict) -> bool:
+    return (
+        "land" in (c.get("type_line") or "").lower()
+        or (c.get("cmc") or 0) % 2 == 1
+    )
+
+
+def _zirda_ok(c: dict) -> bool:
+    return not _is_permanent(c) or _has_activated_ability(c)
+
+
 def cmd_companion(args: argparse.Namespace) -> int:
     """Check each MTGA companion's eligibility predicate against the deck.
 
@@ -1197,25 +1238,11 @@ def cmd_companion(args: argparse.Namespace) -> int:
     checks: list[tuple[str, list[str]]] = []
 
     # Lurrus: every nonland permanent card has cmc <= 2.
-    bad = _violations(
-        lambda c: (
-            "land" in (c.get("type_line") or "").lower()
-            or not _is_permanent(c)
-            or (c.get("cmc") or 0) <= _COMPANION_LURRUS_MAX_CMC
-        ),
-        "lurrus",
-    )
+    bad = _violations(_lurrus_ok, "lurrus")
     checks.append(("Lurrus of the Dream-Den (cmc<=2 nonland permanents)", bad))
 
     # Kaheera: every creature card shares a type from the whitelist.
-    def kaheera_ok(c: dict) -> bool:
-        tline = (c.get("type_line") or "").lower()
-        if "creature" not in tline:
-            return True
-        tokens = set(tline.replace("—", " ").split())
-        return bool(tokens & _COMPANION_KAHEERA_TYPES)
-
-    bad = _violations(kaheera_ok, "kaheera")
+    bad = _violations(_kaheera_ok, "kaheera")
     types_label = "/".join(sorted(_COMPANION_KAHEERA_TYPES))
     checks.append((f"Kaheera, the Orphanguard (creatures must be: {types_label})", bad))
 
@@ -1232,33 +1259,15 @@ def cmd_companion(args: argparse.Namespace) -> int:
     checks.append(("Yorion, Sky Nomad (>=80-card starting deck)", yorion_msg))
 
     # Gyruda: every nonland card has even cmc (0, 2, 4, ...).
-    bad = _violations(
-        lambda c: (
-            "land" in (c.get("type_line") or "").lower()
-            or (c.get("cmc") or 0) % 2 == 0
-        ),
-        "gyruda",
-    )
+    bad = _violations(_gyruda_ok, "gyruda")
     checks.append(("Gyruda, Doom of Depths (nonland cards have even cmc)", bad))
 
     # Keruga: every nonland card has cmc >= 3.
-    bad = _violations(
-        lambda c: (
-            "land" in (c.get("type_line") or "").lower()
-            or (c.get("cmc") or 0) >= _COMPANION_KERUGA_MIN_CMC
-        ),
-        "keruga",
-    )
+    bad = _violations(_keruga_ok, "keruga")
     checks.append(("Keruga, the Macrosage (nonland cmc>=3)", bad))
 
     # Obosh: every nonland card has odd cmc (1, 3, 5, ...).
-    bad = _violations(
-        lambda c: (
-            "land" in (c.get("type_line") or "").lower()
-            or (c.get("cmc") or 0) % 2 == 1
-        ),
-        "obosh",
-    )
+    bad = _violations(_obosh_ok, "obosh")
     checks.append(("Obosh, the Preypiercer (nonland cards have odd cmc)", bad))
 
     # Umori: only one card type among nonland cards (excluding land/instant
@@ -1284,10 +1293,7 @@ def cmd_companion(args: argparse.Namespace) -> int:
     checks.append(("Umori, the Collector (one nonland card type)", umori_msg))
 
     # Zirda: every permanent card has an activated ability.
-    bad = _violations(
-        lambda c: not _is_permanent(c) or _has_activated_ability(c),
-        "zirda",
-    )
+    bad = _violations(_zirda_ok, "zirda")
     checks.append(("Zirda, the Dawnwaker (every permanent has activated ability)", bad))
 
     # Lutri: no card appears more than once (singleton, ignoring basic
@@ -1441,6 +1447,18 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 _MTGA_STEAM_APPID = "2141910"
 COLLECTION_PATH = DATA / "collection.json"
+
+
+def _warn_if_collection_stale(max_age_d: float = 7.0) -> None:
+    if not COLLECTION_PATH.exists():
+        return
+    age_d = (time.time() - COLLECTION_PATH.stat().st_mtime) / 86400
+    if age_d > max_age_d:
+        print(
+            f"[warn] collection snapshot is {age_d:.1f}d old; "
+            f"consider `mtg collection dump`",
+            file=sys.stderr,
+        )
 
 
 def _candidate_log_paths() -> list[Path]:
@@ -2181,6 +2199,7 @@ def _empty_state_message() -> str:
 
 
 def cmd_collection(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         sys.stdout.write(_empty_state_message())
@@ -2220,6 +2239,7 @@ def cmd_collection(args: argparse.Namespace) -> int:
 
 def cmd_collection_import(args: argparse.Namespace) -> int:
     _warn_if_stale()
+    _warn_if_collection_stale()
     src = Path(args.file).expanduser()
     if not src.exists():
         sys.exit(f"file not found: {src}")
@@ -2238,6 +2258,7 @@ def cmd_collection_import(args: argparse.Namespace) -> int:
 
 def cmd_collection_from_decks(args: argparse.Namespace) -> int:
     _warn_if_stale()
+    _warn_if_collection_stale()
     log_path = _resolve_log_path(args.log)
     print(f"reading log: {log_path}", file=sys.stderr)
     text = log_path.read_text(errors="replace")
@@ -2280,6 +2301,7 @@ def cmd_collection_from_decks(args: argparse.Namespace) -> int:
 
 def cmd_collection_dump(args: argparse.Namespace) -> int:
     _warn_if_stale()
+    _warn_if_collection_stale()
     out_path = Path(args.out).expanduser() if args.out else (DATA / "collection.dump.json")
     cards = _inject_dump(out_path)
     if not cards:
@@ -2299,6 +2321,7 @@ def cmd_collection_dump(args: argparse.Namespace) -> int:
 
 
 def cmd_own(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         sys.exit(_empty_state_message().rstrip())
@@ -2325,6 +2348,7 @@ def cmd_own(args: argparse.Namespace) -> int:
 
 
 def cmd_owned(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         print(
@@ -2475,6 +2499,7 @@ def _deck_gap_rows(
 
 
 def cmd_gaps(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         sys.exit(_empty_state_message().rstrip())
@@ -2518,6 +2543,7 @@ def cmd_gaps(args: argparse.Namespace) -> int:
 
 
 def cmd_coverage(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         sys.exit(_empty_state_message().rstrip())
@@ -2591,6 +2617,7 @@ def _resolve_wantlist_decks(
 
 
 def cmd_wantlist(args: argparse.Namespace) -> int:
+    _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
         print(
