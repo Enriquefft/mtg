@@ -31,6 +31,7 @@ Subcommands:
     fetch-meta <format>           scrape a meta source -> decks/<fmt>/ + meta.json
     freq <format>                 card-frequency index over decks/<fmt>/*.txt
     shells --format F             cluster owned cards by keyword/type/theme
+    recommend --format F          rank corpus decks you can build + shell bridge
 
 Run `mtg <subcommand> --help` for details.
 """
@@ -5707,6 +5708,348 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- recommend (collection-aware archetype + shell roll-up) -------
+
+
+def _recommend_build_status(row: dict, min_threshold: float) -> str:
+    """Classify a deck row into BUILDABLE / NEEDS_STAPLES / BLOCKED.
+
+    BLOCKED beats NEEDS_STAPLES beats BUILDABLE — we report the worst
+    blocker first so the user always sees the actual gating issue:
+
+      * BLOCKED        — F2 anchor missing (commander or ≥50% corpus
+                         staple). Substitution refuses to fill these,
+                         so the deck simply isn't this deck without
+                         them.
+      * NEEDS_STAPLES  — F2 sub-fidelity floor tripped (`subs_acceptable`
+                         False, i.e. > max-sub-pct of the deck would be
+                         swapped). The user owns enough cards in role
+                         shape to limp, but not enough to be playing
+                         the archetype.
+      * BUILDABLE      — owned_pct >= --min AND subs_acceptable AND no
+                         missing anchors. Buildable today.
+
+    Falls through to NEEDS_STAPLES when none of the explicit blockers
+    fire but the deck is below `min_threshold` — "you don't own enough
+    of the right cards" reads to the user as "needs staples", which is
+    accurate.
+    """
+    if row.get("anchor_unfilled", 0) > 0:
+        return "BLOCKED"
+    if row.get("subs_acceptable") is False:
+        return "NEEDS_STAPLES"
+    base = max(
+        row.get("owned_pct") or 0.0,
+        row.get("with_subs_pct") or 0.0,
+    )
+    if base >= min_threshold:
+        return "BUILDABLE"
+    return "NEEDS_STAPLES"
+
+
+def _recommend_compute(
+    args: argparse.Namespace,
+) -> tuple[dict, list[dict], list[dict]]:
+    """Pure-compute core for `cmd_recommend`.
+
+    Returns ``(meta, deck_rows, shell_rows)`` where:
+      * `meta` is the run header (format, min, top, max_sub_pct, plus
+        `corpus_size` / `decks_considered` / `buildable_count` so the
+        text and JSON renderers stay in sync on the same numbers).
+      * `deck_rows` are `_coverage_row` outputs (with F2 sidecar fields
+        + `build_status` enum) sorted by composite desc and capped at
+        `--top`. Already filtered against `--min` (via
+        `owned_pct + with_subs_pct < 2 * min` — the F2 clamp means
+        with_subs_pct == owned_pct when subs are unacceptable, so this
+        also catches `NEEDS_STAPLES` decks that are nowhere close).
+      * `shell_rows` are non-empty cluster->archetype matches when
+        `--include-shells` is set OR fewer than 3 BUILDABLE decks
+        survived the filter (the spec's auto-fallback so the user
+        always gets *something* actionable).
+    """
+    fmt = args.format.lower()
+    min_threshold = float(args.min)
+    top_n = int(args.top)
+    max_sub_pct = float(args.max_sub_pct)
+    quiet = bool(getattr(args, "json", False))
+
+    deck_paths = _corpus_deck_files(fmt)
+    snap = _load_collection()  # checked by caller; never None here.
+    assert snap is not None
+
+    idx = _load_index()
+    owned = _aggregate_by_name(idx, _cards_owned(snap))
+
+    deck_rows: list[dict] = []
+    if deck_paths:
+        fallback_warn = [False]
+        for path in deck_paths:
+            row = _coverage_row(
+                path, idx, snap, owned,
+                with_subs=True,
+                fallback_warn=fallback_warn,
+                quiet=quiet,
+                max_sub_pct=max_sub_pct,
+                include_subs_meta=True,
+            )
+            row["build_status"] = _recommend_build_status(row, min_threshold)
+            deck_rows.append(row)
+
+    # Filter: drop decks where neither owned nor sub-pct are anywhere
+    # close to the threshold. F2 clamps with_subs_pct == owned_pct when
+    # subs are unacceptable, so persist-combo (8.5% owned, sub-pct cap
+    # tripped) ends up at 0.085 + 0.085 = 0.17 < 0.60 and gets dropped
+    # cleanly. Decks that fail anchor checks but are otherwise in range
+    # survive (so the user sees the BLOCKED status with the missing
+    # anchor in the build advice).
+    cutoff = 2.0 * min_threshold
+    filtered = [
+        r for r in deck_rows
+        if (r["owned_pct"] + (r["with_subs_pct"] or 0.0)) >= cutoff
+    ]
+    filtered.sort(key=lambda r: (-r["composite"], r["archetype"]))
+    capped = filtered[:top_n]
+
+    buildable_count = sum(1 for r in capped if r["build_status"] == "BUILDABLE")
+    want_shells = bool(getattr(args, "include_shells", False)) or (
+        buildable_count < 3
+    )
+
+    shell_rows: list[dict] = []
+    if want_shells:
+        cards_owned = _cards_owned(snap)
+        clusters = _shell_cluster_rows(
+            idx, cards_owned, fmt,
+            by="keyword",
+            min_cards=15 if fmt in BRAWL_FORMATS else 24,
+            top_anchors=10,
+        )
+        archetype_anchors = _load_archetype_anchors(fmt)
+        freq_index = _load_freq_index(fmt, rebuild_if_stale=False)
+        if freq_index is None or not (freq_index.get("cards") or {}):
+            freq_index = None
+        for cl in clusters:
+            shell_names = cl.get("_card_names") or set()
+            matches = (
+                _shell_corpus_matches(
+                    shell_names, archetype_anchors, freq_index,
+                    min_pct=0.30, min_count=5,
+                )
+                if archetype_anchors else []
+            )
+            if not matches:
+                continue
+            shell_rows.append({
+                "cluster_key": cl["key"],
+                "owned_count": cl["count"],
+                "anchors": cl["anchors"],
+                "matches": matches,
+            })
+
+    meta = {
+        "format": fmt,
+        "min": round(min_threshold, 4),
+        "top": top_n,
+        "max_sub_pct": round(max_sub_pct, 4),
+        "corpus_size": len(deck_paths),
+        "decks_considered": len(deck_rows),
+        "buildable_count": buildable_count,
+        "shells_emitted": bool(shell_rows),
+        "shells_reason": (
+            "include_shells" if getattr(args, "include_shells", False)
+            else ("fallback" if buildable_count < 3 else "none")
+        ),
+    }
+    return meta, capped, shell_rows
+
+
+def _print_recommend_text(
+    meta: dict, decks: list[dict], shells: list[dict],
+) -> None:
+    """Human render. Sections mirror the JSON shape exactly:
+    a per-deck ranked list with build advice + (when applicable) a
+    cluster->archetype shell bridge.
+    """
+    fmt = meta["format"]
+    print(
+        f"recommend (fmt={fmt}, corpus={meta['corpus_size']}, "
+        f"min={meta['min']}, top={meta['top']}, "
+        f"max-sub-pct={meta['max_sub_pct']})"
+    )
+    print()
+
+    if not decks:
+        print(
+            f"no decks above min={meta['min']} — try lowering --min, "
+            f"expanding the corpus, or running tools/mtg fetch-meta"
+        )
+    else:
+        print("=== ranked decks ===")
+        for r in decks:
+            wc = r["missing_wc"]
+            wc_str = (
+                f"{wc['mythic']}/{wc['rare']}/{wc['uncommon']}/{wc['common']}"
+            )
+            owned_pct = (r["owned_pct"] or 0.0) * 100
+            sub_pct = (r["with_subs_pct"] or 0.0) * 100
+            tier_str = r["tier"] or "-"
+            line = (
+                f"  {r['archetype']:<32} tier={tier_str:<2} "
+                f"composite={r['composite']:.4f}  "
+                f"owned={owned_pct:.0f}% (subs={sub_pct:.0f}%)  "
+                f"missing {wc_str} WC"
+            )
+            print(line)
+            top3 = r.get("top3_missing") or []
+            if top3:
+                print(f"    top missing: {', '.join(top3)}")
+            anchor_unfilled = r.get("anchor_unfilled", 0)
+            anchor_total = r.get("anchor_total", 0)
+            if anchor_unfilled > 0:
+                print(
+                    f"    anchors missing: {anchor_unfilled} of {anchor_total}"
+                )
+            status = r["build_status"]
+            if status == "BUILDABLE":
+                advice = "    -> BUILDABLE"
+            elif status == "BLOCKED":
+                advice = "    -> BLOCKED — anchor missing"
+            else:  # NEEDS_STAPLES
+                advice = (
+                    f"    -> NEEDS STAPLES "
+                    f"({wc['mythic']}x mythic, {wc['rare']}x rare)"
+                )
+            print(advice)
+            print()
+
+    why = meta.get("shells_reason")
+    if shells or why in {"include_shells", "fallback"}:
+        suffix = (
+            "" if why == "include_shells"
+            else "  (auto-shown: < 3 BUILDABLE decks)"
+        )
+        print(f"=== shell -> archetype bridge ==={suffix}")
+        if not shells:
+            print("  (no clusters above match threshold)")
+        for s in shells:
+            match_strs = []
+            for m in s["matches"]:
+                pct = m["overlap_pct"] * 100
+                tier = m.get("tier") or "-"
+                match_strs.append(
+                    f"{m['archetype']} [{tier}] {pct:.0f}% overlap"
+                )
+            print(
+                f"  [{s['cluster_key']}] ({s['owned_count']} owned cards)"
+                f" -> matches: {', '.join(match_strs)}"
+            )
+
+
+def cmd_recommend(args: argparse.Namespace) -> int:
+    """End-to-end: rank decks the user can build and surface novel-deck
+    shells. Always uses the live `data/collection.json` snapshot — the
+    headline goal is "what should I actually play tonight", not
+    "what could I play if I owned more". Errors out cleanly if the
+    snapshot is missing.
+
+    Output sections:
+      1. Ranked deck recommendations (composite-sorted, capped at
+         --top; per-deck build_status: BUILDABLE / NEEDS_STAPLES /
+         BLOCKED).
+      2. Shell -> archetype bridge (always with --include-shells; auto
+         when < 3 BUILDABLE decks survive the --min filter).
+
+    Stale freq index emits a one-line stderr warn — `recommend` reads
+    `_freq.json` for sub-scoring + shell match weighting, so the user
+    knows the prior may be off without us forcing a rebuild on a
+    read-only command.
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+    args.format = fmt
+
+    if not (0.0 <= args.min <= 1.0):
+        print("--min must be in [0, 1]", file=sys.stderr)
+        return 2
+    if args.top <= 0:
+        print("--top must be > 0", file=sys.stderr)
+        return 2
+    if not (0.0 < args.max_sub_pct <= 1.0):
+        print("--max-sub-pct must be in (0, 1]", file=sys.stderr)
+        return 2
+
+    if _load_collection() is None:
+        print(
+            "no collection snapshot — run 'tools/mtg collection dump' first",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not _corpus_deck_files(fmt):
+        msg = (
+            f"[warn] no corpus for {fmt} — "
+            f"run tools/mtg fetch-meta {fmt} first"
+        )
+        if args.json:
+            print(msg, file=sys.stderr)
+            _emit_json({
+                "format": fmt,
+                "min": round(float(args.min), 4),
+                "top": int(args.top),
+                "max_sub_pct": round(float(args.max_sub_pct), 4),
+                "corpus_size": 0,
+                "decks": [],
+                "shells": [],
+            })
+        else:
+            print(msg, file=sys.stderr)
+        return 0
+
+    if _freq_index_is_stale(fmt):
+        idx_path = _freq_index_path(fmt)
+        if idx_path.exists():
+            age_days = max(
+                0,
+                int((time.time() - idx_path.stat().st_mtime) // 86400),
+            )
+            print(
+                f"[warn] freq index for {fmt} is {age_days} days old "
+                f"(corpus newer); consider tools/mtg freq {fmt} --rebuild",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[warn] freq index for {fmt} missing; "
+                f"consider tools/mtg freq {fmt} --rebuild",
+                file=sys.stderr,
+            )
+
+    meta, decks, shells = _recommend_compute(args)
+
+    if args.json:
+        _emit_json({
+            "format": meta["format"],
+            "min": meta["min"],
+            "top": meta["top"],
+            "max_sub_pct": meta["max_sub_pct"],
+            "corpus_size": meta["corpus_size"],
+            "decks_considered": meta["decks_considered"],
+            "buildable_count": meta["buildable_count"],
+            "shells_reason": meta["shells_reason"],
+            "decks": decks,
+            "shells": shells,
+        })
+        return 0
+
+    _print_recommend_text(meta, decks, shells)
+    return 0
+
+
 # ---------- entrypoint ---------------------------------------------------
 
 
@@ -6092,6 +6435,45 @@ def main(argv: list[str] | None = None) -> int:
         help="bypass the 24h on-disk HTML cache and re-fetch",
     )
     s.set_defaults(func=cmd_fetch_meta)
+
+    s = sub.add_parser(
+        "recommend",
+        help="rank corpus decks you can build (composite-sorted) + "
+             "shell->archetype bridge for novel-deck discovery",
+    )
+    s.add_argument(
+        "--format", required=True,
+        help="Arena format (must have a corpus under decks/<format>/)",
+    )
+    s.add_argument(
+        "--min", type=float, default=0.30, metavar="N",
+        help=(
+            "drop decks where owned_pct + with_subs_pct < 2*N "
+            "(default: 0.30; F2 clamp means decks with sub-pct cap "
+            "tripped are filtered when ownership is also low)"
+        ),
+    )
+    s.add_argument(
+        "--top", type=int, default=10, metavar="N",
+        help="cap ranked deck list at N (default: 10)",
+    )
+    s.add_argument(
+        "--include-shells", action="store_true",
+        help=(
+            "always emit the shell->archetype bridge section (otherwise "
+            "auto-shown only when < 3 BUILDABLE decks survive --min)"
+        ),
+    )
+    s.add_argument(
+        "--max-sub-pct", type=float, default=0.30, metavar="N",
+        help=(
+            "F2 sub-fidelity floor: clamp with_subs_pct to owned_pct "
+            "when more than N (0.0-1.0) of the deck would be substituted "
+            "(default: 0.30 = 30%%)"
+        ),
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_recommend)
 
     args = p.parse_args(argv)
     return args.func(args)
