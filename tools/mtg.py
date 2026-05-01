@@ -29,6 +29,7 @@ Subcommands:
     diff <a.txt> <b.txt>          per-card delta between two deck files
     suggest-subs <deck.txt> -f F  propose owned replacements for missing cards
     fetch-meta <format>           scrape a meta source -> decks/<fmt>/ + meta.json
+    shells --format F             cluster owned cards by keyword/type/theme
 
 Run `mtg <subcommand> --help` for details.
 """
@@ -1991,6 +1992,26 @@ def _aggregate_by_name(
 
 
 _RARITY_ORDER = {"common": 1, "uncommon": 2, "rare": 3, "mythic": 4}
+# Keywords on cards everywhere — Flying / Trample / Vigilance / etc. They
+# match thousands of cards apiece and tell you nothing about a synergy
+# cluster. `cmd_shells` filters them out so the keyword bucketer surfaces
+# named mechanics (Blitz, Survival, Squad, Repartee, Aftermath, …) only.
+_EVERGREEN_KEYWORDS = frozenset({
+    "Flying",
+    "First strike",
+    "Deathtouch",
+    "Haste",
+    "Vigilance",
+    "Lifelink",
+    "Trample",
+    "Reach",
+    "Menace",
+    "Hexproof",
+    "Defender",
+    "Flash",
+    "Ward",
+    "Indestructible",
+})
 _BASIC_NAMES = frozenset({"plains", "island", "swamp", "mountain", "forest", "wastes"})
 
 
@@ -3377,6 +3398,230 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- shells (cluster owned cards for novel-deck discovery) --------
+
+# Role tags eligible as shell themes. `_ROLE_TYPE` entries (creature /
+# instant / land / …) are intentionally excluded — "all my creatures" is
+# not a shell, it's a card pool. Only function tags survive: removal,
+# sweeper, counter, hand_attack, peek, card_advantage, loot, tutor, ramp,
+# recursion, threat, wincon. Mirrors the `_ROLE_FUNC` keys exactly so
+# adding a new function role surfaces here automatically.
+_SHELL_THEME_KEYS = frozenset(k for k, _ in _ROLE_FUNC)
+
+
+def _shell_cluster_rows(
+    idx: dict,
+    cards_owned: dict[int, int],
+    fmt: str,
+    by: str,
+    min_cards: int,
+    top_anchors: int,
+) -> list[dict]:
+    """Bucket the user's owned, format-legal cards by `by` and return the
+    structured cluster list both text and JSON output consume.
+
+    Same return shape across modes — text and JSON render identical rows.
+    """
+    # Dedup by canonical name (the index already canonicalises multi-face
+    # cards to `Front // Back`, so the cluster output spells them that way
+    # without any reconstruction here).
+    seen_names: set[str] = set()
+    owned_cards: list[dict] = []
+    for aid in cards_owned:
+        c = idx["by_arena_id"].get(aid)
+        if c is None:
+            continue
+        if not _card_legal_in(c, fmt):
+            continue
+        type_line = (c.get("type_line") or "").lower()
+        if "basic" in type_line and "land" in type_line:
+            continue
+        name = c["name"]
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        owned_cards.append(c)
+
+    clusters: dict[str, list[dict]] = {}
+    for c in owned_cards:
+        type_line = (c.get("type_line") or "").lower()
+        if by == "keyword":
+            keys = {
+                kw for kw in (c.get("keywords") or [])
+                if kw not in _EVERGREEN_KEYWORDS
+            }
+        elif by == "type":
+            if "creature" not in type_line:
+                continue
+            full_type = c.get("type_line") or ""
+            if " — " not in full_type:
+                continue
+            subtype_str = full_type.split(" — ", 1)[1]
+            keys = set(subtype_str.split())
+        elif by == "theme":
+            keys = classify_card(c) & _SHELL_THEME_KEYS
+        else:
+            keys = set()
+        for k in keys:
+            clusters.setdefault(k, []).append(c)
+
+    rows: list[dict] = []
+    for key, cards in clusters.items():
+        if len(cards) < min_cards:
+            continue
+        # Color-identity union, in WUBRG order; "C" if every card is
+        # colorless. `color_pairs` is the sorted distinct identity each
+        # card contributes (a deck-builder skim signal — does this cluster
+        # actually overlap on colors, or is it a wishful union of mono
+        # cards in different colors?).
+        union: set[str] = set()
+        pair_set: set[str] = set()
+        for c in cards:
+            ci = c.get("color_identity") or []
+            union.update(ci)
+            pair_set.add("".join(sorted(ci, key=_COLORS.index)))
+        colors_str = "".join(col for col in _COLORS if col in union) or "C"
+        color_pairs = sorted(pair_set)
+
+        # Anchors: highest-rarity first, tie-break by CMC desc then name
+        # asc. Mythics + rares are the "build around" cards a shell hangs
+        # off; commons are usually glue.
+        sorted_cards = sorted(
+            cards,
+            key=lambda c: (
+                -_RARITY_ORDER.get(c.get("rarity") or "common", 0),
+                -(c.get("cmc") or 0),
+                c["name"],
+            ),
+        )
+        anchors: list[dict] = []
+        for c in sorted_cards[:top_anchors]:
+            ci_list = c.get("color_identity") or []
+            anchors.append({
+                "name": c["name"],
+                "set": (c.get("set") or "").upper(),
+                "collector_number": str(c.get("collector_number") or ""),
+                "rarity": c.get("rarity") or "",
+                "cmc": float(c.get("cmc") or 0),
+                "color_identity":
+                    "".join(sorted(ci_list, key=_COLORS.index)) or "C",
+            })
+
+        rows.append({
+            "key": key,
+            "count": len(cards),
+            "colors": colors_str,
+            "color_pairs": color_pairs,
+            "anchors": anchors,
+        })
+
+    rows.sort(key=lambda r: (-r["count"], r["key"]))
+    return rows
+
+
+def cmd_shells(args: argparse.Namespace) -> int:
+    """Group owned, format-legal cards into synergy clusters.
+
+    The CLI does enumeration; you do taste. Three bucketers — `keyword`
+    (Blitz / Survival / Squad / …), `type` (creature subtypes for tribal
+    decks), `theme` (function-role tags from `classify_card`) — surface
+    the shells the meta corpus misses. `--min-cards` defaults to 24 for
+    constructed and 15 for Brawl: enough themed slots to build around,
+    not so many that the threshold filters out real shells.
+
+    JSON schema (--json):
+    {
+      "format": "historic", "by": "keyword", "min_cards": 24,
+      "clusters": [
+        {"key": "Survival", "count": 31, "colors": "WUBRG",
+         "color_pairs": ["", "G", "GW", "BG"],
+         "anchors": [{"name": "Up the Beanstalk", "set": "WOE",
+                      "collector_number": "246", "rarity": "rare",
+                      "cmc": 2.0, "color_identity": "G"}]}
+      ]
+    }
+    """
+    _warn_if_stale()
+    _warn_if_collection_stale()
+
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    snap = _load_collection()
+    if snap is None:
+        print(
+            "no collection snapshot — run 'tools/mtg collection dump' first",
+            file=sys.stderr,
+        )
+        return 2
+
+    by = args.by
+    if args.min_cards is not None:
+        min_cards = args.min_cards
+    else:
+        min_cards = 15 if fmt in BRAWL_FORMATS else 24
+
+    idx = _load_index()
+    cards_owned = _cards_owned(snap)
+
+    clusters = _shell_cluster_rows(
+        idx, cards_owned, fmt, by, min_cards, args.top_anchors,
+    )
+    if args.limit is not None:
+        clusters = clusters[: args.limit]
+
+    if args.json:
+        json.dump(
+            {
+                "format": fmt,
+                "by": by,
+                "min_cards": min_cards,
+                "clusters": clusters,
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    if not clusters:
+        print(
+            f"no shells with ≥{min_cards} owned cards "
+            f"(fmt={fmt}, by={by})"
+        )
+        return 0
+
+    print(f"shells (fmt={fmt}, by={by}, min={min_cards}):")
+    print()
+    for cl in clusters:
+        pairs_str = ",".join(p or "C" for p in cl["color_pairs"])
+        print(
+            f"  [{cl['key']}] — {cl['count']} owned cards · "
+            f"colors: {cl['colors']} ({pairs_str})"
+        )
+        if cl["anchors"]:
+            print("    anchors:")
+            for a in cl["anchors"]:
+                cmc_val = a["cmc"]
+                cmc_str = (
+                    str(int(cmc_val)) if float(cmc_val).is_integer()
+                    else str(cmc_val)
+                )
+                print(
+                    f"      {a['name'][:38]:<38} "
+                    f"{a['set']:<5} {a['collector_number']:<5} "
+                    f"{a['rarity']:<7} cmc {cmc_str:<3} "
+                    f"{a['color_identity']:<4}"
+                )
+        print()
+    return 0
+
+
 _DECK_VERSION_RE = re.compile(r"v(\d+)\.txt$", re.IGNORECASE)
 
 
@@ -4081,6 +4326,36 @@ def main(argv: list[str] | None = None) -> int:
         help="filter rows below this fraction in [0,1] (ranking metric)",
     )
     s.set_defaults(func=cmd_coverage)
+
+    s = sub.add_parser(
+        "shells",
+        help="cluster owned cards by keyword/type/theme for novel-deck discovery",
+    )
+    s.add_argument(
+        "--format", required=True,
+        help="Arena format predicate (validated against ARENA_FORMATS)",
+    )
+    s.add_argument(
+        "--by", choices=("keyword", "type", "theme"), default="keyword",
+        help="bucketer (default: keyword)",
+    )
+    s.add_argument(
+        "--min-cards", type=int, default=None, metavar="N",
+        help="min cluster size (default: 15 for brawl, 24 otherwise)",
+    )
+    s.add_argument(
+        "--top-anchors", type=int, default=10, metavar="N",
+        help="anchor cards listed per cluster (default: 10)",
+    )
+    s.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="cap clusters listed (default: all)",
+    )
+    s.add_argument(
+        "--json", action="store_true",
+        help="emit JSON instead of text table",
+    )
+    s.set_defaults(func=cmd_shells)
 
     s = sub.add_parser(
         "wantlist",
