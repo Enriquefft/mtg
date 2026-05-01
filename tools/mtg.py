@@ -7628,6 +7628,57 @@ def _recommend_compute(
 
     buildable_count = sum(1 for r in capped if r["build_status"] == "BUILDABLE")
 
+    # Corpus health — disambiguates "thin numbers because corpus is sparse"
+    # from "thin numbers because the user's collection is sparse". Lets the
+    # caller (Claude in the headline-prompt loop, or a human) decide whether
+    # to expand sources, derive/invent, or craft. Computed off `deck_rows`
+    # (full considered corpus, pre-cutoff) so the percentiles reflect real
+    # ownership distribution, not the post-min-filter survivors.
+    #
+    # Bottleneck threshold uses the headline-goal floor (0.90), not
+    # `args.min`, so the diagnosis is stable across CLI invocations. The
+    # buildable count we compare against is computed off `filtered`
+    # (post-quality-gate, pre-top-N cap) so a user passing `--top 10`
+    # doesn't false-trigger the heuristic.
+    if deck_rows:
+        owned_sorted = sorted(float(r["owned_pct"] or 0.0) for r in deck_rows)
+        def _pct(p: float) -> float:
+            i = max(0, min(len(owned_sorted) - 1, int(p * (len(owned_sorted) - 1))))
+            return round(owned_sorted[i], 4)
+        median_owned_pct = _pct(0.50)
+        p25_owned_pct = _pct(0.25)
+        p75_owned_pct = _pct(0.75)
+        decks_at_min_or_above = sum(
+            1 for v in owned_sorted if v >= min_threshold
+        )
+    else:
+        median_owned_pct = 0.0
+        p25_owned_pct = 0.0
+        p75_owned_pct = 0.0
+        decks_at_min_or_above = 0
+    corpus_size = len(deck_paths)
+    buildable_total = sum(
+        1 for r in filtered if r["build_status"] == "BUILDABLE"
+    )
+    _HEADLINE_FLOOR = 0.90
+    if (
+        corpus_size >= 50
+        and median_owned_pct < _HEADLINE_FLOOR
+        and buildable_total < 10
+    ):
+        bottleneck = "collection"
+    elif corpus_size < 50 and buildable_total < 10:
+        bottleneck = "corpus"
+    else:
+        bottleneck = "none"
+    corpus_health = {
+        "median_owned_pct": median_owned_pct,
+        "p25_owned_pct": p25_owned_pct,
+        "p75_owned_pct": p75_owned_pct,
+        "decks_at_min_or_above": decks_at_min_or_above,
+        "bottleneck": bottleneck,
+    }
+
     # Top-level craft priority — computed off the full filtered set
     # (not just `capped`) so the ranking still reflects which crafts
     # unlock the deepest pool of buildable decks across the corpus,
@@ -7682,9 +7733,10 @@ def _recommend_compute(
         "max_sub_pct": round(max_sub_pct, 4),
         "quality": quality,
         "quality_dropped": quality_dropped,
-        "corpus_size": len(deck_paths),
+        "corpus_size": corpus_size,
         "decks_considered": len(deck_rows),
         "buildable_count": buildable_count,
+        "corpus_health": corpus_health,
         "craft_priority": craft_priority,
         "format_winrate_prior": (
             round(format_winrate_prior, 6) if format_winrate_prior is not None
@@ -7781,6 +7833,18 @@ def _print_recommend_text(
                 f"({entry['rarity']})"
             )
 
+    health = meta.get("corpus_health") or {}
+    if health.get("bottleneck") == "collection":
+        med = (health.get("median_owned_pct") or 0.0) * 100
+        print(
+            f"[note] median owned {med:.0f}% across "
+            f"{meta['corpus_size']}-deck corpus; bottleneck is collection, "
+            f"not corpus. Consider tools/mtg derive / invent for "
+            f"owned-card variants, or tools/mtg recommend --format all "
+            f"to see craft priorities across formats.",
+            file=sys.stderr,
+        )
+
 
 def cmd_recommend(args: argparse.Namespace) -> int:
     """End-to-end: rank decks the user can build and surface novel-deck
@@ -7851,6 +7915,13 @@ def cmd_recommend(args: argparse.Namespace) -> int:
                 "corpus_size": 0,
                 "decks_considered": 0,
                 "buildable_count": 0,
+                "corpus_health": {
+                    "median_owned_pct": 0.0,
+                    "p25_owned_pct": 0.0,
+                    "p75_owned_pct": 0.0,
+                    "decks_at_min_or_above": 0,
+                    "bottleneck": "corpus",
+                },
                 "craft_priority": [],
                 "format_winrate_prior": None,
                 "format_winrate_sample_size": 0,
@@ -7895,6 +7966,7 @@ def cmd_recommend(args: argparse.Namespace) -> int:
             "corpus_size": meta["corpus_size"],
             "decks_considered": meta["decks_considered"],
             "buildable_count": meta["buildable_count"],
+            "corpus_health": meta.get("corpus_health"),
             "craft_priority": meta.get("craft_priority") or [],
             "format_winrate_prior": meta.get("format_winrate_prior"),
             "format_winrate_sample_size": meta.get("format_winrate_sample_size", 0),
