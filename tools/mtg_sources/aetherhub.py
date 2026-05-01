@@ -176,11 +176,6 @@ def _entries_from_deck_page(
             else:
                 break
 
-        key = (name, section)
-        if key in seen:
-            continue
-        seen.add(key)
-
         printing = resolve_name(name)
         if printing is None:
             unresolved += count
@@ -190,9 +185,20 @@ def _entries_from_deck_page(
         if not set_code or not collector:
             unresolved += count
             continue
+        # Use Scryfall's canonical name (`Front // Back` for multi-face
+        # layouts). MTGA's deck importer rejects deck-lines that omit
+        # the back-face suffix for split/adventure/MDFC/transform/flip,
+        # and `cards_hash` keys by name — using the raw `data-card-name`
+        # attribute would (a) corrupt the deck file and (b) break cross-
+        # source dedup against moxfield/untapped which already canonicalise.
+        canonical_name = printing.get("name") or name
+        key = (canonical_name, section)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(DeckEntry(
             count=count,
-            name=name,
+            name=canonical_name,
             set_code=set_code,
             collector=collector,
             section=section,

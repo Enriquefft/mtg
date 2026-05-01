@@ -6745,9 +6745,6 @@ def _recommend_compute(
                 float(row.get("owned_pct") or 0.0),
                 max_steps=5,
             )
-            # `--format all` cross-format unlock count is out of scope
-            # for this revision; emit None so the JSON schema is stable.
-            row["cross_format_unlock"] = None
             deck_rows.append(row)
 
     # Filter: drop decks where neither owned nor sub-pct are anywhere
@@ -6988,7 +6985,12 @@ def cmd_recommend(args: argparse.Namespace) -> int:
                 "min": round(float(args.min), 4),
                 "top": int(args.top),
                 "max_sub_pct": round(float(args.max_sub_pct), 4),
+                "quality": getattr(args, "quality", "loose") or "loose",
+                "quality_dropped": 0,
                 "corpus_size": 0,
+                "decks_considered": 0,
+                "buildable_count": 0,
+                "craft_priority": [],
                 "decks": [],
                 "shells": [],
             })
