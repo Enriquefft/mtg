@@ -401,14 +401,23 @@ def _printings_for_name(name: str) -> list[dict]:
     return idx["by_name"].get(_normalize_name(name), [])
 
 
+_RESOLVE_CARD_MEMO: dict[str, dict | None] = {}
+
+
 def _resolve_card(name: str) -> dict | None:
     """Pick a representative printing. Prefer one with `arena` in games."""
+    key = _normalize_name(name)
+    if key in _RESOLVE_CARD_MEMO:
+        return _RESOLVE_CARD_MEMO[key]
     prints = _printings_for_name(name)
     if not prints:
+        _RESOLVE_CARD_MEMO[key] = None
         return None
     for p in prints:
         if "arena" in (p.get("games") or []):
+            _RESOLVE_CARD_MEMO[key] = p
             return p
+    _RESOLVE_CARD_MEMO[key] = prints[0]
     return prints[0]
 
 
@@ -899,7 +908,19 @@ def _all_text(c: dict) -> str:
     return "\n".join(parts).lower()
 
 
+_CLASSIFY_CARD_MEMO: dict[str, set[str]] = {}
+
+
 def classify_card(c: dict) -> set[str]:
+    # Memoize by oracle_id when available (stable across reprints; same
+    # card across sets returns the same tag set). Falls through to the
+    # un-memoized path for cards that lack an oracle_id (tokens, art-only
+    # rows). Returns the cached set itself — callers must not mutate.
+    oracle_id = c.get("oracle_id")
+    if oracle_id is not None:
+        cached = _CLASSIFY_CARD_MEMO.get(oracle_id)
+        if cached is not None:
+            return cached
     tags: set[str] = set()
     type_line = (c.get("type_line") or "").lower()
     text = _all_text(c)
@@ -963,6 +984,8 @@ def classify_card(c: dict) -> set[str]:
     if ("creature" in type_line or "planeswalker" in type_line) and cmc >= 4:
         tags.add("threat")
 
+    if oracle_id is not None:
+        _CLASSIFY_CARD_MEMO[oracle_id] = tags
     return tags
 
 
@@ -3382,20 +3405,31 @@ _SUPERTYPES = ("legendary", "basic", "snow", "world")
 # every heuristic match.
 
 
+_STRICTLYBETTER_CACHE_MEMO: dict | None = None
+
+
 def _strictlybetter_load_cache() -> dict:
     """Return the on-disk cache dict, or a fresh skeleton if missing/corrupt.
 
     Single source of truth for both subkeys; callers mutate and call
     `_strictlybetter_save_cache`. Corrupt JSON is logged and replaced —
     we never crash the CLI over a malformed sub-cache.
+
+    Memoized at module level — the cache file is ~7 MB, and `_run_suggest_subs`
+    calls this once per missing slot. `_strictlybetter_save_cache` invalidates
+    the memo so writers see their own writes back.
     """
+    global _STRICTLYBETTER_CACHE_MEMO
+    if _STRICTLYBETTER_CACHE_MEMO is not None:
+        return _STRICTLYBETTER_CACHE_MEMO
     skeleton = {
         "schema": STRICTLYBETTER_CACHE_SCHEMA,
         "functional_reprints": None,
         "obsoletes": None,
     }
     if not STRICTLYBETTER_CACHE.exists():
-        return dict(skeleton)
+        _STRICTLYBETTER_CACHE_MEMO = dict(skeleton)
+        return _STRICTLYBETTER_CACHE_MEMO
     try:
         data = json.loads(STRICTLYBETTER_CACHE.read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -3404,25 +3438,31 @@ def _strictlybetter_load_cache() -> dict:
             "starting fresh in-memory",
             file=sys.stderr,
         )
-        return dict(skeleton)
+        _STRICTLYBETTER_CACHE_MEMO = dict(skeleton)
+        return _STRICTLYBETTER_CACHE_MEMO
     if not isinstance(data, dict):
-        return dict(skeleton)
+        _STRICTLYBETTER_CACHE_MEMO = dict(skeleton)
+        return _STRICTLYBETTER_CACHE_MEMO
     if data.get("schema") != STRICTLYBETTER_CACHE_SCHEMA:
         # Stale schema — drop everything and refetch on demand. The
         # functional_reprints groups are direction-agnostic and could in
         # principle be preserved, but the cache is small and refetching
         # once is cheaper than version-aware partial migrations.
-        return dict(skeleton)
+        _STRICTLYBETTER_CACHE_MEMO = dict(skeleton)
+        return _STRICTLYBETTER_CACHE_MEMO
     data.setdefault("functional_reprints", None)
     data.setdefault("obsoletes", None)
-    return data
+    _STRICTLYBETTER_CACHE_MEMO = data
+    return _STRICTLYBETTER_CACHE_MEMO
 
 
 def _strictlybetter_save_cache(cache: dict) -> None:
     """Persist `cache` to disk. Best-effort: log and continue on OSError."""
+    global _STRICTLYBETTER_CACHE_MEMO
     try:
         DATA.mkdir(parents=True, exist_ok=True)
         STRICTLYBETTER_CACHE.write_text(json.dumps(cache, indent=2))
+        _STRICTLYBETTER_CACHE_MEMO = cache
     except OSError as e:
         print(
             f"[warn] could not write strictlybetter cache: {e}",
@@ -3800,25 +3840,37 @@ def _primary_type(type_line: str) -> str:
     return ""
 
 
+_FALLBACK_CACHE_MEMO: dict | None = None
+
+
 def _fallback_load_cache() -> dict:
+    global _FALLBACK_CACHE_MEMO
+    if _FALLBACK_CACHE_MEMO is not None:
+        return _FALLBACK_CACHE_MEMO
     skeleton: dict = {"schema": 1, "entries": {}, "fetched_at": {}}
     if not STRICTLYBETTER_FALLBACK_CACHE.exists():
-        return dict(skeleton)
+        _FALLBACK_CACHE_MEMO = dict(skeleton)
+        return _FALLBACK_CACHE_MEMO
     try:
         data = json.loads(STRICTLYBETTER_FALLBACK_CACHE.read_text())
     except (OSError, json.JSONDecodeError):
-        return dict(skeleton)
+        _FALLBACK_CACHE_MEMO = dict(skeleton)
+        return _FALLBACK_CACHE_MEMO
     if not isinstance(data, dict) or data.get("schema") != 1:
-        return dict(skeleton)
+        _FALLBACK_CACHE_MEMO = dict(skeleton)
+        return _FALLBACK_CACHE_MEMO
     data.setdefault("entries", {})
     data.setdefault("fetched_at", {})
-    return data
+    _FALLBACK_CACHE_MEMO = data
+    return _FALLBACK_CACHE_MEMO
 
 
 def _fallback_save_cache(cache: dict) -> None:
+    global _FALLBACK_CACHE_MEMO
     try:
         DATA.mkdir(parents=True, exist_ok=True)
         STRICTLYBETTER_FALLBACK_CACHE.write_text(json.dumps(cache, indent=2))
+        _FALLBACK_CACHE_MEMO = cache
     except OSError as e:
         print(
             f"[warn] could not write strictlybetter fallback cache: {e}",
