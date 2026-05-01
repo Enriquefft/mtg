@@ -543,7 +543,7 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
 
     # per-card legality + arena availability
     for e in entries:
-        if e.section not in {"deck", "commander", "sideboard"}:
+        if e.section not in {"deck", "commander", "sideboard", "companion"}:
             continue
         c = _resolve_card(e.name)
         if not c:
@@ -604,7 +604,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         print(f"per-card check ({fmt}):")
         ok_n = bad_n = 0
         for e in entries:
-            if e.section not in {"deck", "commander", "sideboard"}:
+            if e.section not in {"deck", "commander", "sideboard", "companion"}:
                 continue
             c = _resolve_card(e.name)
             if not c:
@@ -2023,7 +2023,7 @@ def _is_basic(card_or_name: dict | str) -> bool:
         tl = (card_or_name.get("type_line") or "").lower()
         if "basic" in tl and "land" in tl:
             return True
-    return nm.split(" //", 1)[0].strip().lower() in _BASIC_NAMES
+    return nm.split(" // ", 1)[0].strip().lower() in _BASIC_NAMES
 
 
 # ---- inject (live MTGA dump via Mono DLL injection) -------------------
@@ -3433,8 +3433,7 @@ def _shell_cluster_rows(
             continue
         if not _card_legal_in(c, fmt):
             continue
-        type_line = (c.get("type_line") or "").lower()
-        if "basic" in type_line and "land" in type_line:
+        if _is_basic(c):
             continue
         name = c["name"]
         if name in seen_names:
@@ -3805,6 +3804,7 @@ def _aggregate_deck_for_diff(
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
+    _warn_if_stale()
     a_path = Path(args.a)
     b_path = Path(args.b)
     for p in (a_path, b_path):
