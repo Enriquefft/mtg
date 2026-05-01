@@ -82,6 +82,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 from pathlib import Path
@@ -720,18 +721,30 @@ def parse_untapped(
 
     decks: list[ParsedDeck] = []
     seen_slugs: dict[str, int] = {}
+    total_archetypes = len(archetypes)
+    target = limit if (limit is not None and limit > 0) else total_archetypes
+    # Progress tick: a brawl walk at limit=250 is ~250 HTTP fetches and
+    # can stall up to 10s/archetype on a Cloudflare 202 chain. Without
+    # output the operator can't tell `fetch-meta` from a hung process;
+    # one-line stderr ticker every 10 archetypes (or every archetype
+    # when target is small) keeps the script visible.
+    tick_every = max(1, target // 25)
 
-    for aid, slug, archetype_url in archetypes:
+    for i, (aid, slug, archetype_url) in enumerate(archetypes, start=1):
         if limit is not None and limit > 0 and len(decks) >= limit:
             break
+        if i == 1 or i % tick_every == 0:
+            print(
+                f"[untapped] {i}/{total_archetypes} probed, "
+                f"{len(decks)}/{target} decks",
+                file=sys.stderr,
+                flush=True,
+            )
         try:
             api_decks, archetype_name, sample = _fetch_archetype_decks(
                 archetype_url, aid, fmt,
             )
         except (urllib.error.HTTPError, urllib.error.URLError):
-            # Single archetype fetch failed; keep walking the rest. The
-            # corpus-wide drift check at cmd_fetch_meta layer catches
-            # the case where every archetype fails.
             continue
 
         if not api_decks:

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import html as html_mod
 import re
+import sys
 import time
 import urllib.error
 from typing import Callable
@@ -253,8 +254,16 @@ def parse_aetherhub(
 
     decks: list[ParsedDeck] = []
     seen_slugs: dict[str, int] = {}
+    total_archetypes = len(archetype_ids)
+    tick_every = max(1, total_archetypes // 25)
 
-    for token in archetype_ids:
+    for i, token in enumerate(archetype_ids, start=1):
+        if i == 1 or i % tick_every == 0:
+            print(
+                f"[aetherhub] {i}/{total_archetypes} probed, {len(decks)} decks",
+                file=sys.stderr,
+                flush=True,
+            )
         deck_url = f"{_HOST}/Deck/{token}"
         try:
             page_html = _http_get_html(deck_url)
