@@ -3960,66 +3960,258 @@ def _freq_score_adjustment(deck_pct: float | None) -> float:
     return 0.0
 
 
-def _suggest_subs_score(
+# ---------- multi-dimensional candidate-scoring components ---------------
+#
+# Six small helpers consumed by `_score_candidate`. They keep the scorer
+# itself a thin sum-of-components, and let each dimension be unit-tested
+# in isolation.
+
+# CMC bands collapse mana costs into "fast / curve / midgame / topend /
+# overflow" buckets. Same-band match contributes the full +2; one-band
+# drift contributes +1 (still a meaningful CMC neighbor); larger gaps
+# contribute 0. Replaces the linear `cmc_term` whose -2 floor used to
+# silently zero past distance 2 — bands give us discrete, interpretable
+# behaviour at the boundary.
+_CMC_BANDS = ((0, 1), (2, 2), (3, 3), (4, 4))  # >=5 -> "overflow"
+
+
+def _cmc_band(cmc: float) -> int:
+    """Return the band index for a CMC value (0..4 inclusive).
+
+    0 -> 0-1 (fast), 1 -> 2, 2 -> 3, 3 -> 4, 4 -> 5+ (overflow).
+    """
+    n = int(cmc or 0)
+    for i, (lo, hi) in enumerate(_CMC_BANDS):
+        if lo <= n <= hi:
+            return i
+    return len(_CMC_BANDS)  # overflow band
+
+
+def _cmc_band_match(cand_cmc: float, miss_cmc: float) -> int:
+    """Band-distance score: 2 (same), 1 (adjacent), 0 (further)."""
+    d = abs(_cmc_band(cand_cmc) - _cmc_band(miss_cmc))
+    if d == 0:
+        return 2
+    if d == 1:
+        return 1
+    return 0
+
+
+def _oracle_jaccard(cand: dict, miss: dict) -> float:
+    """Token-set Jaccard similarity over normalised oracle text.
+
+    Reuses `_oracle_tokens` (reminder text stripped, card name -> "~",
+    multi-face combined). Returns 0.0 when either side has no oracle
+    tokens (lands, vanilla creatures), which is the documented graceful
+    degradation per §4 of the rework spec.
+    """
+    a = _oracle_tokens(cand)
+    b = _oracle_tokens(miss)
+    if not a or not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+def _archetype_prior(
+    cand_name: str,
+    deck_archetype: str | None,
+    freq_index: dict | None,
+) -> float:
+    """Probability-style prior that `cand_name` "belongs in" this deck's
+    archetype based on the corpus frequency index.
+
+    Specifically: if the candidate appears in >= 1 archetype, return the
+    fraction of the candidate's archetypes that match this deck's
+    archetype slug. With one match (the most common case) and the
+    candidate appearing in N archetypes total, this is `1 / N` — a
+    Llanowar-Elves-style staple appearing in every Mono-G archetype
+    earns ~0.05; a Phoenix-only namesake like Arclight earns 1.0.
+
+    Returns 0.0 when freq index is missing, the candidate has no
+    archetype data, or the deck's own archetype is unresolvable. Per §4.
+    """
+    if not freq_index or not deck_archetype:
+        return 0.0
+    cards = (freq_index.get("cards") or {})
+    row = cards.get(cand_name)
+    if not row:
+        return 0.0
+    archs = row.get("archetypes") or []
+    if not archs:
+        return 0.0
+    if deck_archetype in archs:
+        return 1.0 / len(archs)
+    return 0.0
+
+
+def _pip_vector(card: dict) -> dict[str, int] | None:
+    """Per-color pip count for the card's mana cost.
+
+    Hybrid pips contribute to every colour they list (so `{W/U}` adds
+    +1 to W AND +1 to U — correct: the deck can satisfy that pip from
+    EITHER source). Generic / X / colourless pips contribute nothing.
+    Returns None when the card has no mana_cost (lands, double-faced
+    backsides without a cost, etc) so the caller can short-circuit
+    pip-shape scoring (per §4 graceful degradation).
+    """
+    cost = (card.get("mana_cost") or "").strip()
+    if not cost:
+        return None
+    vec: dict[str, int] = {col: 0 for col in _COLORS}
+    for tok in _PIP_RE.findall(cost):
+        for col in _pip_colors(tok):
+            vec[col] += 1
+    return vec
+
+
+def _pip_shape_distance(cand: dict, miss: dict) -> float:
+    """Normalised L1 distance between two cards' colour-pip shapes.
+
+    Range: [0.0, 1.0]. 0.0 = identical pip shape (same colours, same
+    intensities); 1.0 = fully disjoint shapes. Used as a SUBTRACTIVE
+    component (penalises mismatched intensity even when CI passes).
+    Returns 0.0 (no penalty) when either card has no pip vector, so
+    lands and free-CMC cards don't artificially shift candidates.
+    """
+    a = _pip_vector(cand)
+    b = _pip_vector(miss)
+    if a is None or b is None:
+        return 0.0
+    a_total = sum(a.values())
+    b_total = sum(b.values())
+    if a_total == 0 and b_total == 0:
+        return 0.0
+    diff = sum(abs(a[c] - b[c]) for c in _COLORS)
+    denom = a_total + b_total
+    if denom == 0:
+        return 0.0
+    return diff / denom
+
+
+def _score_candidate(
     c: dict,
+    miss_card: dict,
     cand_roles: set[str],
     missing_roles: set[str],
     missing_cmc: float,
+    slot_weight: float,
+    deck_archetype: str | None,
+    freq_index: dict | None,
     is_rare_role,
     *,
     cand_deck_pct: float | None = None,
-) -> float:
+) -> dict:
     """Score one candidate card against one missing slot.
 
-    Components are summed, then multiplied by 1.5 if the missing slot
-    fills a role that's rare in the deck's pool (T=3, see caller). The
-    frequency adjustment (see `_freq_score_adjustment`) is added AFTER
-    the rare-role multiplier so that a "popular" candidate is rewarded
-    by the same +1.0 regardless of role-rarity, and a "random Scryfall
-    hit" is penalized by the same -2.0 — the freq term is about whether
-    the card belongs in real decks, not about how it fits this slot.
+    Components (single source of truth — text + JSON output both read
+    from the returned dict, no parallel formula anywhere):
+
+      base = role_term
+           + 2.0 * cmc_band_match
+           + type_term
+           + super_term
+           + 2.0 * oracle_text_jaccard
+           + 1.5 * archetype_prior
+           - 1.0 * pip_shape_distance
+      if rare_role_overlap: base *= 1.5
+      if slot_weight == 0.5:           # soft anchor
+          base = base * 0.5 - 3.0
+      base += freq_adjustment(cand_deck_pct)
+
+    Hard anchors (slot_weight == 1.0) are short-circuited by the caller
+    BEFORE this function runs — they never reach the scorer. Soft anchors
+    pay a flat 0.5x + -3.0 penalty so they're still allowed to substitute
+    but trail equivalently-scored flex-slot subs by ~3 points.
     """
     inter = len(cand_roles & missing_roles)
     role_term = 3.0 * inter / max(1, len(cand_roles))
-    cmc_term = 2.0 * max(0, 2 - abs((c.get("cmc") or 0) - missing_cmc))
+    cmc_band = _cmc_band(c.get("cmc") or 0)
+    cmc_band_score = _cmc_band_match(c.get("cmc") or 0, missing_cmc)
     type_term = 1.0 if (cand_roles & _PRIMARY_CARD_TYPES) & missing_roles else 0.0
     tl = (c.get("type_line") or "").lower()
     super_term = 1.0 if any(s in tl for s in _SUPERTYPES) else 0.0
-    score = role_term + cmc_term + type_term + super_term
-    # T=3: a role is "rare for this deck" iff fewer than 3 cards in the
-    # deck's pool tag it. Replacing a rare-role slot with a non-rare-role
-    # candidate hurts disproportionately, so we boost rare-role matches.
-    if any(is_rare_role(r) for r in (cand_roles & missing_roles)):
-        score *= 1.5
-    score += _freq_score_adjustment(cand_deck_pct)
-    return score
+    oracle_jac = _oracle_jaccard(c, miss_card)
+    arch_prior = _archetype_prior(
+        c.get("name") or "", deck_archetype, freq_index,
+    )
+    pip_dist = _pip_shape_distance(c, miss_card)
+    rare_role = bool(any(is_rare_role(r) for r in (cand_roles & missing_roles)))
+
+    base = (
+        role_term
+        + 2.0 * cmc_band_score
+        + type_term
+        + super_term
+        + 2.0 * oracle_jac
+        + 1.5 * arch_prior
+        - 1.0 * pip_dist
+    )
+    if rare_role:
+        base *= 1.5
+    if slot_weight == 0.5:
+        # Soft-anchor penalty: still substitutable, but only when no
+        # flex-slot equivalent exists. 0.5x + -3.0 means a soft-anchor
+        # sub trails an identically-scored flex sub by 3+ points.
+        base = base * 0.5 - 3.0
+    freq_adj = _freq_score_adjustment(cand_deck_pct)
+    base += freq_adj
+
+    return {
+        "total": base,
+        "role": role_term,
+        "cmc_band": cmc_band,
+        "cmc_band_match": cmc_band_score,
+        "type": type_term,
+        "super": super_term,
+        "oracle_jaccard": oracle_jac,
+        "archetype_prior": arch_prior,
+        "pip_distance": pip_dist,
+        "rare_role": rare_role,
+        "slot_weight": slot_weight,
+        "freq_adj": freq_adj,
+    }
 
 
-def _anchor_names(
+def _classify_slot_weights(
     entries: list[DeckEntry],
     fmt: str,
+    deck_path: Path,
     freq_index: dict | None,
+    archetype_anchors: dict[str, dict] | None,
     *,
-    deck_pct_threshold: float = 0.50,
-) -> set[str]:
-    """Canonical names of "anchor" cards in the deck.
+    soft_threshold: float = 0.40,
+    hard_threshold: float = 0.80,
+) -> dict[str, float]:
+    """Graded slot-weight classifier replacing the binary `_anchor_names`.
 
-    A card is an anchor (must NEVER be substituted) iff EITHER:
-      * It is the commander (Brawl identity envelope — replacing it
-        invalidates every other card; cmd_suggest_subs already preserves
-        the commander row, this just propagates the same status into
-        coverage / JSON / text).
-      * Its `deck_pct` in the freq index for this format is >=
-        `deck_pct_threshold` (default 0.50, i.e. shows up in 50%+ of
-        corpus decks for the format) — these are the format's real
-        staples; missing them means "you can't build this format right
-        now," not "swap them out."
+    Returns ``{canonical_name: weight}`` where:
+      * 1.0 ("hard") — never substituted; short-circuited by the caller
+        with `replacement: None, reason: "anchor"`. Triggers when ANY of:
+          - Brawl format AND `entry.section == "commander"`
+          - card name appears in this deck's archetype-anchor set
+            (sourced from `_load_archetype_anchors(fmt)`, keyed by
+            `deck_path.stem`)
+          - `freq_index["cards"][name]["deck_pct"] >= hard_threshold`
+            (default 0.80)
+      * 0.5 ("soft") — substitutable but penalised in the scorer; triggers
+        when `soft_threshold <= deck_pct < hard_threshold` (default
+        0.40-0.80, i.e. cards in 40-80% of corpus decks).
+      * 0.0 ("flex") — every other card. Implicit; not present in the
+        returned dict (caller uses ``.get(name, 0.0)``).
 
-    Anchors are sourced from main + commander + companion only;
-    sideboard cards never count as anchors (they're already optional in
-    a way main/commander cards aren't).
+    Anchors are sourced from main + commander + companion only; sideboard
+    cards never anchor (they're already optional in a way main isn't).
+    Basic lands are never anchors regardless of deck_pct.
+
+    Graceful degradation per §4: missing freq_index -> hard-only-for-
+    commander, flex everything else; missing archetype_anchors -> rule
+    1.b skipped silently; deck_path with no resolvable archetype slug ->
+    rule 1.b can't match.
     """
-    anchors: set[str] = set()
+    weights: dict[str, float] = {}
     is_brawl = fmt in BRAWL_FORMATS
     if is_brawl:
         for e in entries:
@@ -4027,27 +4219,57 @@ def _anchor_names(
                 continue
             c = _resolve_card(e.name)
             if c is not None:
-                anchors.add((c.get("name") or e.name))
-    if freq_index is None:
-        return anchors
-    cards = freq_index.get("cards") or {}
+                weights[c.get("name") or e.name] = 1.0
+
+    # Archetype-anchor lookup. NOTE: `_load_archetype_anchors` keys by
+    # `path.stem` and stores the FULL non-basic card list of each corpus
+    # deck (it powers `shells --match-corpus`, where "anchor" means "any
+    # card that's part of this archetype's reference build", not "named
+    # build-around card"). For suggest-subs we cannot use that as-is:
+    #   * Corpus decks substituting toward themselves would mark every
+    #     card hard and zero substitutions would fire (subs_pct = 0,
+    #     with_subs_pct == owned_pct), trivially breaking the F2 floor.
+    #   * Unioning across other archetypes would mark every popular card
+    #     hard everywhere — same outcome, different path.
+    # Per the §4 graceful-degradation contract, rule 1.b silently skips
+    # when no curated per-archetype anchor list exists. The corpus today
+    # has no such list — `deck_pct >= hard_threshold` (rule 1.c) and the
+    # commander rule (1.a) carry the hard-anchor load until the
+    # archetype-anchor schema grows a `named_anchors` field.
+    arch_card_set: set[str] = set()
+    _ = archetype_anchors  # reserved for future curated-anchor schema
+
+    cards_freq: dict[str, dict] = (freq_index or {}).get("cards") or {}
+
     for e in entries:
         if e.section not in {"deck", "commander", "companion"}:
             continue
         c = _resolve_card(e.name)
         if c is None:
             continue
-        # Basic lands are never anchors regardless of deck_pct (every
-        # deck plays Forests).
+        # Basics never anchor (every deck plays Forests).
         if _is_basic(c):
             continue
         name = c.get("name") or e.name
-        row = cards.get(name)
+        # Already hard from commander rule? Skip — can't downgrade.
+        if weights.get(name) == 1.0:
+            continue
+        # Rule 1.b: card is in this deck's archetype-anchor set.
+        if name in arch_card_set:
+            weights[name] = 1.0
+            continue
+        # Rule 1.c / 2: graded by deck_pct.
+        row = cards_freq.get(name)
         if row is None:
             continue
-        if float(row.get("deck_pct") or 0.0) >= deck_pct_threshold:
-            anchors.add(name)
-    return anchors
+        pct = float(row.get("deck_pct") or 0.0)
+        if pct >= hard_threshold:
+            weights[name] = 1.0
+        elif pct >= soft_threshold:
+            weights[name] = 0.5
+        # else: flex (implicit, not stored)
+
+    return weights
 
 
 def _run_suggest_subs(
@@ -4062,6 +4284,7 @@ def _run_suggest_subs(
     max_sub_pct: float = 0.30,
     freq_index: dict | None = None,
     strictlybetter: bool = True,
+    archetype_anchors: dict[str, dict] | None = None,
 ) -> dict:
     """Pure-compute core of `suggest-subs`.
 
@@ -4078,9 +4301,14 @@ def _run_suggest_subs(
 
     Sub-fidelity floor (F-batch):
       * `anchor_check=True` (default) protects format staples and the
-        commander from substitution — anchor slots emit a
-        `replacement: None`, `reason: "anchor"` row instead of a
-        candidate list.
+        commander from substitution. Slot weights are graded:
+          - 1.0 (hard anchor): never substituted; emits
+            `replacement: None`, `reason: "anchor"`. Triggers for the
+            commander, archetype-anchor cards, and `deck_pct >= 0.80`.
+          - 0.5 (soft anchor): substitutable but penalised in the
+            scorer (0.5x base + -3.0). Triggers for `0.40 <= deck_pct
+            < 0.80`.
+          - 0.0 (flex): no penalty.
       * Candidate scoring is biased toward corpus-popular cards via
         `_freq_score_adjustment` (uses `freq_index` if supplied; loaded
         on demand otherwise).
@@ -4100,6 +4328,11 @@ def _run_suggest_subs(
         cache is empty / API unreachable / no owned reprint exists.
       * `strictlybetter=False` skips the API lookup entirely (offline
         mode; surfaced as `--no-strictlybetter` on `cmd_suggest_subs`).
+
+    `archetype_anchors`: optional pre-loaded `_load_archetype_anchors(fmt)`
+    map. Pass through when calling repeatedly across decks of the same
+    format to avoid re-walking the corpus per call. Loaded on demand
+    when None.
 
     Caller is responsible for:
       - calling `_warn_if_stale()` / `_warn_if_collection_stale()`
@@ -4129,9 +4362,33 @@ def _run_suggest_subs(
             return None
         return float(row.get("deck_pct") or 0.0)
 
-    anchors = (
-        _anchor_names(entries, fmt, freq_index) if anchor_check else set()
-    )
+    # Archetype-anchor map — loaded on demand when caller didn't pre-pass.
+    # Used by `_classify_slot_weights` to honor explicit anchor lists for
+    # the deck's archetype.
+    if archetype_anchors is None:
+        try:
+            archetype_anchors = _load_archetype_anchors(fmt)
+        except Exception:
+            archetype_anchors = {}
+
+    # Deck's archetype slug — drives the `_archetype_prior` component
+    # below. For corpus decks this matches `_load_archetype_anchors`'s
+    # key (path stem); human drafts in `decks/<name>/v0.txt` resolve to
+    # `v0` and won't appear in the freq index — `_archetype_prior`
+    # handles that case (returns 0.0; graceful degradation per §4).
+    deck_archetype = _archetype_for_deck(deck_path)
+
+    if anchor_check:
+        slot_weights = _classify_slot_weights(
+            entries, fmt, deck_path, freq_index, archetype_anchors,
+        )
+    else:
+        slot_weights = {}
+    # Legacy `anchors` set kept for `_coverage_with_subs_pct` consumers
+    # and the public JSON schema — only the hard anchors (slot_weight ==
+    # 1.0). Soft anchors substitute, so they're not "anchors" in the
+    # original sense.
+    anchors = {n for n, w in slot_weights.items() if w == 1.0}
 
     # Build the deck's role pool for the rare-role frequency check —
     # every resolved commander/deck/sideboard card contributes its tag
@@ -4228,13 +4485,14 @@ def _run_suggest_subs(
                 for n in _heuristic_functional_reprints(miss_name, fmt):
                     fb_names_lc.add(n.lower())
 
-        # Anchor preservation: a card is an anchor if it's the commander
-        # OR appears in >= 50% of corpus decks for this format. Anchors
-        # are NEVER substituted — when missing, the deck is fundamentally
-        # not buildable and the slot is emitted with `replacement: None`,
-        # `reason: "anchor"`. cmd_suggest_subs renders this as
-        # `ANCHOR (missing)` and refuses to fill it during --apply.
-        if miss_name in anchors:
+        # Slot-weight preservation: hard anchors (1.0) — the commander,
+        # archetype-anchor cards, and corpus staples (deck_pct >= 0.80) —
+        # are NEVER substituted. cmd_suggest_subs renders these as
+        # `ANCHOR (missing)` and refuses to fill them during --apply.
+        # Soft anchors (0.5) DO produce candidates but pay a flat
+        # 0.5x base + -3.0 penalty in `_score_candidate`.
+        miss_slot_weight = slot_weights.get(miss_name, 0.0)
+        if miss_slot_weight >= 1.0:
             unfilled += 1
             anchor_unfilled += 1
             json_missing.append({
@@ -4246,14 +4504,18 @@ def _run_suggest_subs(
                 "cmc": miss_cmc,
                 "type_line": slot["type_line"],
                 "anchor": True,
+                "slot_weight": 1.0,
                 "replacement": None,
                 "reason": "anchor",
                 "candidates": [],
             })
             continue
 
+        # Per-candidate tuple: (score, scryfall card, owned info, rare-role
+        # boost flag, game-changer flag, candidate deck_pct, strictlybetter
+        # source string|None, full score-components dict).
         candidates: list[
-            tuple[float, dict, dict, bool, bool, float | None, bool]
+            tuple[float, dict, dict, bool, bool, float | None, str | None, dict]
         ] = []
         for cand_name_lc, info in owned_by_name.items():
             cand_display = info.get("name") or ""
@@ -4300,13 +4562,14 @@ def _run_suggest_subs(
                     )
                 continue
             cand_deck_pct = _deck_pct_for(cand_display)
-            score = _suggest_subs_score(
-                c, cand_roles, miss_roles, miss_cmc, _is_rare_role,
+            score_components = _score_candidate(
+                c, miss_card, cand_roles, miss_roles, miss_cmc,
+                miss_slot_weight, deck_archetype, freq_index,
+                _is_rare_role,
                 cand_deck_pct=cand_deck_pct,
             )
-            rare_boost = any(
-                _is_rare_role(r) for r in (cand_roles & miss_roles)
-            )
+            score = score_components["total"]
+            rare_boost = score_components["rare_role"]
             cand_lc = cand_display.lower()
             if cand_lc in sb_names_lc:
                 sb_source: str | None = "strictlybetter_eu"
@@ -4318,11 +4581,14 @@ def _run_suggest_subs(
                 # Community-validated or heuristic-reprint match --
                 # outranks every pure heuristic score match by construction.
                 # Both tiers use the same boost so the caller can still
-                # distinguish them via strictlybetter_source.
+                # distinguish them via strictlybetter_source. Mirror it
+                # into the components dict so downstream consumers see
+                # the post-boost total.
                 score += SB_BOOST
+                score_components = {**score_components, "total": score}
             candidates.append((
                 score, c, info, rare_boost, cand_game_changer, cand_deck_pct,
-                sb_source,
+                sb_source, score_components,
             ))
 
         candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
@@ -4341,7 +4607,10 @@ def _run_suggest_subs(
             "roles": sorted(miss_roles),
             "cmc": miss_cmc,
             "type_line": slot["type_line"],
-            "anchor": False,
+            # Legacy `anchor: bool` derived from slot_weight for any
+            # consumer still keying on the binary distinction.
+            "anchor": miss_slot_weight >= 1.0,
+            "slot_weight": miss_slot_weight,
             "candidates": [
                 {
                     "name": c.get("name"),
@@ -4356,6 +4625,24 @@ def _run_suggest_subs(
                         round(cand_deck_pct, 4)
                         if cand_deck_pct is not None else None
                     ),
+                    # Top-level surface of the §2 components most useful
+                    # for consumers (recommend / coverage / external
+                    # tooling). Full breakdown lives under
+                    # `score_components` for diagnostic / regression use.
+                    "oracle_jaccard": round(
+                        sc.get("oracle_jaccard") or 0.0, 4,
+                    ),
+                    "cmc_band": sc.get("cmc_band"),
+                    "archetype_prior": round(
+                        sc.get("archetype_prior") or 0.0, 4,
+                    ),
+                    "pip_distance": round(
+                        sc.get("pip_distance") or 0.0, 4,
+                    ),
+                    "score_components": {
+                        k: (round(v, 4) if isinstance(v, float) else v)
+                        for k, v in sc.items()
+                    },
                     # Legacy bool kept for backward-compat: True when any
                     # strictlybetter source (eu or fallback) matched.
                     "strictlybetter": sb_source is not None,
@@ -4363,8 +4650,8 @@ def _run_suggest_subs(
                     # or None (pure heuristic scorer, no reprint signal).
                     "strictlybetter_source": sb_source,
                 }
-                for score, c, info, rare_boost, gc, cand_deck_pct, sb_source
-                in candidates
+                for score, c, info, rare_boost, gc, cand_deck_pct,
+                sb_source, sc in candidates
             ],
         })
 
@@ -4429,7 +4716,7 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     {
       "deck": "decks/foo/v1.txt",
       "format": "brawl",
-      "anchors": ["Card Name", ...],
+      "anchors": ["Card Name", ...],   # only hard anchors (slot_weight==1.0)
       "subs_acceptable": true,         # false when subs_pct > --max-sub-pct
       "subs_pct": 0.18,                # cards_substituted / non_basic_main
       "max_sub_pct": 0.30,
@@ -4441,13 +4728,27 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
           "needed": 1, "owned": 0, "deficit": 1,
           "roles": ["threat"], "cmc": 4,
           "type_line": "Legendary Creature — Phyrexian Praetor",
-          "anchor": false,
-          # When anchor: candidates=[], replacement=None, reason="anchor"
+          "anchor": false,             # legacy bool: slot_weight == 1.0
+          "slot_weight": 0.0,          # 0.0 flex / 0.5 soft / 1.0 hard
+          # When hard anchor: candidates=[], replacement=None, reason="anchor"
           "candidates": [
             {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
              "cmc": 4, "type_line": "...",
              "rare_role_boost": false, "game_changer": false,
              "deck_pct": 0.12,
+             # New §2 dimensions surfaced top-level for cheap reads:
+             "oracle_jaccard": 0.34,   # token-set Jaccard on oracle text
+             "cmc_band": 2,            # bucket: 0-1, 2, 3, 4, 5+
+             "archetype_prior": 0.25,  # 1/N where cand appears in N archetypes
+             "pip_distance": 0.0,      # normalised L1 mana-shape distance
+             # Full per-component breakdown (regression / debugging surface):
+             "score_components": {
+                "total": 7.5, "role": 1.5, "cmc_band": 2,
+                "cmc_band_match": 2, "type": 1.0, "super": 0.0,
+                "oracle_jaccard": 0.34, "archetype_prior": 0.25,
+                "pip_distance": 0.0, "rare_role": false,
+                "slot_weight": 0.0, "freq_adj": 1.0,
+             },
              "strictlybetter": true,
              "strictlybetter_source": "strictlybetter_eu"|"fallback_heuristic"|null}
           ]
@@ -4492,12 +4793,18 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         sys.exit(_empty_state_message().rstrip())
     idx = _load_index()
 
+    # Pre-load archetype anchors so the slot-weight classifier inside
+    # `_run_suggest_subs` can honor explicit per-archetype anchor lists
+    # for this format. Single load here keeps the call self-contained.
+    archetype_anchors = _load_archetype_anchors(fmt)
+
     result = _run_suggest_subs(
         deck_path, fmt, idx, snap, args.max_per_card,
         quiet=args.json,
         anchor_check=not args.no_anchor_check,
         max_sub_pct=args.max_sub_pct,
         strictlybetter=not args.no_strictlybetter,
+        archetype_anchors=archetype_anchors,
     )
     json_missing = result["missing"]
     summary = result["summary"]
@@ -4726,6 +5033,7 @@ def _coverage_with_subs_pct(
     quiet: bool = False,
     max_sub_pct: float = 0.30,
     out: dict | None = None,
+    archetype_anchors: dict[str, dict] | None = None,
 ) -> float:
     """Re-run suggest-subs and fold filled deficits into coverage.
 
@@ -4794,6 +5102,7 @@ def _coverage_with_subs_pct(
         return owned_pct
     result = _run_suggest_subs(
         deck_path, fmt, idx, snap, quiet=quiet, max_sub_pct=max_sub_pct,
+        archetype_anchors=archetype_anchors,
     )
     if out is not None:
         summary = result.get("summary") or {}
@@ -4868,6 +5177,7 @@ def _coverage_row(
     quiet: bool = False,
     max_sub_pct: float | None = None,
     include_subs_meta: bool = False,
+    archetype_anchors_cache: dict[str, dict[str, dict]] | None = None,
 ) -> dict:
     """Compute one batch-mode row. Mutates fallback_warn[0] -> True
     when this deck's parent dir is not in ARENA_FORMATS.
@@ -4911,10 +5221,21 @@ def _coverage_row(
     with_subs_pct: float | None = None
     subs_meta: dict = {}
     if with_subs:
+        # Lazy per-format archetype-anchor load so the batch caller can
+        # hand us a shared cache and we only walk the corpus once per
+        # format across the whole batch (ranking 400+ decks otherwise
+        # re-walks the same corpus 400 times).
+        arch_anchors: dict[str, dict] | None = None
+        if archetype_anchors_cache is not None:
+            arch_anchors = archetype_anchors_cache.get(fmt)
+            if arch_anchors is None:
+                arch_anchors = _load_archetype_anchors(fmt)
+                archetype_anchors_cache[fmt] = arch_anchors
         with_subs_pct = _coverage_with_subs_pct(
             deck_path, fmt, idx, snap, total_have, total_need,
             quiet=quiet, max_sub_pct=resolved_max_sub_pct,
             out=subs_meta if include_subs_meta else None,
+            archetype_anchors=arch_anchors,
         )
 
     meta = _load_deck_meta(deck_path)
@@ -5105,12 +5426,18 @@ def cmd_coverage(args: argparse.Namespace) -> int:
 
     fallback_warn = [False]
     rows: list[dict] = []
+    # Per-batch archetype-anchor cache so we only walk the corpus once
+    # per distinct format across the whole batch (cmd_recommend already
+    # threads its own cache, but cmd_coverage --batch was hammering it
+    # 400+ times before the rework).
+    archetype_anchors_cache: dict[str, dict[str, dict]] = {}
     for path in deck_paths:
         rows.append(
             _coverage_row(
                 path, idx, snap, owned, args.with_subs, fallback_warn,
                 quiet=args.json,
                 max_sub_pct=getattr(args, "max_sub_pct", None),
+                archetype_anchors_cache=archetype_anchors_cache,
             )
         )
 
@@ -5344,6 +5671,14 @@ def _compute_freq_index(fmt: str) -> dict:
       - `basic` flag — every deck has Forests; consumers ranking by
         `deck_pct` should drop them rather than have us drop them here
         (single source of truth for "is X a basic" lives in `_is_basic`)
+
+    Variant-weighted aggregation: each on-disk deck file is the
+    representative of `meta.variant_count` near-duplicate uploads (cluster
+    survivors from `fetch-meta` near-dup compaction). All count-style
+    aggregates (`deck_count`, `total_copies`, `total_main`,
+    `total_sideboard`, `corpus_size`) sum the representative's contribution
+    by `variant_count` so that clustered staples retain their statistical
+    weight despite the dedup. Sidecar-less files default to 1 (no-op).
     """
     files = _corpus_deck_files(fmt)
     if not files:
@@ -5361,12 +5696,18 @@ def _compute_freq_index(fmt: str) -> dict:
     archetypes_per_card: dict[str, set[str]] = {}
     total_copies = 0
     unresolved = 0
+    corpus_size = 0
 
     for path in files:
         slug = path.stem
         archetype = _archetype_for_deck(path)
+        meta = _load_deck_meta(path)
+        vc_raw = meta.get("variant_count")
+        weight = vc_raw if isinstance(vc_raw, int) and vc_raw >= 1 else 1
+        corpus_size += weight
         # Per-deck membership: a card present in main + sideboard counts
-        # as one deck for `deck_count` (spec: "main+sideboard combined").
+        # as one deck for `deck_count` (spec: "main+sideboard combined"),
+        # multiplied by the cluster's variant_count.
         seen_in_deck: set[str] = set()
         for entry in parse_deck(path):
             if entry.section == "maybeboard":
@@ -5375,7 +5716,7 @@ def _compute_freq_index(fmt: str) -> dict:
                 continue
             card = _resolve_card(entry.name)
             if card is None:
-                unresolved += entry.count
+                unresolved += entry.count * weight
                 continue
             name = card.get("name") or entry.name
             row = stats.get(name)
@@ -5392,21 +5733,23 @@ def _compute_freq_index(fmt: str) -> dict:
                 }
                 stats[name] = row
                 archetypes_per_card[name] = set()
+            inc = entry.count * weight
             if entry.section == "sideboard":
-                row["total_sideboard"] += entry.count
+                row["total_sideboard"] += inc
             else:
                 # `deck`, `commander`, `companion` all play from main.
-                row["total_main"] += entry.count
-            row["total_copies"] += entry.count
-            total_copies += entry.count
+                row["total_main"] += inc
+            row["total_copies"] += inc
+            total_copies += inc
             if name not in seen_in_deck:
                 seen_in_deck.add(name)
-                row["deck_count"] += 1
+                row["deck_count"] += weight
                 archetypes_per_card[name].add(archetype or slug)
 
-    corpus_size = len(files)
     for name, row in stats.items():
-        row["deck_pct"] = round(row["deck_count"] / corpus_size, 4)
+        row["deck_pct"] = (
+            round(row["deck_count"] / corpus_size, 4) if corpus_size else 0.0
+        )
         row["avg_copies_per_appearing_deck"] = round(
             row["total_copies"] / row["deck_count"], 2
         ) if row["deck_count"] else 0.0
@@ -7049,6 +7392,12 @@ def _recommend_compute(
     deck_rows: list[dict] = []
     if deck_paths:
         fallback_warn = [False]
+        # One archetype-anchor walk for the whole recommend pass; threads
+        # through to `_classify_slot_weights` inside each deck's
+        # suggest-subs sub-call.
+        archetype_anchors_cache: dict[str, dict[str, dict]] = {
+            fmt: _load_archetype_anchors(fmt),
+        }
         for path in deck_paths:
             row = _coverage_row(
                 path, idx, snap, owned,
@@ -7057,6 +7406,7 @@ def _recommend_compute(
                 quiet=quiet,
                 max_sub_pct=max_sub_pct,
                 include_subs_meta=True,
+                archetype_anchors_cache=archetype_anchors_cache,
             )
             row["build_status"] = _recommend_build_status(row, min_threshold)
             # Per-deck role distribution + cosine vs corpus median.
@@ -7548,11 +7898,12 @@ def cmd_derive(args: argparse.Namespace) -> int:
     """Ownership-maximized variant of a corpus deck.
 
     Substrate: `_run_suggest_subs` over the source deck, then apply the
-    top-scored candidate to every non-anchor slot. Anchors (commander +
-    format staples per `_anchor_names`) stay verbatim — when missing,
-    the derived deck inherits the gap and `anchor_unfilled` flags it
-    in the provenance sidecar so `recommend` can still surface the
-    "needs anchor" status.
+    top-scored candidate to every non-anchor slot. Hard anchors (commander
+    + format staples + archetype-anchor cards per
+    `_classify_slot_weights`) stay verbatim — when missing, the derived
+    deck inherits the gap and `anchor_unfilled` flags it in the
+    provenance sidecar so `recommend` can still surface the "needs
+    anchor" status. Soft anchors substitute but at a flat penalty.
 
     Default output: `data/corpus/<fmt>/derived/<source-slug>.txt`.
     Format auto-detected from the source path's parent slug; --format
@@ -7607,12 +7958,14 @@ def cmd_derive(args: argparse.Namespace) -> int:
         sys.exit(_empty_state_message().rstrip())
     idx = _load_index()
 
+    archetype_anchors = _load_archetype_anchors(fmt)
     result = _run_suggest_subs(
         deck_path, fmt, idx, snap, args.max_per_card,
         quiet=True,
         anchor_check=True,
         max_sub_pct=args.max_sub_pct,
         strictlybetter=not args.no_strictlybetter,
+        archetype_anchors=archetype_anchors,
     )
 
     entries = parse_deck(deck_path)
@@ -8419,8 +8772,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--no-anchor-check", action="store_true",
         help=(
-            "disable anchor preservation (commander + format staples "
-            "with deck_pct >= 0.50) — power-user override"
+            "disable graded anchor preservation (commander + format "
+            "staples with deck_pct >= 0.80 hard / 0.40-0.80 soft) — "
+            "power-user override"
         ),
     )
     s.add_argument(
