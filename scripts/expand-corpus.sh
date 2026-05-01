@@ -4,12 +4,29 @@
 # Scryfall resolver and HTTP throttle is per-source anyway) and verbose
 # so a failed parser is obvious.
 #
-# Usage:  scripts/expand-corpus.sh [format]   (default: brawl)
+# Usage:  scripts/expand-corpus.sh [format|all]   (default: brawl)
 #         scripts/expand-corpus.sh historic
+#         scripts/expand-corpus.sh all     # walk every Arena format sequentially
 set -uo pipefail
 
 FMT="${1:-brawl}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# `all` mode: re-invoke this script once per Arena format. Sequential
+# across formats AND sources because the Scryfall index pickle is
+# ~500MB per process; parallelism would balloon RAM and any meta.json
+# cross-write isn't a concern (each format has its own sidecar).
+if [ "$FMT" = "all" ]; then
+  ALL_FORMATS=(standard alchemy historic timeless pioneer brawl)
+  rc=0
+  for f in "${ALL_FORMATS[@]}"; do
+    echo
+    echo "######### $f #########"
+    "${BASH_SOURCE[0]}" "$f" || rc=$?
+  done
+  exit "$rc"
+fi
+
 MTG="$ROOT/tools/mtg"
 LOG_DIR="$ROOT/data/corpus/.fetch-logs"
 mkdir -p "$LOG_DIR"
