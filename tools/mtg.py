@@ -7465,6 +7465,8 @@ def _craft_priority(
 
 def _recommend_compute(
     args: argparse.Namespace,
+    *,
+    keep_gating: bool = False,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Pure-compute core for `cmd_recommend`.
 
@@ -7719,12 +7721,22 @@ def _recommend_compute(
             "matches": matches,
         })
 
+    # Schema parity: every emitted row carries cross_format_unlock so
+    # consumers don't have to branch on single-format vs --format all.
+    # The multi-format caller overwrites with the real count after
+    # post-process; single-format runs leave it null.
+    for r in capped:
+        r["cross_format_unlock"] = None
+
     # Strip private fields before emit — `_gating` / `_total_need` were
     # only carried so `_craft_ladder` and `_craft_priority` could share
-    # the gating computation done by `_coverage_row`.
-    for r in capped:
-        r.pop("_gating", None)
-        r.pop("_total_need", None)
+    # the gating computation done by `_coverage_row`. Multi-format caller
+    # passes keep_gating=True and strips after the cross_format_unlock
+    # post-process.
+    if not keep_gating:
+        for r in capped:
+            r.pop("_gating", None)
+            r.pop("_total_need", None)
 
     meta = {
         "format": fmt,
@@ -7846,6 +7858,285 @@ def _print_recommend_text(
         )
 
 
+def _cmd_recommend_all(args: argparse.Namespace) -> int:
+    """Multi-format pass: run `_recommend_compute` per format with a
+    non-empty corpus, merge into a flat ranked list, then post-process to
+    fill `cross_format_unlock` per deck.
+
+    `cross_format_unlock` semantics: for each deck D, count other decks
+    D' across the union of corpora where D'.missing ⊆ D.missing — i.e.
+    crafting D's missing cards would also unlock D'. Decision-support for
+    "which deck do I craft into next."
+
+    Schema (JSON):
+      {
+        "format": "all",
+        "min", "top", "max_sub_pct" (None when --max-sub-pct omitted),
+        "corpus_size", "decks_considered", "buildable_count",
+        "formats": [{format, corpus_size, decks_considered,
+                     buildable_count, corpus_health, ...} per format],
+        "craft_priority": [...],   # union ranking
+        "decks": [...],            # flat top-N across all formats
+        "shells": [...],           # flat per-format shells
+      }
+    """
+    formats_with_corpus = [
+        f for f in sorted(ARENA_FORMATS)
+        if _corpus_deck_files(f, include_derived=True)
+    ]
+    if not formats_with_corpus:
+        msg = "[warn] no corpus for any Arena format — run tools/mtg fetch-meta"
+        if args.json:
+            print(msg, file=sys.stderr)
+            _emit_json({
+                "format": "all",
+                "min": round(float(args.min), 4),
+                "top": int(args.top),
+                "max_sub_pct": (
+                    round(float(args.max_sub_pct), 4)
+                    if args.max_sub_pct is not None else None
+                ),
+                "quality": getattr(args, "quality", "loose") or "loose",
+                "quality_dropped": 0,
+                "corpus_size": 0,
+                "decks_considered": 0,
+                "buildable_count": 0,
+                "formats": [],
+                "craft_priority": [],
+                "decks": [],
+                "shells": [],
+            })
+        else:
+            print(msg, file=sys.stderr)
+        return 0
+
+    # Per-format passes — clone args so each format resolves its own
+    # max_sub_pct default. The user's explicit --max-sub-pct (if any) is
+    # passed through unchanged; sentinel None triggers per-format default.
+    #
+    # Per-format `--top` is overridden to a very high value: the cross-
+    # format pass needs the full filtered set to find subset relations
+    # (subset semantics is strict — only the post-cap decks would be
+    # visible if we honored the user's `--top` per format, biasing the
+    # unlock count toward whichever format ranks highest globally). The
+    # final user `--top` cap applies to the merged output instead.
+    user_max_sub_pct = args.max_sub_pct  # None or explicit
+    user_top = int(args.top)
+    per_format_meta: list[dict] = []
+    merged_decks: list[dict] = []
+    merged_shells: list[dict] = []
+    for sub_fmt in formats_with_corpus:
+        sub_args = argparse.Namespace(**vars(args))
+        sub_args.format = sub_fmt
+        sub_args.top = 10_000  # effectively uncapped; full filtered set
+        sub_args.max_sub_pct = _resolve_max_sub_pct(sub_fmt, user_max_sub_pct)
+        if not (0.0 < sub_args.max_sub_pct <= 1.0):
+            print(
+                f"--max-sub-pct must be in (0, 1] (resolved {sub_args.max_sub_pct} "
+                f"for {sub_fmt})",
+                file=sys.stderr,
+            )
+            return 2
+        _warn_if_corpus_stale(sub_fmt)
+        sub_meta, sub_decks, sub_shells = _recommend_compute(
+            sub_args, keep_gating=True,
+        )
+        for r in sub_decks:
+            r["format"] = sub_fmt
+        merged_decks.extend(sub_decks)
+        merged_shells.extend(sub_shells)
+        per_format_meta.append(sub_meta)
+
+    # Cross-format unlock — pure post-process over `_gating` cached on
+    # each row. Frozenset subset is O(|M_Dp|); union is ~2200 decks at
+    # current corpus volume (~5M ops total, sub-second).
+    deck_missings: list[frozenset[str]] = []
+    for r in merged_decks:
+        gating = r.get("_gating") or []
+        deck_missings.append(frozenset(name for name, _, _ in gating))
+    for i, r in enumerate(merged_decks):
+        m_d = deck_missings[i]
+        if not m_d:
+            r["cross_format_unlock"] = 0
+            continue
+        count = 0
+        for j, m_dp in enumerate(deck_missings):
+            if j == i or not m_dp:
+                continue
+            if m_dp.issubset(m_d):
+                count += 1
+        r["cross_format_unlock"] = count
+
+    # Strip private fields after the cross-format pass.
+    for r in merged_decks:
+        r.pop("_gating", None)
+        r.pop("_total_need", None)
+
+    # Top decks by cross_format_unlock — separate signal from composite,
+    # often surfaces decks the composite ranking buries (mid-ownership
+    # decks with broad missing sets that contain other decks' gating
+    # entirely). Computed before the global composite cap so the user
+    # sees these even with a small --top.
+    top_unlocks = sorted(
+        merged_decks,
+        key=lambda r: (
+            -(r.get("cross_format_unlock") or 0),
+            -r["composite"],
+            r["archetype"],
+        ),
+    )
+    top_unlocks = [
+        {
+            "format": r["format"],
+            "deck": r["deck"],
+            "archetype": r["archetype"],
+            "owned_pct": r["owned_pct"],
+            "with_subs_pct": r.get("with_subs_pct"),
+            "cross_format_unlock": r.get("cross_format_unlock") or 0,
+            "missing_wc": r["missing_wc"],
+        }
+        for r in top_unlocks
+        if (r.get("cross_format_unlock") or 0) > 0
+    ][:10]
+
+    # Re-rank merged decks by composite (each format's rank is preserved
+    # but the global view sorts uniformly), cap at the user's --top.
+    merged_decks.sort(key=lambda r: (-r["composite"], r["archetype"]))
+    capped = merged_decks[:user_top]
+
+    # Union craft priority — recompute across the union of `_gating`
+    # lists held in per_format_meta as `craft_priority`. Each per-format
+    # entry is already aggregated by name; merge by card name.
+    union_priority: dict[str, dict] = {}
+    for sub_meta in per_format_meta:
+        for entry in sub_meta.get("craft_priority") or []:
+            key = entry["card"]
+            slot = union_priority.setdefault(
+                key,
+                {
+                    "card": key,
+                    "decks_unlocked": 0,
+                    "rarity": entry.get("rarity", "common"),
+                },
+            )
+            slot["decks_unlocked"] += entry.get("decks_unlocked", 0)
+    union_craft_priority = sorted(
+        union_priority.values(),
+        key=lambda e: (-e["decks_unlocked"], e["card"]),
+    )[:20]
+
+    # Aggregate top-level totals.
+    total_corpus = sum(m["corpus_size"] for m in per_format_meta)
+    total_considered = sum(m["decks_considered"] for m in per_format_meta)
+    total_buildable = sum(
+        1 for r in capped if r["build_status"] == "BUILDABLE"
+    )
+
+    payload = {
+        "format": "all",
+        "min": round(float(args.min), 4),
+        "top": int(args.top),
+        "max_sub_pct": (
+            round(float(user_max_sub_pct), 4)
+            if user_max_sub_pct is not None else None
+        ),
+        "quality": getattr(args, "quality", "loose") or "loose",
+        "corpus_size": total_corpus,
+        "decks_considered": total_considered,
+        "buildable_count": total_buildable,
+        "formats": [
+            {
+                "format": m["format"],
+                "corpus_size": m["corpus_size"],
+                "decks_considered": m["decks_considered"],
+                "buildable_count": m["buildable_count"],
+                "max_sub_pct": m["max_sub_pct"],
+                "quality_dropped": m.get("quality_dropped", 0),
+                "corpus_health": m.get("corpus_health"),
+                "format_winrate_prior": m.get("format_winrate_prior"),
+                "format_winrate_sample_size": m.get(
+                    "format_winrate_sample_size", 0,
+                ),
+            }
+            for m in per_format_meta
+        ],
+        "craft_priority": union_craft_priority,
+        "top_unlocks": top_unlocks,
+        "decks": capped,
+        "shells": merged_shells,
+    }
+
+    if args.json:
+        _emit_json(payload)
+        return 0
+
+    _print_recommend_all_text(payload)
+    return 0
+
+
+def _print_recommend_all_text(payload: dict) -> None:
+    """Human render for --format all. Per-format header line + global top-N
+    decks tagged by format + global craft priority."""
+    print(
+        f"recommend (fmt=all, formats={len(payload['formats'])}, "
+        f"corpus={payload['corpus_size']}, "
+        f"min={payload['min']}, top={payload['top']})"
+    )
+    print()
+    print("=== per-format summary ===")
+    for fm in payload["formats"]:
+        health = fm.get("corpus_health") or {}
+        print(
+            f"  {fm['format']:<14} corpus={fm['corpus_size']:>4}  "
+            f"buildable={fm['buildable_count']:>3}  "
+            f"bottleneck={health.get('bottleneck', 'n/a')}"
+        )
+    print()
+    decks = payload["decks"]
+    if not decks:
+        print("no decks above min — try lowering --min")
+    else:
+        print("=== ranked decks (top across all formats) ===")
+        for r in decks:
+            wc = r["missing_wc"]
+            wc_str = (
+                f"{wc['mythic']}/{wc['rare']}/{wc['uncommon']}/{wc['common']}"
+            )
+            owned_pct = (r["owned_pct"] or 0.0) * 100
+            sub_pct = (r["with_subs_pct"] or 0.0) * 100
+            tier_str = r["tier"] or "-"
+            unlock = r.get("cross_format_unlock") or 0
+            print(
+                f"  [{r['format']:<8}] {r['archetype']:<28} "
+                f"tier={tier_str:<2} composite={r['composite']:.4f}  "
+                f"owned={owned_pct:.0f}% (subs={sub_pct:.0f}%)  "
+                f"missing {wc_str} WC  +unlocks={unlock}"
+            )
+            top3 = r.get("top3_missing") or []
+            if top3:
+                print(f"    top missing: {', '.join(top3)}")
+    cp = payload.get("craft_priority") or []
+    if cp:
+        print()
+        print("=== craft priority (union across all formats) ===")
+        for entry in cp[:10]:
+            print(
+                f"  {entry['card'][:36]:<36} "
+                f"unlocks {entry['decks_unlocked']:>3} decks  "
+                f"({entry['rarity']})"
+            )
+    tu = payload.get("top_unlocks") or []
+    if tu:
+        print()
+        print("=== top decks by cross_format_unlock ===")
+        for r in tu:
+            owned_pct = (r["owned_pct"] or 0.0) * 100
+            print(
+                f"  [{r['format']:<8}] {r['archetype']:<28} "
+                f"owned={owned_pct:.0f}%  +unlocks={r['cross_format_unlock']}"
+            )
+
+
 def cmd_recommend(args: argparse.Namespace) -> int:
     """End-to-end: rank decks the user can build and surface novel-deck
     shells. Always uses the live `data/collection.json` snapshot — the
@@ -7869,9 +8160,10 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     read-only command.
     """
     fmt = args.format.lower()
-    if fmt not in ARENA_FORMATS:
+    if fmt != "all" and fmt not in ARENA_FORMATS:
         print(
-            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            f"format must be 'all' or one of: "
+            f"{', '.join(sorted(ARENA_FORMATS))}",
             file=sys.stderr,
         )
         return 2
@@ -7883,19 +8175,23 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     if args.top <= 0:
         print("--top must be > 0", file=sys.stderr)
         return 2
-    # Resolve per-format default before validation so the sentinel (None)
-    # is replaced.  _resolve_max_sub_pct returns the explicit override when
-    # the user passed --max-sub-pct, otherwise the format-specific default.
-    args.max_sub_pct = _resolve_max_sub_pct(fmt, args.max_sub_pct)
-    if not (0.0 < args.max_sub_pct <= 1.0):
-        print("--max-sub-pct must be in (0, 1]", file=sys.stderr)
-        return 2
 
     if _load_collection() is None:
         print(
             "no collection snapshot — run 'tools/mtg collection dump' first",
             file=sys.stderr,
         )
+        return 2
+
+    if fmt == "all":
+        return _cmd_recommend_all(args)
+
+    # Resolve per-format default before validation so the sentinel (None)
+    # is replaced.  _resolve_max_sub_pct returns the explicit override when
+    # the user passed --max-sub-pct, otherwise the format-specific default.
+    args.max_sub_pct = _resolve_max_sub_pct(fmt, args.max_sub_pct)
+    if not (0.0 < args.max_sub_pct <= 1.0):
+        print("--max-sub-pct must be in (0, 1]", file=sys.stderr)
         return 2
 
     if not _corpus_deck_files(fmt, include_derived=True):
@@ -9191,7 +9487,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--format", required=True,
-        help="Arena format (must have a corpus under data/corpus/<format>/)",
+        help=(
+            "Arena format (must have a corpus under "
+            "data/corpus/<format>/). Use 'all' to scan every format and "
+            "compute cross_format_unlock per deck (number of other decks "
+            "that become buildable when this deck's missing cards are "
+            "crafted)."
+        ),
     )
     s.add_argument(
         "--min", type=float, default=0.30, metavar="N",
