@@ -6003,7 +6003,7 @@ def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
     for d in decks:
         deck_file = out_dir / f"{d.slug}.txt"
         _write_mtga_export(deck_file, d.entries)
-        sidecar[deck_file.name] = {
+        entry: dict = {
             "source": d.source,
             "tier": d.tier,
             "winrate": d.winrate,
@@ -6017,10 +6017,75 @@ def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
             # `coverage` run can see why the deck has < 60/100 cards
             # without re-running the fetch.
             "unresolved": d.unresolved,
+            # Cross-source identity hash (sorted multiset of name×count
+            # over main+commander+companion, basics excluded). Lets a
+            # later `fetch-meta` run from a different source detect a
+            # collision without re-parsing every existing deck file.
+            "cards_hash": _common.cards_hash(d),
         }
+        if d.also_seen_at:
+            entry["also_seen_at"] = list(d.also_seen_at)
+        sidecar[deck_file.name] = entry
 
     meta_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
     return sidecar
+
+
+def _evict_corpus_slugs(out_dir: Path, slugs: list[str]) -> None:
+    """Remove `<slug>.txt` files + matching sidecar entries.
+
+    Used by `cmd_fetch_meta` after dedup tells us a fresh higher-
+    priority source beat an existing on-disk deck. Idempotent: missing
+    files / missing sidecar entries are no-ops.
+    """
+    if not slugs:
+        return
+    for slug in slugs:
+        path = out_dir / f"{slug}.txt"
+        if path.exists():
+            path.unlink()
+    meta_path = out_dir / "meta.json"
+    if not meta_path.exists():
+        return
+    try:
+        sidecar = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(sidecar, dict):
+        return
+    for slug in slugs:
+        sidecar.pop(f"{slug}.txt", None)
+    meta_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+
+
+def _existing_corpus_hashes(out_dir: Path) -> dict[str, tuple[str, str]]:
+    """Read `<out_dir>/meta.json` → `{cards_hash: (source, slug)}`.
+
+    Backs cross-source dedup in `cmd_fetch_meta`: a fresh deck colliding
+    with an entry already on disk loses to the higher-priority source.
+    Entries lacking `cards_hash` (pre-dedup-feature corpus) are skipped
+    silently — they get rehashed on their next fetch.
+    """
+    meta_path = out_dir / "meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        sidecar = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(sidecar, dict):
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    for filename, entry in sidecar.items():
+        if not isinstance(entry, dict):
+            continue
+        h = entry.get("cards_hash")
+        src = entry.get("source")
+        if not isinstance(h, str) or not h or not isinstance(src, str):
+            continue
+        slug = filename.removesuffix(".txt")
+        out[h] = (src, slug)
+    return out
 
 
 def cmd_fetch_meta(args: argparse.Namespace) -> int:
@@ -6109,12 +6174,32 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         )
         return 1
 
-    if args.limit is not None and args.limit > 0:
-        decks = decks[: args.limit]
+    # Stub filter applied centrally so every parser benefits — used to
+    # be inlined in untapped.py for the brawl `laelia-the-blade-reforged`
+    # commander+5-nonland+94-Mountains pattern.
+    pre_stub = len(decks)
+    decks = [d for d in decks if not _common.is_stub_deck(d, _resolve_card)]
+    stub_dropped = pre_stub - len(decks)
 
     out_dir = Path(args.out) if args.out else (
         CORPUS / fmt
     )
+
+    # Cross-source dedup: collapse same-multiset decks (basics excluded)
+    # within this fetch and against the existing on-disk corpus. Higher-
+    # priority source (per `_common.SOURCE_PRIORITY`) wins; the loser's
+    # URL is appended to `also_seen_at` for traceability. Disk-resident
+    # losers (`evicted`) are removed so the corpus stays canonical.
+    existing_hashes = _existing_corpus_hashes(out_dir)
+    decks, dedup_dropped_decks, evicted = _common.dedup_decks(
+        decks, existing_hashes=existing_hashes,
+    )
+    dedup_dropped = len(dedup_dropped_decks)
+    _evict_corpus_slugs(out_dir, evicted)
+
+    if args.limit is not None and args.limit > 0:
+        decks = decks[: args.limit]
+
     sidecar = _write_meta_corpus(decks, out_dir)
 
     total_dropped = sum(d.unresolved for d in decks)
@@ -6128,6 +6213,9 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "out": str(out_dir),
             "deck_count": len(decks),
             "unresolved_total": total_dropped,
+            "stub_dropped": stub_dropped,
+            "dedup_dropped": dedup_dropped,
+            "evicted_existing": len(evicted),
             "decks": [
                 {
                     "slug": d.slug,
@@ -6142,6 +6230,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
                     # to a Scryfall printing — the deck file is short
                     # by this much. >0 signals a partial import.
                     "unresolved": d.unresolved,
+                    "also_seen_at": list(d.also_seen_at),
                 }
                 for d in decks
             ],
@@ -6153,6 +6242,12 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     print(f"format : {fmt}")
     print(f"out    : {out_dir}")
     print(f"decks  : {len(decks)}")
+    if stub_dropped:
+        print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
+    if dedup_dropped:
+        print(f"dedup  : {dedup_dropped} fresh decks collapsed (cross-source)")
+    if evicted:
+        print(f"evict  : {len(evicted)} on-disk decks beaten by higher-priority source")
     print(f"sidecar: {len(sidecar)} total entries")
     print()
     # `drop` column shows per-deck dropped-copy count from `ParsedDeck.unresolved`

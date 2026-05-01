@@ -8,11 +8,13 @@ re-deriving regex / section / multi-face rules. Single source of truth.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Callable
 
 # Single source of truth for the toolkit's outbound User-Agent. Used by
 # `tools/mtg.py` (Scryfall JSON) and by per-source parsers fetching
@@ -134,6 +136,11 @@ class ParsedDeck:
     fetched: str
     entries: list[DeckEntry] = field(default_factory=list)
     unresolved: int = 0
+    # Cross-source dedup back-pointers. Populated by `dedup_decks` when a
+    # lower-priority duplicate is collapsed into this entry. Empty for
+    # decks seen in only one source. Surfaces in the sidecar so a later
+    # session can see "same list also lives at <urls>".
+    also_seen_at: list[str] = field(default_factory=list)
 
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
@@ -148,3 +155,173 @@ def slugify(text: str) -> str:
     """
     s = _SLUG_STRIP.sub("-", text.lower()).strip("-")
     return s or "deck"
+
+
+# Source-priority ranking for `dedup_decks`. Lower index = higher priority
+# = winner when two sources publish the same multiset. Order rationale:
+#   * untapped — Arena-native, all formats, the only automated brawl source.
+#   * moxfield — largest user-built corpus on the open web, brawl king.
+#   * archidekt — second-largest user-built; format coverage parity.
+#   * aetherhub — Arena-native w/ winrates, smaller volume.
+#   * mtgazone / mtggoldfish / mtgdecks — legacy curated/paper-tilted.
+# New parsers should be inserted at their evidence-supported position;
+# this is one edit, not a per-call argument, because dedup must be
+# deterministic across all `cmd_fetch_meta` invocations.
+SOURCE_PRIORITY: tuple[str, ...] = (
+    "untapped",
+    "moxfield",
+    "archidekt",
+    "aetherhub",
+    "mtgazone",
+    "mtggoldfish",
+    "mtgdecks",
+)
+
+
+def _source_rank(source: str) -> int:
+    """Index into SOURCE_PRIORITY; unknown sources sort last (=most demoted)."""
+    try:
+        return SOURCE_PRIORITY.index(source)
+    except ValueError:
+        return len(SOURCE_PRIORITY)
+
+
+def cards_hash(deck: ParsedDeck) -> str:
+    """Stable identity hash for cross-source dedup.
+
+    Identity = sorted multiset of `(name, count)` over main-deck +
+    commander + companion entries, EXCLUDING basic lands (so two
+    archetypes that differ only in basic-land count collapse together —
+    the deck plan is the same; the manabase is a tuning detail).
+    Sideboard ignored: same deck across two formats can have different
+    sideboards yet be the same archetype.
+
+    Returns SHA-1 hex digest (12 chars sufficient for ~10⁶ corpus
+    without practical collision risk — full 40 stored for safety).
+    Returns "" if the deck has zero comparable entries (deck file
+    likely corrupt; caller treats as no-collision).
+    """
+    pairs: dict[str, int] = {}
+    for e in deck.entries:
+        if e.section not in {"deck", "commander", "companion"}:
+            continue
+        # Names that include `// ` (multi-face) keep the full name —
+        # collisions need the same printing, not the front-face only.
+        pairs[e.name] = pairs.get(e.name, 0) + e.count
+    # Basic-land filter is name-based (cheap, no resolve_name needed):
+    # the five Arena basics + Wastes + Snow-Covered variants. Any other
+    # land (Treasure Vault, City of Brass, ...) stays in the hash.
+    for basic in (
+        "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
+        "Snow-Covered Plains", "Snow-Covered Island", "Snow-Covered Swamp",
+        "Snow-Covered Mountain", "Snow-Covered Forest",
+    ):
+        pairs.pop(basic, None)
+    if not pairs:
+        return ""
+    payload = "|".join(f"{n}\x1f{c}" for n, c in sorted(pairs.items()))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def is_stub_deck(
+    deck: ParsedDeck,
+    resolve_name: Callable[[str], dict | None],
+) -> bool:
+    """True if `deck` is a basic-land padded placeholder, not a real list.
+
+    Two-signal conjunction (both must hold):
+      * `unique_nonlands < 15` — real constructed has >=15 unique nonlands;
+      * `max_basic_share >= 0.5` — and never a single basic >=50% of deck.
+
+    Real mono-color brews have <15 unique nonlands too, but never a
+    single basic land at half the deck. Real sealed/limited has a tall
+    basic count but >=15 unique nonlands. Conjunction catches the stub
+    pattern (commander + 5 nonlands + 94 Mountains) without false-
+    positiving real decks.
+
+    Originally inlined in untapped.py for the brawl `laelia-the-blade-
+    reforged` pattern; generalised here so every parser benefits.
+    """
+    unique_nonlands = 0
+    deck_total = 0
+    max_basic = 0
+    for e in deck.entries:
+        if e.section != "deck":
+            continue
+        deck_total += e.count
+        printing = resolve_name(e.name)
+        if printing is None:
+            continue
+        type_line = printing.get("type_line") or ""
+        if "Land" not in type_line:
+            unique_nonlands += 1
+            continue
+        if "Basic" in type_line and e.count > max_basic:
+            max_basic = e.count
+    basic_share = (max_basic / deck_total) if deck_total else 0.0
+    return unique_nonlands < 15 and basic_share >= 0.5
+
+
+def dedup_decks(
+    decks: list[ParsedDeck],
+    *,
+    existing_hashes: dict[str, tuple[str, str]] | None = None,
+) -> tuple[list[ParsedDeck], list[ParsedDeck], list[str]]:
+    """Cross-source dedup by `cards_hash` identity.
+
+    Within `decks`, when two entries share a hash, keep the one whose
+    source has higher SOURCE_PRIORITY (lower index). The loser's `url`
+    is appended to the winner's `also_seen_at`.
+
+    `existing_hashes` (optional) maps `cards_hash → (source, slug)` for
+    decks already on disk in the same corpus dir. A fresh deck colliding
+    with an existing on-disk entry:
+      * loses (gets dropped, existing stays) if existing has higher priority;
+      * wins (kept, existing's slug returned for caller to unlink) otherwise.
+
+    Returns `(kept, dropped_fresh, evicted_existing_slugs)`:
+      * `kept` — fresh decks to write to disk;
+      * `dropped_fresh` — fresh decks collapsed away (intra-batch losers
+        and on-disk-existing wins);
+      * `evicted_existing_slugs` — on-disk slugs the caller must unlink
+        (and prune from sidecar) because a fresh higher-priority source
+        beat them.
+    """
+    by_hash: dict[str, ParsedDeck] = {}
+    dropped: list[ParsedDeck] = []
+    evicted: list[str] = []
+    existing_hashes = existing_hashes or {}
+
+    for deck in decks:
+        h = cards_hash(deck)
+        if not h:
+            # Hashless deck (no comparable entries): keep as-is, can't dedup.
+            by_hash[f"_no_hash_{id(deck)}"] = deck
+            continue
+
+        existing = by_hash.get(h)
+        if existing is not None:
+            winner, loser = (
+                (existing, deck)
+                if _source_rank(existing.source) <= _source_rank(deck.source)
+                else (deck, existing)
+            )
+            if loser.url and loser.url not in winner.also_seen_at:
+                winner.also_seen_at.append(loser.url)
+            by_hash[h] = winner
+            dropped.append(loser)
+            continue
+
+        prior = existing_hashes.get(h)
+        if prior is not None:
+            prior_source, prior_slug = prior
+            if _source_rank(prior_source) <= _source_rank(deck.source):
+                # Existing on disk wins; drop this fresh entry.
+                dropped.append(deck)
+                continue
+            # Fresh entry wins; existing slug needs eviction by caller.
+            evicted.append(prior_slug)
+
+        by_hash[h] = deck
+
+    return list(by_hash.values()), dropped, evicted
