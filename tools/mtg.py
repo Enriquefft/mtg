@@ -106,6 +106,11 @@ BULK_JSON = DATA / "default_cards.json"
 INDEX_PKL = DATA / "index.pkl"
 META_JSON = DATA / "bulk-meta.json"
 STRICTLYBETTER_CACHE = DATA / "strictlybetter-cache.json"
+# Sidecar for locally-computed heuristic fallback hits (cards missing from
+# strictlybetter.eu, typically freshly-printed). Kept separate so a future
+# strictlybetter.eu bulk-refresh overwrites only the primary cache without
+# losing heuristic results for cards still absent from the upstream DB.
+STRICTLYBETTER_FALLBACK_CACHE = DATA / "strictlybetter-fallback.json"
 # Meta-deck corpus root: machine-managed scrapes from `fetch-meta`. Each
 # format gets `data/corpus/<fmt>/{*.txt, meta.json, _freq.json}`. Tracked
 # human drafts live separately under `decks/<name>/v*.txt` (different
@@ -3726,6 +3731,215 @@ def _strictlybetter_subs(card_name: str) -> list[str]:
     return out
 
 
+# ---------- local-heuristic fallback for cards missing from strictlybetter --
+#
+# When strictlybetter.eu has no entry for a card (typically freshly-printed
+# Standard / Alchemy sets not yet catalogued by the community), fall back to
+# a purely local heuristic over the Scryfall index already in memory.
+#
+# Criteria for "B is a heuristic functional-reprint candidate of A":
+#   1. Same color identity (CI)
+#   2. Same primary card type (first non-supertype token of type_line)
+#   3. Same CMC (strict -- no drift; CMC relaxation is the scorer's job)
+#   4. For creatures: power AND toughness each within +-1
+#   5. Oracle text Jaccard >= 0.5 (normalized tokens; reminder text stripped;
+#      card name replaced with "~")
+#
+# Results cached in STRICTLYBETTER_FALLBACK_CACHE (7d TTL) keyed by
+# "{card_name_lc}@{fmt}" so format-legal filters survive. Cache is kept
+# independent of STRICTLYBETTER_CACHE so a fresh strictlybetter.eu bulk-
+# fetch never wipes heuristic entries for cards still absent upstream.
+
+import re as _re
+
+_REMINDER_RX = _re.compile(r"\([^)]*\)")
+_TOKEN_RX = _re.compile(r"[A-Za-z0-9]+")
+_SUPERTYPES_SET = frozenset({"legendary", "basic", "snow", "world", "ongoing"})
+
+_FALLBACK_INDEX: dict | None = None  # in-process memo; keyed by cache_key
+
+
+def _oracle_tokens(card: dict) -> frozenset[str]:
+    """Normalized token set for Jaccard similarity.
+
+    1. Collect oracle_text (and card_faces for DFCs).
+    2. Strip reminder text (parenthesised clauses).
+    3. Replace card's own name (and short front-face name for DFCs) with "~".
+    4. Lowercase, split on punctuation+whitespace, filter empties.
+    """
+    parts: list[str] = []
+    base_text = card.get("oracle_text") or ""
+    if base_text:
+        parts.append(base_text)
+    for face in card.get("card_faces") or []:
+        ft = face.get("oracle_text") or ""
+        if ft and ft not in parts:
+            parts.append(ft)
+    full = " ".join(parts)
+    full = _REMINDER_RX.sub(" ", full)
+    cname = (card.get("name") or "").strip()
+    if cname:
+        short = cname.split(" // ", 1)[0].strip()
+        for variant in {cname, short}:
+            if variant:
+                full = full.replace(variant, "~")
+    return frozenset(_TOKEN_RX.findall(full.lower()))
+
+
+def _primary_type(type_line: str) -> str:
+    """First non-supertype, non-dash token of the type line.
+
+    "Legendary Creature - Phyrexian Praetor" -> "creature"
+    "Basic Snow Land - Forest" -> "land"
+    """
+    for tok in type_line.lower().split():
+        if tok in ("—", "-", "//"):
+            break
+        if tok not in _SUPERTYPES_SET:
+            return tok
+    return ""
+
+
+def _fallback_load_cache() -> dict:
+    skeleton: dict = {"schema": 1, "entries": {}, "fetched_at": {}}
+    if not STRICTLYBETTER_FALLBACK_CACHE.exists():
+        return dict(skeleton)
+    try:
+        data = json.loads(STRICTLYBETTER_FALLBACK_CACHE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return dict(skeleton)
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        return dict(skeleton)
+    data.setdefault("entries", {})
+    data.setdefault("fetched_at", {})
+    return data
+
+
+def _fallback_save_cache(cache: dict) -> None:
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        STRICTLYBETTER_FALLBACK_CACHE.write_text(json.dumps(cache, indent=2))
+    except OSError as e:
+        print(
+            f"[warn] could not write strictlybetter fallback cache: {e}",
+            file=sys.stderr,
+        )
+
+
+def _heuristic_functional_reprints(card_name: str, fmt: str) -> list[str]:
+    """Local-heuristic functional-reprint candidates for *card_name*.
+
+    Uses the Scryfall index already loaded in process. Returns a (possibly
+    empty) list of card names passing all five heuristic criteria. Results
+    cached in STRICTLYBETTER_FALLBACK_CACHE (7d TTL) keyed by
+    "{card_name_lc}@{fmt}". Never raises -- returns [] on any failure.
+    """
+    global _FALLBACK_INDEX
+    name = (card_name or "").strip()
+    if not name:
+        return []
+    cache_key = f"{name.lower()}@{fmt}"
+
+    if _FALLBACK_INDEX is not None:
+        entry = _FALLBACK_INDEX.get(cache_key)
+        if entry is not None:
+            return list(entry)
+
+    disk = _fallback_load_cache()
+    entries = disk.get("entries") or {}
+    fetched_at_map = disk.get("fetched_at") or {}
+    cached_at = fetched_at_map.get(cache_key)
+    if cached_at and _strictlybetter_is_fresh(cached_at) and cache_key in entries:
+        hits = entries[cache_key]
+        if _FALLBACK_INDEX is None:
+            _FALLBACK_INDEX = {}
+        _FALLBACK_INDEX[cache_key] = hits
+        return list(hits)
+
+    try:
+        anchor = _resolve_card(name)
+    except Exception:
+        return []
+    if anchor is None:
+        return []
+
+    anchor_ci = frozenset(anchor.get("color_identity") or [])
+    anchor_cmc = float(anchor.get("cmc") or 0)
+    anchor_ptype = _primary_type((anchor.get("type_line") or ""))
+    if not anchor_ptype:
+        return []
+    is_creature = (anchor_ptype == "creature")
+    try:
+        anchor_pow = float(anchor.get("power") or 0)
+        anchor_tou = float(anchor.get("toughness") or 0)
+    except (TypeError, ValueError):
+        anchor_pow = anchor_tou = 0.0
+    anchor_tokens = _oracle_tokens(anchor)
+    anchor_name_lc = name.lower()
+
+    idx = _load_index()
+    by_name = idx.get("by_name") or {}
+    hits_list: list[str] = []
+    seen_names: set[str] = set()
+    for _lc_key, printings in by_name.items():
+        if not printings:
+            continue
+        cand: dict | None = None
+        for p in printings:
+            if "arena" in (p.get("games") or []):
+                cand = p
+                break
+        if cand is None:
+            cand = printings[0]
+        cand_name = (cand.get("name") or "").strip()
+        if not cand_name:
+            continue
+        cand_lc = cand_name.lower()
+        if cand_lc == anchor_name_lc:
+            continue
+        if cand_lc in seen_names:
+            continue
+        seen_names.add(cand_lc)
+        if not _card_legal_in(cand, fmt):
+            continue
+        # Criterion 1: same color identity.
+        if frozenset(cand.get("color_identity") or []) != anchor_ci:
+            continue
+        # Criterion 2: same primary type.
+        if _primary_type((cand.get("type_line") or "")) != anchor_ptype:
+            continue
+        # Criterion 3: same CMC.
+        if float(cand.get("cmc") or 0) != anchor_cmc:
+            continue
+        # Criterion 4: creatures -- P/T within +-1.
+        if is_creature:
+            try:
+                cp = float(cand.get("power") or 0)
+                ct = float(cand.get("toughness") or 0)
+            except (TypeError, ValueError):
+                cp = ct = 0.0
+            if abs(cp - anchor_pow) > 1 or abs(ct - anchor_tou) > 1:
+                continue
+        # Criterion 5: oracle Jaccard >= 0.5.
+        cand_tokens = _oracle_tokens(cand)
+        union = anchor_tokens | cand_tokens
+        if not union:
+            continue
+        if len(anchor_tokens & cand_tokens) / len(union) < 0.5:
+            continue
+        hits_list.append(cand_name)
+
+    if _FALLBACK_INDEX is None:
+        _FALLBACK_INDEX = {}
+    _FALLBACK_INDEX[cache_key] = hits_list
+    entries[cache_key] = hits_list
+    fetched_at_map[cache_key] = _strictlybetter_now()
+    disk["entries"] = entries
+    disk["fetched_at"] = fetched_at_map
+    _fallback_save_cache(disk)
+    return hits_list
+
+
 def _freq_score_adjustment(deck_pct: float | None) -> float:
     """Frequency-aware score adjustment for sub candidates.
 
@@ -4002,10 +4216,17 @@ def _run_suggest_subs(
         # strictlybetter.eu functional-reprint + good-obsolete set for
         # this missing card. Lookup short-circuits when disabled or when
         # there's no canonical name to query.
-        sb_names_lc: set[str] = set()
+        # When the primary cache has no entry (card too new for the community
+        # to have catalogued), fire the local heuristic fallback instead.
+        sb_names_lc: set[str] = set()     # source: strictlybetter_eu
+        fb_names_lc: set[str] = set()     # source: fallback_heuristic
         if strictlybetter and miss_name:
             for n in _strictlybetter_subs(miss_name):
                 sb_names_lc.add(n.lower())
+            if not sb_names_lc:
+                # No community entry -- try local heuristic.
+                for n in _heuristic_functional_reprints(miss_name, fmt):
+                    fb_names_lc.add(n.lower())
 
         # Anchor preservation: a card is an anchor if it's the commander
         # OR appears in >= 50% of corpus decks for this format. Anchors
@@ -4086,14 +4307,22 @@ def _run_suggest_subs(
             rare_boost = any(
                 _is_rare_role(r) for r in (cand_roles & miss_roles)
             )
-            is_strictlybetter = cand_display.lower() in sb_names_lc
-            if is_strictlybetter:
-                # Rules-text-equivalent / community-validated upgrade —
-                # outranks every heuristic match by construction.
+            cand_lc = cand_display.lower()
+            if cand_lc in sb_names_lc:
+                sb_source: str | None = "strictlybetter_eu"
+            elif cand_lc in fb_names_lc:
+                sb_source = "fallback_heuristic"
+            else:
+                sb_source = None
+            if sb_source is not None:
+                # Community-validated or heuristic-reprint match --
+                # outranks every pure heuristic score match by construction.
+                # Both tiers use the same boost so the caller can still
+                # distinguish them via strictlybetter_source.
                 score += SB_BOOST
             candidates.append((
                 score, c, info, rare_boost, cand_game_changer, cand_deck_pct,
-                is_strictlybetter,
+                sb_source,
             ))
 
         candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
@@ -4127,9 +4356,14 @@ def _run_suggest_subs(
                         round(cand_deck_pct, 4)
                         if cand_deck_pct is not None else None
                     ),
-                    "strictlybetter": sb,
+                    # Legacy bool kept for backward-compat: True when any
+                    # strictlybetter source (eu or fallback) matched.
+                    "strictlybetter": sb_source is not None,
+                    # Discriminator: "strictlybetter_eu", "fallback_heuristic",
+                    # or None (pure heuristic scorer, no reprint signal).
+                    "strictlybetter_source": sb_source,
                 }
-                for score, c, info, rare_boost, gc, cand_deck_pct, sb
+                for score, c, info, rare_boost, gc, cand_deck_pct, sb_source
                 in candidates
             ],
         })
@@ -4213,7 +4447,9 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
             {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
              "cmc": 4, "type_line": "...",
              "rare_role_boost": false, "game_changer": false,
-             "deck_pct": 0.12}
+             "deck_pct": 0.12,
+             "strictlybetter": true,
+             "strictlybetter_source": "strictlybetter_eu"|"fallback_heuristic"|null}
           ]
         }
       ],
@@ -4312,7 +4548,13 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
                 cand_cmc = cand["cmc"]
                 if isinstance(cand_cmc, float) and cand_cmc.is_integer():
                     cand_cmc = int(cand_cmc)
-                tag = " [strictlybetter]" if cand.get("strictlybetter") else ""
+                sb_src = cand.get("strictlybetter_source")
+                if sb_src == "strictlybetter_eu":
+                    tag = " [strictlybetter]"
+                elif sb_src == "fallback_heuristic":
+                    tag = " [strictlybetter*]"  # * = heuristic confidence
+                else:
+                    tag = ""
                 text_block.append(
                     f"    {cand['score']:6.3f}  {cand['owned']}x "
                     f"{cand['name']:<32} cmc={cand_cmc}  "
@@ -4624,7 +4866,7 @@ def _coverage_row(
     fallback_warn: list[bool],
     *,
     quiet: bool = False,
-    max_sub_pct: float = 0.30,
+    max_sub_pct: float | None = None,
     include_subs_meta: bool = False,
 ) -> dict:
     """Compute one batch-mode row. Mutates fallback_warn[0] -> True
@@ -4634,9 +4876,12 @@ def _coverage_row(
     callers don't emit the per-candidate game-changer stderr line for
     each deck in the batch.
 
-    `max_sub_pct` overrides the F2 sub-fidelity floor (default 0.30 =
-    30% of the deck). `include_subs_meta=True` adds the F2 sidecar
-    fields (`subs_acceptable`, `anchor_unfilled`, `anchor_total`,
+    `max_sub_pct` is the F2 sub-fidelity floor.  Pass None (default) to
+    use the per-format default from `_MAX_SUB_PCT_BY_FORMAT` (resolved
+    after fmt is known from the deck path).  Pass an explicit float to
+    override the per-format default (user --max-sub-pct flag).
+    `include_subs_meta=True` adds the F2 sidecar fields
+    (`subs_acceptable`, `anchor_unfilled`, `anchor_total`,
     `cards_substituted`, `subs_pct`, plus `short_circuited` when the
     math short-circuit fired) to the returned row — needed by
     `recommend` for build-status classification, opt-in elsewhere so
@@ -4646,6 +4891,7 @@ def _coverage_row(
     fmt = parent if parent in ARENA_FORMATS else "brawl"
     if parent and parent not in ARENA_FORMATS:
         fallback_warn[0] = True
+    resolved_max_sub_pct = _resolve_max_sub_pct(fmt, max_sub_pct)
 
     total_have, total_need, gating, _unres = _coverage_single(
         deck_path, idx, owned,
@@ -4667,7 +4913,7 @@ def _coverage_row(
     if with_subs:
         with_subs_pct = _coverage_with_subs_pct(
             deck_path, fmt, idx, snap, total_have, total_need,
-            quiet=quiet, max_sub_pct=max_sub_pct,
+            quiet=quiet, max_sub_pct=resolved_max_sub_pct,
             out=subs_meta if include_subs_meta else None,
         )
 
@@ -4680,6 +4926,11 @@ def _coverage_row(
     winrate = winrate_raw if isinstance(winrate_raw, (int, float)) else None
     sample_raw = meta.get("sample")
     winrate_sample = sample_raw if isinstance(sample_raw, int) else None
+    # Near-dup clustering results persisted in the sidecar.
+    vc_raw = meta.get("variant_count")
+    variant_count = vc_raw if isinstance(vc_raw, int) and vc_raw >= 1 else 1
+    variants_raw = meta.get("variants")
+    variants = variants_raw if isinstance(variants_raw, list) else []
 
     tier_w = _tier_weight(tier)
     # Composite score: tier_weight * (with_subs_pct if --with-subs and
@@ -4707,6 +4958,8 @@ def _coverage_row(
         ),
         "composite": composite,
         "top3_missing": top3,
+        "variant_count": variant_count,
+        "variants": variants,
     }
     if include_subs_meta and subs_meta:
         row["subs_acceptable"] = subs_meta["subs_acceptable"]
@@ -4833,6 +5086,10 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     if args.min is not None and not (0.0 <= args.min <= 1.0):
         print("--min must be in [0, 1]", file=sys.stderr)
         return 2
+    max_sub_pct_raw = getattr(args, "max_sub_pct", None)
+    if max_sub_pct_raw is not None and not (0.0 < max_sub_pct_raw <= 1.0):
+        print("--max-sub-pct must be in (0, 1]", file=sys.stderr)
+        return 2
 
     deck_paths = sorted(
         Path(p) for p in glob_mod.glob(args.glob, recursive=True)
@@ -4853,6 +5110,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             _coverage_row(
                 path, idx, snap, owned, args.with_subs, fallback_warn,
                 quiet=args.json,
+                max_sub_pct=getattr(args, "max_sub_pct", None),
             )
         )
 
@@ -6431,7 +6689,11 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     decks, dedup_dropped_decks, eviction_map = _common.dedup_decks(
         decks, existing_hashes=existing_hashes,
     )
-    dedup_dropped = len(dedup_dropped_decks)
+    # Near-dup drops are counted off the winners' variant_count fields
+    # (each winner with variant_count=N absorbed N-1 near-dups). Exact-
+    # dedup drops are the remainder.
+    near_dup_dropped = sum(max(0, d.variant_count - 1) for d in decks)
+    exact_dedup_dropped = len(dedup_dropped_decks) - near_dup_dropped
 
     # Truncate winners BEFORE eviction. If a winner that wants to evict
     # an on-disk deck falls outside the cap, evicting anyway would leave
@@ -6462,7 +6724,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "unresolved_total": total_dropped,
             "stub_dropped": stub_dropped,
             "winrate_dropped": winrate_dropped,
-            "dedup_dropped": dedup_dropped,
+            "dedup_dropped": exact_dedup_dropped,
+            "near_dup_dropped": near_dup_dropped,
             "evicted_existing": len(evicted),
             "decks": [
                 {
@@ -6479,6 +6742,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
                     # by this much. >0 signals a partial import.
                     "unresolved": d.unresolved,
                     "also_seen_at": list(d.also_seen_at),
+                    "variant_count": d.variant_count,
+                    "variants": list(d.variants),
                 }
                 for d in decks
             ],
@@ -6494,8 +6759,10 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
     if winrate_dropped:
         print(f"winrate: {winrate_dropped} dropped (< {args.min_winrate:.2%})")
-    if dedup_dropped:
-        print(f"dedup  : {dedup_dropped} fresh decks collapsed (cross-source)")
+    if exact_dedup_dropped:
+        print(f"dedup  : {exact_dedup_dropped} fresh decks collapsed (exact cross-source)")
+    if near_dup_dropped:
+        print(f"near-d : {near_dup_dropped} fresh decks collapsed (near-dup Jaccard≥0.85)")
     if evicted:
         print(f"evict  : {len(evicted)} on-disk decks beaten by higher-priority source")
     print(f"sidecar: {len(sidecar)} total entries")
@@ -6955,6 +7222,11 @@ def _recommend_compute(
         "decks_considered": len(deck_rows),
         "buildable_count": buildable_count,
         "craft_priority": craft_priority,
+        "format_winrate_prior": (
+            round(format_winrate_prior, 6) if format_winrate_prior is not None
+            else None
+        ),
+        "format_winrate_sample_size": format_winrate_sample_size,
     }
     return meta, capped, shell_rows
 
@@ -7116,6 +7388,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
                 "decks_considered": 0,
                 "buildable_count": 0,
                 "craft_priority": [],
+                "format_winrate_prior": None,
+                "format_winrate_sample_size": 0,
                 "decks": [],
                 "shells": [],
             })
@@ -7158,6 +7432,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
             "decks_considered": meta["decks_considered"],
             "buildable_count": meta["buildable_count"],
             "craft_priority": meta.get("craft_priority") or [],
+            "format_winrate_prior": meta.get("format_winrate_prior"),
+            "format_winrate_sample_size": meta.get("format_winrate_sample_size", 0),
             "decks": decks,
             "shells": shells,
         })
@@ -8388,11 +8664,13 @@ def main(argv: list[str] | None = None) -> int:
         help="cap ranked deck list at N (default: 10)",
     )
     s.add_argument(
-        "--max-sub-pct", type=float, default=0.30, metavar="N",
+        "--max-sub-pct", type=float, default=None, metavar="N",
         help=(
             "F2 sub-fidelity floor: clamp with_subs_pct to owned_pct "
-            "when more than N (0.0-1.0) of the deck would be substituted "
-            "(default: 0.30 = 30%%)"
+            "when more than N (0.0-1.0) of the deck would be substituted. "
+            "Omit to use the per-format default "
+            "(brawl/standardbrawl=0.55, standard/alchemy=0.22, "
+            "historic/timeless/pioneer/explorer=0.28)."
         ),
     )
     s.add_argument(
