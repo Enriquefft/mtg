@@ -1207,13 +1207,66 @@ def _is_permanent(c: dict) -> bool:
     ))
 
 
+_RX_PAREN = re.compile(r"\([^()]*\)")
+_RX_QUOTED = re.compile(r"\"[^\"]*\"")
+_RX_TAP_MANA = re.compile(r"\{t\}\s*[,:]", re.IGNORECASE)
+# Keyword-shorthand activated abilities (rule 702 — costs printed as
+# `<keyword> <cost>` rather than `<cost>: <effect>`). Word boundary via
+# negative lookahead to avoid matching `equip`→`equipped`/`equipment`.
+_RX_KW_ACT = re.compile(
+    r"(?:^|[\s.,;])"
+    r"(?:cycling|equip|crew|morph|megamorph|unearth|flashback|"
+    r"channel|forecast|fortify|level\s+up|outlast|reinforce|scavenge|"
+    r"transmute|transfigure|ninjutsu|commander\s+ninjutsu|"
+    r"embalm|eternalize|jump-?start|aftermath|dash|prowl|recover|"
+    r"spectacle|surge|emerge|escape|adapt|monstrosity|bestow|crank!|"
+    r"crime|saddle|harmonize|craft)"
+    r"(?![a-z])",
+    re.IGNORECASE,
+)
+
+
 def _has_activated_ability(c: dict) -> bool:
     """Detect activated abilities — oracle lines with `<cost>: <effect>`.
-    Mana abilities count (rule 605.1). False positives possible on cards
-    whose oracle uses ":" for non-cost reasons, but vanishingly few do.
+
+    Mana abilities count (rule 605.1). The naive "any colon on a line"
+    test over-fires on (a) reminder text inside parens that grants a
+    *token* (not the parent card) an activated ability, (b) quoted
+    strings on token-creating spells / Auras that grant abilities to
+    something else, and (c) modal lines like `Choose one —`. So:
+
+    1. Iteratively strip paren-reminder text and quoted token-grant
+       strings; if any `:` survives in the residue it's an ability of
+       the card itself.
+    2. Fall back to `{T}:`/`{T},` mana-tap detection on text with
+       quotes stripped (basics print their mana ability only as
+       reminder text inside parens, but this also catches the explicit
+       printed form).
+    3. Fall back to keyword-shorthand activated abilities (`Equip 2`,
+       `Crew 3`, `Cycling {1}`, morph, etc.) which are real activated
+       abilities (rule 702) that don't use the colon syntax.
     """
     text = _all_text(c)
-    return bool(re.search(r"^[^\n]*?:[^\n]*?$", text, re.MULTILINE)) and ":" in text
+    if not text:
+        return False
+    stripped = text
+    while True:
+        nxt = _RX_PAREN.sub(" ", stripped)
+        if nxt == stripped:
+            break
+        stripped = nxt
+    stripped_no_quotes = _RX_QUOTED.sub(" ", stripped)
+    if ":" in stripped_no_quotes:
+        return True
+    # Basic lands & some intrinsic-mana cards: tap-for-mana only printed
+    # in reminder text, which the paren strip above removed. Re-check
+    # against the version with parens kept (quotes still stripped).
+    quotes_only_stripped = _RX_QUOTED.sub(" ", text)
+    if _RX_TAP_MANA.search(quotes_only_stripped):
+        return True
+    if _RX_KW_ACT.search(stripped_no_quotes):
+        return True
+    return False
 
 
 def _colored_pips(c: dict) -> list[str]:
@@ -2849,11 +2902,19 @@ def _run_suggest_subs(
                 break
 
     # Pre-compute per-name copy counts in the deck so the per-candidate
-    # copy-cap check is O(1).
+    # copy-cap check is O(1). Resolve each entry through `_resolve_card`
+    # so multi-face cards written by their short face name (e.g.
+    # `"Brazen Borrower"`) collapse to the canonical full name
+    # (`"Brazen Borrower // Petty Theft"`) the candidate display side
+    # uses — otherwise an already-included multi-face card sneaks past
+    # the copy cap and is offered as a substitute for some other slot.
     deck_copies: Counter[str] = Counter()
     for e in entries:
-        if e.section in {"commander", "deck", "sideboard"}:
-            deck_copies[e.name] += e.count
+        if e.section not in {"commander", "deck", "sideboard"}:
+            continue
+        rc = _resolve_card(e.name)
+        canonical = (rc.get("name") if rc else None) or e.name
+        deck_copies[canonical] += e.count
     max_copies = 1 if is_brawl else 4
 
     fillable = 0
