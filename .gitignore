@@ -16,3 +16,8 @@ tools/inject/build/
 # Claude Code agent scratch space — settings.json is checked in, the rest is ephemeral
 .claude/worktrees/
 .claude/local/
+.claude/scheduled_tasks.lock
+
+# Decks: existing tracked lists stay tracked; new entries (corpus dumps from
+# fetch-meta, ad-hoc drafts) are ephemeral. Use `git add -f` for new curated decks.
+decks/
