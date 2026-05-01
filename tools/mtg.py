@@ -6955,6 +6955,511 @@ def cmd_derive(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- invent (compose deck from shell + collection priors) --------
+
+
+# Per-format role-target templates for `cmd_invent`. Numbers are
+# soft targets — the greedy fill stops short when the candidate pool
+# runs dry, and slack rolls into the threat bucket so the deck still
+# hits its total card count. Brawl uses the standard 1+99 layout
+# (commander + 37 lands + 8 ramp + 6 draw + 6 spot + 2 sweep +
+# 4 counter + 36 threat = 100); constructed targets a 60-card meta
+# baseline. Counters are only spent when the deck has access to U.
+_INVENT_TEMPLATES: dict[str, dict[str, int]] = {
+    "brawl": {
+        "ramp": 8,
+        "card_advantage": 6,
+        "removal": 6,
+        "sweeper": 2,
+        "counter": 4,
+        "threat": 36,
+        "land": 37,
+    },
+    "constructed": {
+        "ramp": 0,
+        "card_advantage": 4,
+        "removal": 8,
+        "sweeper": 2,
+        "counter": 4,
+        "threat": 18,
+        "land": 24,
+    },
+}
+
+_BASIC_BY_COLOR: dict[str, str] = {
+    "W": "Plains",
+    "U": "Island",
+    "B": "Swamp",
+    "R": "Mountain",
+    "G": "Forest",
+}
+
+
+def _invent_template(fmt: str) -> dict[str, int]:
+    """Pick the role-target template for `fmt` (brawl or constructed)."""
+    if fmt in BRAWL_FORMATS:
+        return dict(_INVENT_TEMPLATES["brawl"])
+    return dict(_INVENT_TEMPLATES["constructed"])
+
+
+def _invent_select_commander(
+    candidates: list[dict],
+    explicit: str | None,
+) -> dict | None:
+    """Pick the commander for an invent run.
+
+    `explicit` (--commander NAME) wins outright when it resolves to a
+    legendary creature in the user's collection; otherwise we pick the
+    highest-rarity, deepest-CI legendary creature from `candidates`
+    (the cluster's owned legal cards).
+    """
+    if explicit:
+        c = _resolve_card(explicit)
+        if c is None:
+            return None
+        type_line = (c.get("type_line") or "").lower()
+        if "legendary" not in type_line or "creature" not in type_line:
+            return None
+        return c
+
+    legends = [
+        c for c in candidates
+        if "legendary" in (c.get("type_line") or "").lower()
+        and "creature" in (c.get("type_line") or "").lower()
+    ]
+    if not legends:
+        return None
+    legends.sort(
+        key=lambda c: (
+            -_RARITY_ORDER.get(c.get("rarity") or "common", 0),
+            -len(c.get("color_identity") or []),
+            -(c.get("cmc") or 0),
+            c.get("name") or "",
+        )
+    )
+    return legends[0]
+
+
+def _invent_score(
+    card: dict,
+    *,
+    in_shell: bool,
+    freq_cards: dict,
+    owned_count: int,
+) -> float:
+    """Rank a candidate for the role-bucket fill.
+
+    Components:
+      * shell membership: +5 (the cluster cards are why we picked
+        this commander/colors — promote them)
+      * freq prior: +deck_pct * 4 (corpus-popular = format-tested)
+      * ownership: tiny tiebreak when multiple copies are available
+        (matters for constructed where you might want 4-of)
+    """
+    name = card.get("name") or ""
+    row = freq_cards.get(name) or {}
+    deck_pct = float(row.get("deck_pct") or 0.0)
+    score = 0.0
+    if in_shell:
+        score += 5.0
+    score += deck_pct * 4.0
+    score += min(owned_count, 4) * 0.01
+    return score
+
+
+def _invent_fill_bucket(
+    role: str,
+    target: int,
+    pool: list[tuple[float, dict, bool]],
+    used_names: set[str],
+    cmdr_identity: set[str] | None,
+    is_brawl: bool,
+    skip_lands: bool = True,
+) -> list[tuple[dict, int]]:
+    """Greedily pick top-scored unused candidates that carry `role`.
+
+    Returns `[(card, count), ...]`. Singleton brawl => count=1. For
+    constructed we cap at 4 per name. Cards that already filled
+    another bucket (in `used_names`) are skipped — every card occupies
+    one bucket, even if its tag set covers several.
+    """
+    picked: list[tuple[dict, int]] = []
+    remaining = target
+    max_copies = 1 if is_brawl else 4
+    for score, card, in_shell in pool:
+        if remaining <= 0:
+            break
+        name = card.get("name") or ""
+        if name in used_names:
+            continue
+        if skip_lands and "land" in (card.get("type_line") or "").lower():
+            continue
+        roles = classify_card(card)
+        if role not in roles:
+            continue
+        if cmdr_identity is not None:
+            ci = set(card.get("color_identity") or [])
+            if not ci.issubset(cmdr_identity):
+                continue
+        copies = 1 if is_brawl else min(max_copies, remaining)
+        picked.append((card, copies))
+        used_names.add(name)
+        remaining -= copies
+    return picked
+
+
+def _invent_pick_lands(
+    target: int,
+    cluster_lands: list[dict],
+    cmdr_identity: set[str] | None,
+    is_brawl: bool,
+    used_names: set[str],
+) -> list[tuple[dict, int]]:
+    """Fill the land slot with owned dual/utility lands first, then basics.
+
+    Owned non-basic lands in the user's CI come first (one each in
+    brawl, up to 4 in constructed). Whatever's left is basics split
+    proportionally across the commander's color identity. Single-color
+    decks get all basics in their color; colorless decks fall back to
+    Wastes via colorless commanders' implicit colorless requirement.
+    """
+    picked: list[tuple[dict, int]] = []
+    remaining = target
+    max_copies = 1 if is_brawl else 4
+
+    # Pass 1: owned non-basic lands matching CI (dual lands, utility
+    # lands, etc.). Sort by CI breadth desc so duals trump monocolor
+    # utility — the manabase needs colors more than it needs gimmicks.
+    cluster_lands_sorted = sorted(
+        cluster_lands,
+        key=lambda c: (
+            -len(c.get("color_identity") or []),
+            -_RARITY_ORDER.get(c.get("rarity") or "common", 0),
+            c.get("name") or "",
+        ),
+    )
+    for c in cluster_lands_sorted:
+        if remaining <= 0:
+            break
+        name = c.get("name") or ""
+        if name in used_names:
+            continue
+        if cmdr_identity is not None:
+            ci = set(c.get("color_identity") or [])
+            if not ci.issubset(cmdr_identity):
+                continue
+        copies = 1 if is_brawl else min(max_copies, remaining)
+        picked.append((c, copies))
+        used_names.add(name)
+        remaining -= copies
+
+    if remaining <= 0:
+        return picked
+
+    # Pass 2: basic lands. Split evenly across CI colors; colorless
+    # commanders get Wastes only if available, else just no basics
+    # (caller will report the deck size shortfall via `validate`).
+    colors = sorted(cmdr_identity or set(), key="WUBRG".index)
+    if not colors:
+        wastes = _resolve_card("Wastes")
+        if wastes is not None:
+            picked.append((wastes, remaining))
+        return picked
+
+    per_color = remaining // len(colors)
+    leftover = remaining - per_color * len(colors)
+    for i, col in enumerate(colors):
+        basic_name = _BASIC_BY_COLOR.get(col)
+        if basic_name is None:
+            continue
+        c = _resolve_card(basic_name)
+        if c is None:
+            continue
+        count = per_color + (1 if i < leftover else 0)
+        if count > 0:
+            picked.append((c, count))
+    return picked
+
+
+def cmd_invent(args: argparse.Namespace) -> int:
+    """Compose a deck from a shell + collection priors + role template.
+
+    Algorithm (one-shot; Claude orchestrates retries with different
+    shells/commanders):
+
+      1. Cluster the user's owned, format-legal cards by `--by` (same
+         primitive as `tools/mtg shells`); locate the cluster keyed
+         `--shell`.
+      2. Pick a commander (brawl) — `--commander NAME` if provided
+         and legal; otherwise the highest-rarity, deepest-CI legendary
+         creature in the cluster.
+      3. Build a candidate pool: every owned, format-legal, CI-subset
+         card. Score each by shell membership + freq-corpus prior +
+         ownership tiebreak.
+      4. Greedy fill role buckets from `_invent_template(fmt)` —
+         ramp / card_advantage / removal / sweeper / counter / threat.
+         Each card occupies exactly one bucket (first-fit by score),
+         so a counter that's also a threat goes into whichever bucket
+         the iteration order hits first.
+      5. Land base: owned non-basic lands in CI first, then basics
+         split proportionally across the commander's colors. Total
+         lands = template[`land`].
+      6. Write to `data/corpus/<fmt>/derived/<shell>-<commander-slug>.txt`
+         by default; sidecar at `_meta.json` carries provenance.
+      7. Run `validate_deck` and print the result inline.
+
+    Best-effort. The greedy fill produces a starter deck, not a tuned
+    list — the user (or Claude) iterates from there with `analyze` /
+    `manabase` / `suggest-subs`.
+    """
+    _warn_if_stale()
+    _warn_if_collection_stale()
+
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    idx = _load_index()
+    cards_owned = _cards_owned(snap)
+
+    by = args.by
+    if args.min_cards is not None:
+        min_cards = args.min_cards
+    else:
+        min_cards = 15 if fmt in BRAWL_FORMATS else 24
+
+    clusters = _shell_cluster_rows(idx, cards_owned, fmt, by, min_cards, 10)
+    if not clusters:
+        print(
+            f"no shells with >={min_cards} owned cards "
+            f"(fmt={fmt}, by={by}); try lowering --min-cards",
+            file=sys.stderr,
+        )
+        return 1
+
+    target_key = args.shell
+    target_key_lc = target_key.lower()
+    matched = next(
+        (cl for cl in clusters if cl["key"].lower() == target_key_lc), None,
+    )
+    if matched is None:
+        keys = ", ".join(cl["key"] for cl in clusters[:10])
+        print(
+            f"shell {target_key!r} not found among top clusters: {keys}",
+            file=sys.stderr,
+        )
+        return 1
+
+    shell_names: set[str] = matched.get("_card_names") or set()
+    shell_cards: list[dict] = []
+    for name in shell_names:
+        c = _resolve_card(name)
+        if c is not None:
+            shell_cards.append(c)
+
+    is_brawl = fmt in BRAWL_FORMATS
+    commander = (
+        _invent_select_commander(shell_cards, args.commander)
+        if is_brawl else None
+    )
+    if is_brawl and commander is None:
+        print(
+            f"no legendary creature found in shell {target_key!r} "
+            f"and --commander not provided",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmdr_identity: set[str] | None = None
+    if commander is not None:
+        cmdr_identity = set(commander.get("color_identity") or [])
+    elif not is_brawl:
+        # Constructed: derive CI from the cluster union.
+        union: set[str] = set()
+        for c in shell_cards:
+            union.update(c.get("color_identity") or [])
+        cmdr_identity = union or None
+
+    template = _invent_template(fmt)
+    # If commander has no blue, drop the counter slot — keeps the
+    # template honest instead of leaving 4 unfillable counterspell
+    # slots that would absorb threat slack we'd rather spend on bodies.
+    if cmdr_identity is not None and "U" not in cmdr_identity:
+        spare = template.pop("counter", 0)
+        template["threat"] = template.get("threat", 0) + spare
+
+    freq_index = _load_freq_index(fmt, rebuild_if_stale=False) or {}
+    freq_cards = freq_index.get("cards") or {}
+
+    # Build the full candidate pool. Every owned, format-legal,
+    # CI-subset, non-basic card is fair game; shell membership is a
+    # score boost rather than a gate so we can fill ramp/draw/removal
+    # roles with cards outside the cluster (e.g. generic Cultivate is
+    # ramp regardless of which shell you're building).
+    seen_names: set[str] = set()
+    pool: list[tuple[float, dict, bool]] = []
+    shell_lands: list[dict] = []
+    for aid, qty in cards_owned.items():
+        c = idx["by_arena_id"].get(aid)
+        if c is None:
+            continue
+        if not _card_legal_in(c, fmt):
+            continue
+        name = c.get("name") or ""
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        if cmdr_identity is not None:
+            ci = set(c.get("color_identity") or [])
+            if not ci.issubset(cmdr_identity):
+                continue
+        if (c.get("name") or "").startswith("A-") and not (
+            fmt == "alchemy" or is_brawl
+        ):
+            continue
+        in_shell = name in shell_names
+        type_line = (c.get("type_line") or "").lower()
+        if "land" in type_line:
+            if not _is_basic(c):
+                shell_lands.append(c)
+            continue
+        score = _invent_score(
+            c, in_shell=in_shell, freq_cards=freq_cards, owned_count=qty,
+        )
+        pool.append((score, c, in_shell))
+
+    pool.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
+
+    used_names: set[str] = set()
+    if commander is not None:
+        used_names.add(commander.get("name") or "")
+
+    role_order = ("ramp", "card_advantage", "removal", "sweeper", "counter", "threat")
+    bucket_picks: dict[str, list[tuple[dict, int]]] = {}
+    for role in role_order:
+        target = template.get(role, 0)
+        if target <= 0:
+            continue
+        bucket_picks[role] = _invent_fill_bucket(
+            role, target, pool, used_names, cmdr_identity, is_brawl,
+        )
+
+    # Slack rollover: undelivered slots in any bucket roll into threat.
+    delivered = sum(c for picks in bucket_picks.values() for _, c in picks)
+    expected_nonland = sum(
+        v for k, v in template.items() if k != "land"
+    )
+    slack = expected_nonland - delivered
+    if slack > 0:
+        # Re-fill threat with whatever else fits (any role).
+        extra = _invent_fill_bucket(
+            "threat", slack, pool, used_names, cmdr_identity, is_brawl,
+        )
+        bucket_picks.setdefault("threat", []).extend(extra)
+
+    land_picks = _invent_pick_lands(
+        template.get("land", 0),
+        shell_lands,
+        cmdr_identity,
+        is_brawl,
+        used_names,
+    )
+
+    # Materialize entries.
+    entries: list[DeckEntry] = []
+
+    def _entry_for(card: dict, count: int, section: str) -> DeckEntry:
+        name = card.get("name") or ""
+        set_code = (card.get("set") or "").upper()
+        collector = str(card.get("collector_number") or "")
+        return DeckEntry(count, name, set_code, collector, section)
+
+    if commander is not None:
+        entries.append(_entry_for(commander, 1, "commander"))
+    for role in role_order:
+        for card, count in bucket_picks.get(role, []):
+            entries.append(_entry_for(card, count, "deck"))
+    for card, count in land_picks:
+        entries.append(_entry_for(card, count, "deck"))
+
+    # Slug + output path.
+    if commander is not None:
+        cmd_slug = slugify(commander.get("name") or "commander")
+        slug = f"{slugify(target_key)}-{cmd_slug}"
+    else:
+        slug = f"{slugify(target_key)}-{fmt}"
+    out_path = (
+        Path(args.out) if args.out
+        else CORPUS / fmt / "derived" / f"{slug}.txt"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_mtga_export(out_path, entries)
+
+    rc, msgs = validate_deck(entries, fmt)
+
+    sidecar_path = out_path.parent / "_meta.json"
+    sidecar: dict[str, dict] = {}
+    if sidecar_path.exists():
+        try:
+            existing = json.loads(sidecar_path.read_text())
+            if isinstance(existing, dict):
+                sidecar = existing
+        except (OSError, json.JSONDecodeError):
+            pass
+    sidecar[out_path.name] = {
+        "source": "invent",
+        "shell": target_key,
+        "by": by,
+        "commander": (commander.get("name") if commander else None),
+        "format": fmt,
+        "derived_at": time.strftime("%Y-%m-%d", time.gmtime()),
+        "role_targets": template,
+        "delivered": {
+            **{role: sum(c for _, c in bucket_picks.get(role, []))
+               for role in role_order if template.get(role, 0) > 0},
+            "land": sum(c for _, c in land_picks),
+        },
+        "validate_clean": rc == 0,
+    }
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n"
+    )
+
+    payload = {
+        "shell": target_key,
+        "by": by,
+        "format": fmt,
+        "commander": (commander.get("name") if commander else None),
+        "out": str(out_path),
+        "role_targets": template,
+        "delivered": sidecar[out_path.name]["delivered"],
+        "validate_clean": rc == 0,
+        "validate_messages": msgs,
+    }
+    if args.json:
+        _emit_json(payload)
+        return 0
+
+    cmdr_label = commander.get("name") if commander else "(no commander)"
+    print(f"invented {fmt} deck -> {out_path}")
+    print(f"  shell={target_key} ({by})  commander={cmdr_label}")
+    print(f"  delivered: {payload['delivered']}")
+    if rc == 0:
+        print("  validate: clean")
+    else:
+        print(f"  validate: {len(msgs)} issue(s)")
+        for m in msgs:
+            print(f"    {m}")
+    return 0
+
+
 # ---------- entrypoint ---------------------------------------------------
 
 
@@ -7430,6 +7935,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_derive)
+
+    s = sub.add_parser(
+        "invent",
+        help="compose a deck from a shell + collection priors + role template "
+             "(one-shot; Claude orchestrates retries with different shells)",
+    )
+    s.add_argument(
+        "--format", required=True,
+        help="Arena format (brawl/standardbrawl/standard/alchemy/historic/timeless/explorer/pioneer)",
+    )
+    s.add_argument(
+        "--shell", required=True,
+        help="cluster key from `tools/mtg shells` (e.g. 'Survival', 'Dragon', 'ramp')",
+    )
+    s.add_argument(
+        "--by", choices=("keyword", "type", "theme"), default="keyword",
+        help="cluster bucketer (default: keyword); must match the --by used to find --shell",
+    )
+    s.add_argument(
+        "--commander", default=None, metavar="NAME",
+        help="brawl: legendary creature to lead (default: highest-rarity legend in shell)",
+    )
+    s.add_argument(
+        "--out", default=None, metavar="PATH",
+        help="output path (default: data/corpus/<fmt>/derived/<shell>-<commander>.txt)",
+    )
+    s.add_argument(
+        "--min-cards", type=int, default=None, metavar="N",
+        help="cluster size threshold (default: 15 for brawl, 24 for constructed)",
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_invent)
 
     args = p.parse_args(argv)
     return args.func(args)
