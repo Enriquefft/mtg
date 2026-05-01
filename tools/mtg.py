@@ -3969,6 +3969,8 @@ def _coverage_with_subs_pct(
     total_need: int,
     *,
     quiet: bool = False,
+    max_sub_pct: float = 0.30,
+    out: dict | None = None,
 ) -> float:
     """Re-run suggest-subs and fold filled deficits into coverage.
 
@@ -3988,11 +3990,64 @@ def _coverage_with_subs_pct(
     `quiet` is forwarded to `_run_suggest_subs` so the per-candidate
     `[warn] dropping game-changer ...` stderr noise stays out of
     `coverage --batch --with-subs --json` output.
+
+    `out` (when provided) is populated with the F2 sidecar fields the
+    `recommend` command needs: `subs_acceptable`, `subs_pct`,
+    `cards_substituted`, `anchor_unfilled`, `anchor_total`,
+    `non_basic_main`. Lets `_coverage_row` and `_recommend_compute`
+    share one `_run_suggest_subs` call instead of paying for two.
+
+    Math short-circuit: when `(1 - owned_pct) > max_sub_pct`, the F2
+    fidelity floor is guaranteed to trip (more than `max_sub_pct` of
+    the deck must be substituted just to fill the deficit), so the
+    clamp returns `owned_pct` regardless of which candidates exist.
+    Skip the heavy `_run_suggest_subs` scoring pass entirely. When this
+    fires the sidecar adds `"short_circuited": True` so consumers can
+    distinguish "we didn't compute the rewrite detail" from "we
+    computed it and the counts are zero" — `cards_substituted`,
+    `anchor_unfilled`, `anchor_total`, and `non_basic_main` are all
+    set to 0 in that case but those zeros are placeholders, not facts.
     """
     if total_need == 0:
+        if out is not None:
+            out.update({
+                "subs_acceptable": True,
+                "subs_pct": 0.0,
+                "cards_substituted": 0,
+                "anchor_unfilled": 0,
+                "anchor_total": 0,
+                "non_basic_main": 0,
+            })
         return 1.0
     owned_pct = total_have / total_need
-    result = _run_suggest_subs(deck_path, fmt, idx, snap, quiet=quiet)
+    needed_sub_pct = 1.0 - owned_pct
+    if needed_sub_pct > max_sub_pct:
+        # Mathematically guaranteed unacceptable — F2's clamp would
+        # return owned_pct anyway. Skip the suggest-subs call entirely.
+        if out is not None:
+            out.update({
+                "subs_acceptable": False,
+                "subs_pct": needed_sub_pct,  # lower bound; actual could be higher if anchors are missing
+                "cards_substituted": 0,  # we didn't compute the rewrite, can't count slots
+                "anchor_unfilled": 0,    # ditto
+                "anchor_total": 0,       # ditto
+                "non_basic_main": 0,     # ditto
+                "short_circuited": True,  # signal to consumers that detail is not available
+            })
+        return owned_pct
+    result = _run_suggest_subs(
+        deck_path, fmt, idx, snap, quiet=quiet, max_sub_pct=max_sub_pct,
+    )
+    if out is not None:
+        summary = result.get("summary") or {}
+        out.update({
+            "subs_acceptable": bool(result.get("subs_acceptable", True)),
+            "subs_pct": float(result.get("subs_pct") or 0.0),
+            "cards_substituted": int(result.get("cards_substituted") or 0),
+            "anchor_unfilled": int(summary.get("anchor_unfilled") or 0),
+            "anchor_total": len(result.get("anchors") or []),
+            "non_basic_main": int(result.get("non_basic_main") or 0),
+        })
     if not result.get("subs_acceptable", True):
         return owned_pct
     filled = 0
@@ -4043,6 +4098,8 @@ def _coverage_row(
     fallback_warn: list[bool],
     *,
     quiet: bool = False,
+    max_sub_pct: float = 0.30,
+    include_subs_meta: bool = False,
 ) -> dict:
     """Compute one batch-mode row. Mutates fallback_warn[0] -> True
     when this deck's parent dir is not in ARENA_FORMATS.
@@ -4050,6 +4107,14 @@ def _coverage_row(
     `quiet` is forwarded to the suggest-subs sub-call so JSON-output
     callers don't emit the per-candidate game-changer stderr line for
     each deck in the batch.
+
+    `max_sub_pct` overrides the F2 sub-fidelity floor (default 0.30 =
+    30% of the deck). `include_subs_meta=True` adds the F2 sidecar
+    fields (`subs_acceptable`, `anchor_unfilled`, `anchor_total`,
+    `cards_substituted`, `subs_pct`, plus `short_circuited` when the
+    math short-circuit fired) to the returned row — needed by
+    `recommend` for build-status classification, opt-in elsewhere so
+    the existing `coverage --batch` JSON schema stays unchanged.
     """
     parent = deck_path.parent.name
     fmt = parent if parent in ARENA_FORMATS else "brawl"
@@ -4072,9 +4137,12 @@ def _coverage_row(
     top3 = [name for name, _short, _rarity in gating_sorted[:3]]
 
     with_subs_pct: float | None = None
+    subs_meta: dict = {}
     if with_subs:
         with_subs_pct = _coverage_with_subs_pct(
-            deck_path, fmt, idx, snap, total_have, total_need, quiet=quiet,
+            deck_path, fmt, idx, snap, total_have, total_need,
+            quiet=quiet, max_sub_pct=max_sub_pct,
+            out=subs_meta if include_subs_meta else None,
         )
 
     meta = _load_deck_meta(deck_path)
@@ -4092,7 +4160,7 @@ def _coverage_row(
     )
     composite = round(tier_w * base_pct, 4)
 
-    return {
+    row: dict = {
         "deck": str(deck_path),
         "archetype": deck_path.stem,
         "tier": tier,
@@ -4105,6 +4173,16 @@ def _coverage_row(
         "composite": composite,
         "top3_missing": top3,
     }
+    if include_subs_meta and subs_meta:
+        row["subs_acceptable"] = subs_meta["subs_acceptable"]
+        row["subs_pct"] = round(subs_meta["subs_pct"], 4)
+        row["cards_substituted"] = subs_meta["cards_substituted"]
+        row["anchor_unfilled"] = subs_meta["anchor_unfilled"]
+        row["anchor_total"] = subs_meta["anchor_total"]
+        row["non_basic_main"] = subs_meta["non_basic_main"]
+        if subs_meta.get("short_circuited"):
+            row["short_circuited"] = True
+    return row
 
 
 def _print_coverage_batch_text(rows: list[dict], with_subs: bool) -> None:
