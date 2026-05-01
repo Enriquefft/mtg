@@ -5,15 +5,20 @@ Groundwork for building MTG Arena decks. Lets a Claude session answer
 "validate my deck list" without hitting rate limits or trusting
 outdated internet info.
 
-## Hard rule: `data/` is CLI-only
+## Hard rule: `data/` bulk files are CLI-only
 
 `data/` holds the ~500 MB Scryfall bulk dump, an 80 MB pickled index,
-and the collection snapshot — reading any into context blows the
-window. **Never `Read`/`Glob`/`Grep`/`cat`/`head`/`tail`/`jq` files in
-`data/`.** `.claude/settings.json` enforces this with a deny rule; the
-only sanctioned path is `tools/mtg`. If a query isn't covered by a
+the collection snapshot, and the strictlybetter cache — reading any
+into context blows the window. **Never `Read`/`Glob`/`Grep`/`cat`/
+`head`/`tail`/`jq` the `data/*.json` / `data/*.pkl` / `data/meta-cache/`
+files.** `.claude/settings.json` denies these specifically. The only
+sanctioned path is `tools/mtg`. If a query isn't covered by a
 subcommand, add one. `python -c "open('data/...')"` and shell
 redirects (`cmd < data/foo`) bypass the deny list — don't use them.
+
+**Carve-out:** `data/corpus/<fmt>/` is small text + small JSON
+(MTGA-export decklists + per-format `meta.json` + `_freq.json`), readable
+freely. Machine-managed by `fetch-meta`; always re-buildable, gitignored.
 
 ## Quick start
 
@@ -93,17 +98,19 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
 
 11. **For batch ownership ranking** across a deck directory:
     ```bash
-    tools/mtg coverage --batch --glob 'decks/<fmt>/*.txt' --with-subs --min 0.90 --json
+    tools/mtg coverage --batch --glob 'data/corpus/<fmt>/*.txt' --with-subs --min 0.90 --json
     ```
     Sorts by ownership %; `--with-subs` factors in `suggest-subs` rewrites.
     `--json` works in single-deck and batch mode.
 
 12. **For pulling a meta corpus** into the repo:
     ```bash
-    tools/mtg fetch-meta historic --out decks/historic/ --limit 30
+    tools/mtg fetch-meta historic --limit 30   # writes to data/corpus/historic/
     ```
-    Sources: `mtgazone`, `mtggoldfish`, `mtgdecks`, `untapped` (the only
-    automated Brawl source — `--source untapped brawl`; also covers
+    Default `--out` is `data/corpus/<fmt>/` (machine-managed, gitignored;
+    distinct from tracked human drafts under `decks/<name>/`). Sources:
+    `mtgazone`, `mtggoldfish`, `mtgdecks`, `untapped` (the only automated
+    Brawl source — `--source untapped brawl`; also covers
     `historic`/`standard`/`pioneer`/`alchemy`/`timeless` with much larger
     samples than mtgazone). See `docs/sources.md`.
     Add `--no-cache` to bypass `data/meta-cache/`, `--json` for stdout output.
@@ -152,10 +159,11 @@ Other format edge cases live in `docs/gotchas.md`.
 
 ## Layout
 
-`tools/mtg{,.py}` (CLI), `data/` (gitignored bulk + index + collection),
+`tools/mtg{,.py}` (CLI), `data/` (gitignored bulk + index + collection;
+`data/corpus/<fmt>/` holds machine-managed meta scrapes, also gitignored),
 `docs/` (formats / gotchas / sources / historic / roadmap), `decks/`
-(MTGA-export files), `flake.nix` + `.envrc` (Nix dev shell: python3 + uv
-+ jq + curl + dotnet-sdk_8 + util-linux).
+(tracked human drafts: `decks/<name>/v*.txt`), `flake.nix` + `.envrc`
+(Nix dev shell: python3 + uv + jq + curl + dotnet-sdk_8 + util-linux).
 
 ## Workflow for building a new deck
 

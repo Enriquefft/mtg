@@ -18,6 +18,6 @@ tools/inject/build/
 .claude/local/
 .claude/scheduled_tasks.lock
 
-# Decks: existing tracked lists stay tracked; new entries (corpus dumps from
-# fetch-meta, ad-hoc drafts) are ephemeral. Use `git add -f` for new curated decks.
-decks/
+# `decks/` holds tracked human-curated drafts (e.g. decks/<name>/v*.txt).
+# Machine-managed meta corpus from `fetch-meta` lives under `data/corpus/`
+# (gitignored separately via data/.gitignore).

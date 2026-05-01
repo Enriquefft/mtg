@@ -28,8 +28,8 @@ Subcommands:
     coverage <deck.txt>           % of deck you can build right now
     diff <a.txt> <b.txt>          per-card delta between two deck files
     suggest-subs <deck.txt> -f F  propose owned replacements for missing cards
-    fetch-meta <format>           scrape a meta source -> decks/<fmt>/ + meta.json
-    freq <format>                 card-frequency index over decks/<fmt>/*.txt
+    fetch-meta <format>           scrape a meta source -> data/corpus/<fmt>/ + meta.json
+    freq <format>                 card-frequency index over data/corpus/<fmt>/*.txt
     shells --format F             cluster owned cards by keyword/type/theme
     recommend --format F          rank corpus decks you can build + shell bridge
 
@@ -98,6 +98,11 @@ BULK_JSON = DATA / "default_cards.json"
 INDEX_PKL = DATA / "index.pkl"
 META_JSON = DATA / "bulk-meta.json"
 STRICTLYBETTER_CACHE = DATA / "strictlybetter-cache.json"
+# Meta-deck corpus root: machine-managed scrapes from `fetch-meta`. Each
+# format gets `data/corpus/<fmt>/{*.txt, meta.json, _freq.json}`. Tracked
+# human drafts live separately under `decks/<name>/v*.txt` (different
+# namespace, different lifecycle). Gitignored via `data/.gitignore`.
+CORPUS = DATA / "corpus"
 
 SCRYFALL_BULK = "https://api.scryfall.com/bulk-data/default-cards"
 SCRYFALL_API = "https://api.scryfall.com"
@@ -4942,13 +4947,13 @@ def _shell_cluster_rows(
 
 
 def _corpus_deck_files(fmt: str) -> list[Path]:
-    """Sorted MTGA-export deck files in `decks/<fmt>/`.
+    """Sorted MTGA-export deck files in `data/corpus/<fmt>/`.
 
     Excludes JSON sidecars (`meta.json`, `_freq.json`, `_*.json`) so the
     corpus enumerator never tries to `parse_deck` a JSON blob. Returns []
     if the directory doesn't exist.
     """
-    corpus_dir = ROOT / "decks" / fmt
+    corpus_dir = CORPUS / fmt
     if not corpus_dir.is_dir():
         return []
     out: list[Path] = []
@@ -4973,7 +4978,7 @@ def _archetype_for_deck(deck_path: Path) -> str:
 
 
 def _compute_freq_index(fmt: str) -> dict:
-    """Walk `decks/<fmt>/*.txt` and tally per-card stats.
+    """Walk `data/corpus/<fmt>/*.txt` and tally per-card stats.
 
     Schema is consumer-stable (F2/F3/F4 read this directly):
       - `deck_count` / `deck_pct` — main+sideboard combined membership
@@ -5064,7 +5069,7 @@ def _compute_freq_index(fmt: str) -> dict:
 
 
 def _freq_index_path(fmt: str) -> Path:
-    return ROOT / "decks" / fmt / "_freq.json"
+    return CORPUS / fmt / "_freq.json"
 
 
 def _freq_index_is_stale(fmt: str) -> bool:
@@ -5077,7 +5082,7 @@ def _freq_index_is_stale(fmt: str) -> bool:
         if p.stat().st_mtime > idx_mtime:
             return True
     # Sidecar bumps too: archetype names sourced from there.
-    sidecar = ROOT / "decks" / fmt / "meta.json"
+    sidecar = CORPUS / fmt / "meta.json"
     if sidecar.exists() and sidecar.stat().st_mtime > idx_mtime:
         return True
     return False
@@ -5138,7 +5143,7 @@ def _freq_rows_sorted(index: dict) -> list[tuple[str, dict]]:
 
 
 def cmd_freq(args: argparse.Namespace) -> int:
-    """Card-frequency index over `decks/<fmt>/*.txt`.
+    """Card-frequency index over `data/corpus/<fmt>/*.txt`.
 
     Three viewing modes:
       * default — top 30 cards by `deck_pct` as a text table
@@ -5266,7 +5271,7 @@ def cmd_freq(args: argparse.Namespace) -> int:
 def _load_archetype_anchors(fmt: str) -> dict[str, dict]:
     """Per-archetype canonical card sets for `shells --match-corpus`.
 
-    Walks `decks/<fmt>/*.txt` (excluding sidecars + `_freq.json`) and
+    Walks `data/corpus/<fmt>/*.txt` (excluding sidecars + `_freq.json`) and
     returns ``{archetype_slug: {"cards": set[str], "size": int,
     "tier": str | None}}``. Anchor cards are non-basic-land main +
     commander + companion + sideboard entries resolved through
@@ -6108,7 +6113,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         decks = decks[: args.limit]
 
     out_dir = Path(args.out) if args.out else (
-        ROOT / "decks" / fmt
+        CORPUS / fmt
     )
     sidecar = _write_meta_corpus(decks, out_dir)
 
@@ -6782,15 +6787,15 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser(
         "freq",
-        help="card-frequency index over decks/<fmt>/*.txt (popularity prior)",
+        help="card-frequency index over data/corpus/<fmt>/*.txt (popularity prior)",
     )
     s.add_argument(
         "format",
-        help="Arena format (must have a corpus under decks/<format>/)",
+        help="Arena format (must have a corpus under data/corpus/<format>/)",
     )
     s.add_argument(
         "--rebuild", action="store_true",
-        help="recompute the index and write decks/<fmt>/_freq.json",
+        help="recompute the index and write data/corpus/<fmt>/_freq.json",
     )
     s.add_argument(
         "--no-rebuild", action="store_true",
@@ -6899,7 +6904,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--out", default=None, metavar="DIR",
-        help="output dir (default: decks/<format>/)",
+        help="output dir (default: data/corpus/<format>/)",
     )
     s.add_argument(
         "--limit", type=int, default=None, metavar="N",
@@ -6922,7 +6927,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--format", required=True,
-        help="Arena format (must have a corpus under decks/<format>/)",
+        help="Arena format (must have a corpus under data/corpus/<format>/)",
     )
     s.add_argument(
         "--min", type=float, default=0.30, metavar="N",
