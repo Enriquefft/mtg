@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import glob as glob_mod
 import hashlib
+import io
 import json
 import os
 import pickle
@@ -356,6 +357,48 @@ def _resolve_card(name: str) -> dict | None:
 # ---------- card / printing -----------------------------------------------
 
 
+def _emit_json(payload) -> None:
+    """Single sink for `--json` output. Adds a trailing newline (so piping
+    to `python -c 'json.load'` works cleanly) and routes non-JSON-native
+    types through `str` (Path, set, etc).
+    """
+    print(json.dumps(payload, indent=2, default=str))
+
+
+def _card_to_json(c: dict) -> dict:
+    """Canonical JSON shape for a single card. Used by `card`, `printing`
+    and embedded inside list-shaped payloads.
+    """
+    return {
+        "name": c.get("name"),
+        "set": (c.get("set") or "").upper(),
+        "collector_number": c.get("collector_number"),
+        "mana_cost": c.get("mana_cost"),
+        "cmc": c.get("cmc"),
+        "type_line": c.get("type_line"),
+        "oracle_text": c.get("oracle_text"),
+        "colors": c.get("colors") or [],
+        "color_identity": c.get("color_identity") or [],
+        "rarity": c.get("rarity"),
+        "keywords": c.get("keywords") or [],
+        "legalities": c.get("legalities") or {},
+        "games": c.get("games") or [],
+        "image_uris": c.get("image_uris") or None,
+        "card_faces": [
+            {
+                "name": f.get("name"),
+                "mana_cost": f.get("mana_cost"),
+                "type_line": f.get("type_line"),
+                "oracle_text": f.get("oracle_text"),
+                "colors": f.get("colors") or [],
+                "image_uris": f.get("image_uris") or None,
+            }
+            for f in (c.get("card_faces") or [])
+        ] or None,
+        "game_changer": bool(c.get("game_changer")),
+    }
+
+
 def _format_card(c: dict) -> str:
     lines = []
     lines.append(f"name        : {c['name']}")
@@ -391,7 +434,10 @@ def cmd_card(args: argparse.Namespace) -> int:
     if not c:
         print(f"card not found: {args.name}", file=sys.stderr)
         return 1
-    print(_format_card(c))
+    if getattr(args, "json", False):
+        _emit_json(_card_to_json(c))
+    else:
+        print(_format_card(c))
     return 0
 
 
@@ -402,7 +448,10 @@ def cmd_printing(args: argparse.Namespace) -> int:
     if not c:
         print(f"printing not found: {args.set} {args.num}", file=sys.stderr)
         return 1
-    print(_format_card(c))
+    if getattr(args, "json", False):
+        _emit_json(_card_to_json(c))
+    else:
+        print(_format_card(c))
     return 0
 
 
@@ -424,8 +473,20 @@ def cmd_legal(args: argparse.Namespace) -> int:
         return 1
     legal = (c.get("legalities") or {}).get(fmt, "not_legal")
     on_arena = "arena" in (c.get("games") or [])
-    print(f"{c['name']}: {legal} in {fmt}; arena={'yes' if on_arena else 'no'}")
-    return 0 if (legal == "legal" and on_arena) else 1
+    is_legal = legal == "legal" and on_arena
+    if getattr(args, "json", False):
+        _emit_json({
+            "name": c["name"],
+            "format": fmt,
+            "legal": is_legal,
+            "status": legal,
+            "on_arena": on_arena,
+        })
+    else:
+        print(
+            f"{c['name']}: {legal} in {fmt}; arena={'yes' if on_arena else 'no'}"
+        )
+    return 0 if is_legal else 1
 
 
 # ---------- deck parsing + validation ------------------------------------
@@ -609,6 +670,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return 2
     entries = parse_deck(path)
     fmt = args.format.lower()
+
+    if getattr(args, "json", False):
+        code, msgs = validate_deck(entries, fmt)
+        cmdrs = [e.name for e in entries if e.section == "commander"]
+        total = sum(
+            e.count for e in entries if e.section in {"deck", "commander"}
+        )
+        _emit_json({
+            "deck": str(path),
+            "format": fmt,
+            "ok": code == 0,
+            "errors": msgs,
+            "warnings": [],
+            "card_total": total,
+            "commander": cmdrs[0] if cmdrs else None,
+        })
+        return code
 
     if args.verbose:
         cmdr_entry = next((e for e in entries if e.section == "commander"), None)
@@ -873,6 +951,51 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             curve[cmc] = curve.get(cmc, 0) + e.count
         rows.append((e, c, tags, cmc))
 
+    if getattr(args, "json", False):
+        type_keys = {k for k, _ in _ROLE_TYPE}
+        func_keys = {k for k, _ in _ROLE_FUNC}
+        type_mix = {label: role_counts.get(key, 0) for key, label in _ROLE_TYPE}
+        function_tags = {label: role_counts.get(key, 0) for key, label in _ROLE_FUNC}
+        function_tags["game_changers"] = gc_total
+        avg_cmc = (
+            sum(c * n for c, n in curve.items()) / max(nonland_total, 1)
+            if curve else 0.0
+        )
+        cards_payload = []
+        for e, c, tags, cmc in rows:
+            if c is None:
+                cards_payload.append({
+                    "name": e.name,
+                    "count": e.count,
+                    "section": e.section,
+                    "cmc": None,
+                    "types": [],
+                    "tags": [],
+                    "resolved": False,
+                })
+                continue
+            cards_payload.append({
+                "name": c.get("name"),
+                "count": e.count,
+                "section": e.section,
+                "cmc": cmc,
+                "types": sorted(tags & type_keys),
+                "tags": sorted(tags & func_keys),
+                "resolved": True,
+            })
+        _emit_json({
+            "deck": str(path),
+            "scope": sorted(sections),
+            "card_total": total,
+            "type_mix": type_mix,
+            "function_tags": function_tags,
+            "curve": {str(k): v for k, v in sorted(curve.items())},
+            "nonland_total": nonland_total,
+            "avg_cmc": round(avg_cmc, 4),
+            "cards": cards_payload,
+        })
+        return 0
+
     print(f"deck: {path} ({total} cards, scope={'+'.join(sorted(sections))})")
     print()
     print("composition (by type, lands+nonlands):")
@@ -945,7 +1068,17 @@ def cmd_related(args: argparse.Namespace) -> int:
         return 2
     keywords = list(c.get("keywords") or [])
     if not keywords:
-        print(f"{c['name']} has no Scryfall-tagged keywords; nothing to expand.")
+        if getattr(args, "json", False):
+            _emit_json({
+                "anchor": c["name"],
+                "format": fmt or None,
+                "keywords": [],
+                "by_keyword": {},
+            })
+        else:
+            print(
+                f"{c['name']} has no Scryfall-tagged keywords; nothing to expand."
+            )
         return 0
 
     idx = _load_index()
@@ -981,6 +1114,32 @@ def cmd_related(args: argparse.Namespace) -> int:
                 by_kw[kw].append(rep)
                 seen.add(rep["name"])
                 break
+
+    if getattr(args, "json", False):
+        out_by_kw: dict[str, list[dict]] = {}
+        for kw in sorted(keywords, key=lambda k: len(by_kw[k])):
+            cards = sorted(
+                by_kw[kw], key=lambda x: (x.get("cmc") or 0, x["name"])
+            )[: args.limit]
+            out_by_kw[kw] = [
+                {
+                    "name": p["name"],
+                    "set": (p.get("set") or "").upper(),
+                    "cmc": p.get("cmc") or 0,
+                    "color_identity":
+                        "".join(p.get("color_identity") or []) or "C",
+                    "type_line": p.get("type_line") or "",
+                    "rarity": p.get("rarity") or "",
+                }
+                for p in cards
+            ]
+        _emit_json({
+            "anchor": c["name"],
+            "format": fmt or None,
+            "keywords": keywords,
+            "by_keyword": out_by_kw,
+        })
+        return 0
 
     print(f"sister cards by keyword (anchor: {c['name']}{', fmt=' + fmt if fmt else ''}):")
     # Rarer keywords first — named/mechanic clusters (Blitz, Survival,
@@ -1095,6 +1254,39 @@ def cmd_manabase(args: argparse.Namespace) -> int:
             if _RX_ETB_TAPPED.search(text):
                 tapped_lands.append((e, c))
 
+    if getattr(args, "json", False):
+        pip_demand_payload = {
+            str(cmc): pip_by_cmc[cmc] for cmc in sorted(pip_by_cmc)
+        }
+        sources_payload = {col: src_by_color[col] for col in _COLORS + ("C",)}
+        sources_payload["lands"] = land_total
+        sources_payload["nonland_producers"] = nonland_producer_total
+        tapped_payload = []
+        for e, c in tapped_lands:
+            text = c.get("oracle_text") or ""
+            hit_lines = [
+                ln.strip()
+                for ln in text.splitlines()
+                if _RX_ETB_TAPPED.search(ln.lower())
+            ]
+            tapped_payload.append({
+                "name": c.get("name"),
+                "count": e.count,
+                "first_etb_line":
+                    hit_lines[0] if hit_lines else None,
+            })
+        _emit_json({
+            "deck": str(path),
+            "pip_demand": pip_demand_payload,
+            "nonland_count_by_cmc": {
+                str(k): v for k, v in sorted(nonland_count_by_cmc.items())
+            },
+            "sources": sources_payload,
+            "etb_tapped": len(tapped_lands),
+            "etb_tapped_lands": tapped_payload,
+        })
+        return 0
+
     print(f"manabase: {path}")
     print()
     if pip_by_cmc:
@@ -1164,13 +1356,40 @@ def cmd_wildcards(args: argparse.Namespace) -> int:
         by_rarity[r] = by_rarity.get(r, 0) + e.count
         by_rarity_cards.setdefault(r, []).append((e, c))
 
-    print(f"wildcards: {path} (deck + sideboard)")
-    print()
-    print("rarity breakdown:")
     seen_rarities = sorted(
         by_rarity,
         key=lambda r: (_RARITY_ORDER.get(r, 99), r),
     )
+
+    if getattr(args, "json", False):
+        rarity_counts = {
+            r: by_rarity.get(r, 0)
+            for r in ("mythic", "rare", "uncommon", "common")
+        }
+        # surface any non-standard rarity buckets seen (token, special, ...).
+        for r in seen_rarities:
+            if r not in rarity_counts:
+                rarity_counts[r] = by_rarity[r]
+        cards_by_rarity = {}
+        if args.list:
+            for r in seen_rarities:
+                cards_by_rarity[r] = [
+                    {"name": c.get("name"), "count": e.count}
+                    for e, c in sorted(
+                        by_rarity_cards[r], key=lambda x: x[1]["name"]
+                    )
+                ]
+        _emit_json({
+            "deck": str(path),
+            "rarity_counts": rarity_counts,
+            "unresolved": len(unknown),
+            "cards_by_rarity": cards_by_rarity,
+        })
+        return 0
+
+    print(f"wildcards: {path} (deck + sideboard)")
+    print()
+    print("rarity breakdown:")
     for r in seen_rarities:
         print(f"  {r:<10} {by_rarity[r]:>3}")
     if unknown:
@@ -1498,6 +1717,28 @@ def cmd_companion(args: argparse.Namespace) -> int:
         _sb_check("Lutri, the Spellchaser", lutri_violations),
     ))
 
+    if getattr(args, "json", False):
+        eligible: list[str] = []
+        ineligible: dict[str, dict] = {}
+        for label, viols in checks:
+            # Companion display name is everything before the first " (".
+            name = label.split(" (", 1)[0]
+            if not viols:
+                eligible.append(name)
+            else:
+                ineligible[name] = {
+                    "rule": label,
+                    "violations": viols,
+                    "violation_count": len(viols),
+                }
+        _emit_json({
+            "deck": str(path),
+            "format": args.format,
+            "eligible": eligible,
+            "ineligible": ineligible,
+        })
+        return 0
+
     print(f"companion: {path}")
     print()
     for label, viols in checks:
@@ -1520,6 +1761,29 @@ def _check_divider(label: str) -> None:
     print(f"\n{bar} {label} {bar}")
 
 
+def _capture_json(fn, ns: argparse.Namespace) -> tuple[int, object]:
+    """Invoke a sub-command in `--json` mode and capture its payload.
+
+    Used by composite commands (e.g. `check --json`) so they can stitch
+    together each stage's structured output without duplicating compute
+    paths. Stdout is redirected through a `StringIO` buffer; the buffer
+    is parsed as JSON and returned alongside the sub-command's exit
+    code. Stderr is left attached to the real fd so warnings still
+    surface during the composite run.
+    """
+    ns.json = True
+    buf = io.StringIO()
+    saved = sys.stdout
+    sys.stdout = buf
+    try:
+        rc = fn(ns)
+    finally:
+        sys.stdout = saved
+    raw = buf.getvalue().strip()
+    payload = json.loads(raw) if raw else None
+    return rc, payload
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Run the full validate/analyze/manabase/wildcards/companion battery
     against a deck file, with section dividers between each stage.
@@ -1531,6 +1795,52 @@ def cmd_check(args: argparse.Namespace) -> int:
     """
     deck = args.deck
     fmt = args.format
+
+    if getattr(args, "json", False):
+        rc, validate_payload = _capture_json(
+            cmd_validate,
+            argparse.Namespace(deck=deck, format=fmt, verbose=False),
+        )
+        _, analyze_payload = _capture_json(
+            cmd_analyze,
+            argparse.Namespace(
+                deck=deck, include_sideboard=False, sideboard_only=False,
+            ),
+        )
+        _, manabase_payload = _capture_json(
+            cmd_manabase, argparse.Namespace(deck=deck),
+        )
+        _, wildcards_payload = _capture_json(
+            cmd_wildcards, argparse.Namespace(deck=deck, list=False),
+        )
+        _, companion_payload = _capture_json(
+            cmd_companion, argparse.Namespace(deck=deck, format=fmt),
+        )
+        gaps_payload: object = None
+        if args.collection:
+            if _load_collection() is None:
+                print(
+                    "[check] --collection requested but no snapshot at "
+                    f"{COLLECTION_PATH}; skipping gaps.",
+                    file=sys.stderr,
+                )
+            else:
+                _, gaps_payload = _capture_json(
+                    cmd_gaps, argparse.Namespace(deck=deck),
+                )
+        payload = {
+            "deck": deck,
+            "format": fmt,
+            "validate": validate_payload,
+            "analyze": analyze_payload,
+            "manabase": manabase_payload,
+            "wildcards": wildcards_payload,
+            "companion": companion_payload,
+        }
+        if args.collection:
+            payload["gaps"] = gaps_payload
+        _emit_json(payload)
+        return rc
 
     _check_divider("validate")
     validate_args = argparse.Namespace(deck=deck, format=fmt, verbose=False)
@@ -1599,12 +1909,33 @@ def cmd_search(args: argparse.Namespace) -> int:
         data = _get_json(url)
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            if getattr(args, "json", False):
+                _emit_json({
+                    "query": q,
+                    "limit": args.limit,
+                    "total_cards": 0,
+                    "shown": 0,
+                    "has_more": False,
+                    "cards": [],
+                })
+                return 1
             print("no cards matched")
             return 1
         raise
     cards = data.get("data") or []
+    shown = cards[: args.limit]
+    if getattr(args, "json", False):
+        _emit_json({
+            "query": q,
+            "limit": args.limit,
+            "total_cards": data.get("total_cards", len(cards)),
+            "shown": len(shown),
+            "has_more": bool(data.get("has_more")),
+            "cards": [_card_to_json(c) for c in shown],
+        })
+        return 0
     print(f"{data.get('total_cards', len(cards))} match(es); showing {len(cards)}:")
-    for c in cards[: args.limit]:
+    for c in shown:
         ci = "".join(c.get("color_identity") or []) or "C"
         on_arena = "✓" if "arena" in (c.get("games") or []) else " "
         print(
@@ -2408,6 +2739,18 @@ def cmd_collection(args: argparse.Namespace) -> int:
     _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
+        if getattr(args, "json", False):
+            _emit_json({
+                "snapshot_at": None,
+                "source": None,
+                "completeness": None,
+                "unique_arena_ids": 0,
+                "unique_names": 0,
+                "total_copies": 0,
+                "rarity_unique": {},
+                "rarity_owned": {},
+            })
+            return 1
         sys.stdout.write(_empty_state_message())
         return 1
     cards = _cards_owned(snap)
@@ -2419,6 +2762,19 @@ def cmd_collection(args: argparse.Namespace) -> int:
         r = slot["rarity"] or "common"
         rarity_owned[r] = rarity_owned.get(r, 0) + slot["owned"]
         rarity_unique[r] = rarity_unique.get(r, 0) + 1
+
+    if getattr(args, "json", False):
+        _emit_json({
+            "snapshot_at": snap.get("snapshot_at"),
+            "source": snap.get("source"),
+            "completeness": snap.get("completeness"),
+            "unique_arena_ids": len(cards),
+            "unique_names": len(by_name),
+            "total_copies": sum(cards.values()),
+            "rarity_unique": rarity_unique,
+            "rarity_owned": rarity_owned,
+        })
+        return 0
 
     print(f"snapshot:    {snap.get('snapshot_at')}")
     print(f"source:      {snap.get('source')}")
@@ -2530,11 +2886,25 @@ def cmd_own(args: argparse.Namespace) -> int:
     _warn_if_collection_stale()
     snap = _load_collection()
     if snap is None:
+        if getattr(args, "json", False):
+            _emit_json({
+                "name": args.name,
+                "found": False,
+                "error": "no collection snapshot",
+            })
+            return 1
         sys.exit(_empty_state_message().rstrip())
     idx = _load_index()
     name_lc = _normalize_name(args.name)
     printings = idx["by_name"].get(name_lc) or []
     if not printings:
+        if getattr(args, "json", False):
+            _emit_json({
+                "name": args.name,
+                "found": False,
+                "error": "unknown card",
+            })
+            return 1
         sys.exit(f"unknown card: {args.name}")
     cards = _cards_owned(snap)
     by_name = _aggregate_by_name(idx, cards)
@@ -2542,11 +2912,23 @@ def cmd_own(args: argparse.Namespace) -> int:
     owned = slot["owned"] if slot else 0
     canonical = printings[0]["name"]
     rarity = (slot or {}).get("rarity") or printings[0].get("rarity", "?")
-    target = 1 if _is_basic(canonical) else 4
+    is_basic = _is_basic(canonical)
+    target = 1 if is_basic else 4
     short = max(0, target - owned)
+    if getattr(args, "json", False):
+        _emit_json({
+            "name": canonical,
+            "found": True,
+            "rarity": rarity,
+            "owned": owned,
+            "target": target,
+            "short": short,
+            "is_basic": is_basic,
+        })
+        return 0
     print(f"{canonical}  [{rarity}]")
     print(f"  owned: {owned}")
-    if _is_basic(canonical):
+    if is_basic:
         print("  basic land — MTGA gives unlimited copies, ignore counts")
     else:
         print(f"  4-of target: {owned}/{target}  (short {short})")
@@ -2614,6 +2996,33 @@ def cmd_owned(args: argparse.Namespace) -> int:
 
     rows.sort(key=lambda r: (r[1].lower(), r[2], r[3]))
 
+    json_rows = [
+        {
+            "name": name,
+            "set": sset,
+            "collector_number": cn,
+            "rarity": rarity,
+            "cmc": cmc,
+            "type_line": type_line,
+            "owned": qty,
+        }
+        for qty, name, sset, cn, rarity, cmc, type_line in rows
+    ]
+    total_copies = sum(r["owned"] for r in json_rows)
+
+    if getattr(args, "json", False):
+        _emit_json({
+            "query": args.query,
+            "min": args.min,
+            "unique": bool(args.unique),
+            "scryfall_total": len(results),
+            "arena_eligible": arena_eligible,
+            "rows": json_rows,
+            "unique_owned": len(json_rows),
+            "total_copies_owned": total_copies,
+        })
+        return 0
+
     if not rows:
         if arena_eligible == 0:
             print(
@@ -2628,13 +3037,11 @@ def cmd_owned(args: argparse.Namespace) -> int:
             )
         return 0
 
-    total_copies = 0
     for qty, name, sset, cn, rarity, cmc, type_line in rows:
         cmc_str = f"{cmc:g}" if cmc is not None else "-"
         print(
             f"  {qty}x {name} ({sset} {cn}) [{rarity}] mv={cmc_str} {type_line}"
         )
-        total_copies += qty
 
     print(
         f"{len(rows)} unique / {total_copies} total owned / "
@@ -2753,6 +3160,33 @@ def cmd_gaps(args: argparse.Namespace) -> int:
     for _name, _need, _have, short, rarity in rows:
         wc_cost[rarity] = wc_cost.get(rarity, 0) + short
 
+    if getattr(args, "json", False):
+        _emit_json({
+            "deck": args.deck,
+            "completeness": snap.get("completeness"),
+            "gating": [
+                {
+                    "name": name,
+                    "needed": need,
+                    "have": have,
+                    "short": short,
+                    "rarity": rarity,
+                }
+                for name, need, have, short, rarity in rows
+            ],
+            "wildcards": wc_cost,
+            "unresolved": [
+                {
+                    "name": e.name,
+                    "set": e.set_code,
+                    "collector_number": e.collector,
+                    "count": e.count,
+                }
+                for e in unresolved
+            ],
+        })
+        return 0
+
     print(f"deck: {args.deck}  (snapshot: {snap.get('completeness')})")
     if not rows:
         print("you own every card in this deck.")
@@ -2848,6 +3282,11 @@ def _run_suggest_subs(
       - validating `fmt` against ARENA_FORMATS
       - checking deck_path existence
       - loading idx and snap
+
+    `quiet=True` suppresses informational stderr lines (e.g. game-changer
+    drop warnings). JSON-emitting callers (coverage --batch --with-subs
+    --json, suggest-subs --json) set this so stderr noise doesn't visually
+    corrupt JSON the user is capturing.
     """
     from collections import Counter
 
@@ -3080,8 +3519,7 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     idx = _load_index()
 
     result = _run_suggest_subs(
-        deck_path, fmt, idx, snap, args.max_per_card,
-        quiet=getattr(args, "json", False),
+        deck_path, fmt, idx, snap, args.max_per_card, quiet=args.json,
     )
     json_missing = result["missing"]
     summary = result["summary"]
@@ -3350,8 +3788,7 @@ def _coverage_row(
     with_subs_pct: float | None = None
     if with_subs:
         with_subs_pct = _coverage_with_subs_pct(
-            deck_path, fmt, idx, snap, total_have, total_need,
-            quiet=quiet,
+            deck_path, fmt, idx, snap, total_have, total_need, quiet=quiet,
         )
 
     meta = _load_deck_meta(deck_path)
@@ -3428,6 +3865,23 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             deck_path, idx, owned,
         )
         pct = (100.0 * total_have / total_need) if total_need else 100.0
+        gating.sort(
+            key=lambda r: (-_RARITY_ORDER.get(r[2], 0), -r[1], r[0]),
+        )
+        if getattr(args, "json", False):
+            _emit_json({
+                "deck": args.deck,
+                "completeness": snap.get("completeness"),
+                "have": total_have,
+                "need": total_need,
+                "owned_pct": (total_have / total_need) if total_need else 1.0,
+                "gating": [
+                    {"name": name, "short": short, "rarity": rarity}
+                    for name, short, rarity in gating
+                ],
+                "unresolved": unresolved_count,
+            })
+            return 0
         print(f"deck: {args.deck}  (snapshot: {snap.get('completeness')})")
         print(
             f"coverage: {total_have}/{total_need} non-basic copies  "
@@ -3435,9 +3889,6 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         )
         if gating:
             print()
-            gating.sort(
-                key=lambda r: (-_RARITY_ORDER.get(r[2], 0), -r[1], r[0]),
-            )
             print("gating cards (need wildcards):")
             for name, short, rarity in gating:
                 print(f"  -{short} {rarity:<8} {name}")
@@ -3776,6 +4227,16 @@ def cmd_wantlist(args: argparse.Namespace) -> int:
 
     deck_paths = _resolve_wantlist_decks(args.decks, args.latest_only)
     if not deck_paths:
+        if getattr(args, "json", False):
+            _emit_json({
+                "decks_glob": args.decks,
+                "latest_only": bool(args.latest_only),
+                "deck_count": 0,
+                "rows": [],
+                "totals": {},
+                "unresolved_total": 0,
+            })
+            return 0
         print("no deck files matched")
         return 0
 
@@ -3839,6 +4300,30 @@ def cmd_wantlist(args: argparse.Namespace) -> int:
             r[1].lower(),
         )
     )
+
+    if getattr(args, "json", False):
+        _emit_json({
+            "decks_glob": args.decks,
+            "latest_only": bool(args.latest_only),
+            "deck_count": len(deck_paths),
+            "rows": [
+                {
+                    "rarity": rarity,
+                    "name": name,
+                    "deck_count": deck_count,
+                    "wildcards_needed": wc,
+                    "decks": decks,
+                }
+                for rarity, name, deck_count, wc, decks in rows
+            ],
+            "totals": {r: totals.get(r, 0) for r in rarity_buckets},
+            "unresolved_total": unresolved_total,
+            "unresolved_examples": [
+                {"deck": label, "name": name}
+                for label, name in unresolved_examples
+            ],
+        })
+        return 0
 
     if rows:
         for rarity, name, deck_count, wc, decks in rows:
@@ -3957,6 +4442,39 @@ def cmd_diff(args: argparse.Namespace) -> int:
             removed.append((name, ac))
         else:
             changed.append((name, ac, bc))
+
+    if getattr(args, "json", False):
+        plus = sum(n for _, n in added) + sum(
+            max(0, bc - ac) for _, ac, bc in changed
+        )
+        minus = sum(n for _, n in removed) + sum(
+            max(0, ac - bc) for _, ac, bc in changed
+        )
+        _emit_json({
+            "a": str(a_path),
+            "b": str(b_path),
+            "a_total": a_total,
+            "b_total": b_total,
+            "commander_a": a_cmd,
+            "commander_b": b_cmd,
+            "commander_changed": commander_changed,
+            "added": [
+                {"name": n, "count": c}
+                for n, c in sorted(added, key=lambda r: r[0].lower())
+            ],
+            "removed": [
+                {"name": n, "count": c}
+                for n, c in sorted(removed, key=lambda r: r[0].lower())
+            ],
+            "changed": [
+                {"name": n, "from": ac, "to": bc, "delta": bc - ac}
+                for n, ac, bc in sorted(changed, key=lambda r: r[0].lower())
+            ],
+            "net_added": plus,
+            "net_removed": minus,
+            "net_delta": b_total - a_total,
+        })
+        return 0
 
     print(f"diff: {a_path} -> {b_path}")
 
@@ -4130,6 +4648,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
 
       Exit 1 (runtime / source-side failure):
         * HTTP non-200;
+        * parser raises ValueError (drift);
         * parser returns zero decks from a 200 page (= schema drift);
         * resolution failures that would leave `--out` empty.
     """
@@ -4249,6 +4768,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     for d in decks:
         main_n = sum(e.count for e in d.entries if e.section == "deck")
         sb_n = sum(e.count for e in d.entries if e.section == "sideboard")
+        # Show a literal 0 (not "-") for the drop column so the eye
+        # picks out the rows where it isn't 0.
         print(
             f"{d.tier or '-':<4}  {main_n:>4}  {sb_n:>3}  {d.unresolved:>4}  "
             f"{d.slug[:32]:<32}  {d.archetype}"
@@ -4271,6 +4792,18 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
 # ---------- entrypoint ---------------------------------------------------
 
 
+def _add_json_flag(parser: argparse.ArgumentParser) -> None:
+    """Register the standard `--json` flag on a read-only subcommand.
+
+    Centralised so help text stays uniform across the CLI surface and a
+    future change to naming/behaviour is one edit.
+    """
+    parser.add_argument(
+        "--json", action="store_true",
+        help="emit a JSON payload instead of human-readable text",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="mtg", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -4281,38 +4814,45 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("card", help="show full info for a card by name")
     s.add_argument("name")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_card)
 
     s = sub.add_parser("printing", help="lookup by MTGA-style set+collector")
     s.add_argument("set")
     s.add_argument("num")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_printing)
 
     s = sub.add_parser("legal", help="check legality in an Arena format")
     s.add_argument("name")
     s.add_argument("format")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_legal)
 
     s = sub.add_parser("validate", help="validate an MTGA-export deck file")
     s.add_argument("deck")
     s.add_argument("-f", "--format", required=True)
     s.add_argument("-v", "--verbose", action="store_true", help="print per-card status")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("analyze", help="composition breakdown (curve, role mix, CA)")
     s.add_argument("deck")
     s.add_argument("--include-sideboard", action="store_true", default=False)
     s.add_argument("--sideboard-only", action="store_true", default=False)
+    _add_json_flag(s)
     s.set_defaults(func=cmd_analyze)
 
     s = sub.add_parser("related", help="cards sharing each keyword with the anchor card")
     s.add_argument("name")
     s.add_argument("-f", "--format", default=None, help="filter by Arena format")
     s.add_argument("--limit", type=int, default=15)
+    _add_json_flag(s)
     s.set_defaults(func=cmd_related)
 
     s = sub.add_parser("manabase", help="pip demand, color sources, etb-tapped lands")
     s.add_argument("deck")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_manabase)
 
     s = sub.add_parser("wildcards", help="rarity breakdown for MTGA wildcard estimates")
@@ -4322,6 +4862,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also list every card grouped by rarity",
     )
+    _add_json_flag(s)
     s.set_defaults(func=cmd_wildcards)
 
     s = sub.add_parser(
@@ -4330,6 +4871,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument("deck")
     s.add_argument("-f", "--format", default="brawl", help="format (default: brawl)")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_companion)
 
     s = sub.add_parser(
@@ -4348,17 +4890,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also run `gaps` if a collection snapshot exists",
     )
+    _add_json_flag(s)
     s.set_defaults(func=cmd_check)
 
     s = sub.add_parser("search", help="live Scryfall search (one HTTP request)")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=20)
+    _add_json_flag(s)
     s.set_defaults(func=cmd_search)
 
     s = sub.add_parser(
         "collection",
         help="show summary of current collection snapshot or manage it",
     )
+    _add_json_flag(s)
     s.set_defaults(func=cmd_collection)
     csub = s.add_subparsers(dest="collection_cmd")
 
@@ -4394,6 +4939,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("own", help="show owned count for a card")
     s.add_argument("name", help="card name (Arena-style)")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_own)
 
     s = sub.add_parser(
@@ -4409,6 +4955,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="collapse printings: one row per name, qty = max owned across printings",
     )
+    _add_json_flag(s)
     s.set_defaults(func=cmd_owned)
 
     s = sub.add_parser(
@@ -4439,6 +4986,7 @@ def main(argv: list[str] | None = None) -> int:
         help="cards you are short for a deck + wildcard cost",
     )
     s.add_argument("deck", help="path to MTGA-export deck file")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_gaps)
 
     s = sub.add_parser(
@@ -4463,7 +5011,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--json", action="store_true",
-        help="emit JSON instead of text table (batch mode only)",
+        help="emit a JSON payload instead of human-readable text "
+        "(single-deck or batch)",
     )
     s.add_argument(
         "--min", type=float, default=None, metavar="N",
@@ -4515,6 +5064,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="only consider the highest-numbered v<N>.txt per deck dir",
     )
+    _add_json_flag(s)
     s.set_defaults(func=cmd_wantlist)
 
     s = sub.add_parser(
@@ -4523,6 +5073,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument("a", help="path to the older / left-hand deck file")
     s.add_argument("b", help="path to the newer / right-hand deck file")
+    _add_json_flag(s)
     s.set_defaults(func=cmd_diff)
 
     s = sub.add_parser(
