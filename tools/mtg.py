@@ -2398,6 +2398,23 @@ def _aggregate_by_name(
 
 
 _RARITY_ORDER = {"common": 1, "uncommon": 2, "rare": 3, "mythic": 4}
+
+# Composite-rank tier weights for `coverage --batch --rank composite`.
+# Multiplied against (with_subs_pct or owned_pct) to favour high-tier
+# decks the user can mostly build. Anything outside S/A/B/C — including
+# tierless decks (no meta.json or null tier) — gets the default 0.40 so
+# they sort below ranked decks but aren't zeroed out.
+_TIER_WEIGHTS = {"S": 1.0, "A": 0.85, "B": 0.70, "C": 0.55}
+_TIER_WEIGHT_DEFAULT = 0.40
+
+
+def _tier_weight(tier: str | None) -> float:
+    """Composite-score weight for a deck's meta.json tier letter.
+
+    Falls back to `_TIER_WEIGHT_DEFAULT` for missing / unknown tiers.
+    """
+    return _TIER_WEIGHTS.get((tier or "").upper(), _TIER_WEIGHT_DEFAULT)
+
 # Keywords on cards everywhere — Flying / Trample / Vigilance / etc. They
 # match thousands of cards apiece and tell you nothing about a synergy
 # cluster. `cmd_shells` filters them out so the keyword bucketer surfaces
@@ -3801,30 +3818,47 @@ def _coverage_row(
     tier_raw = meta.get("tier")
     tier = tier_raw if isinstance(tier_raw, str) and tier_raw else None
 
+    tier_w = _tier_weight(tier)
+    # Composite score: tier_weight * (with_subs_pct if --with-subs and
+    # available else owned_pct). F2 clamps with_subs_pct to owned_pct
+    # when subs are unacceptable, so this picks up that clamp for free
+    # without any special-case here.
+    base_pct = (
+        with_subs_pct if (with_subs and with_subs_pct is not None)
+        else owned_pct
+    )
+    composite = round(tier_w * base_pct, 4)
+
     return {
         "deck": str(deck_path),
         "archetype": deck_path.stem,
         "tier": tier,
+        "tier_weight": tier_w,
         "owned_pct": round(owned_pct, 4),
         "missing_wc": wc,
         "with_subs_pct": (
             round(with_subs_pct, 4) if with_subs_pct is not None else None
         ),
+        "composite": composite,
         "top3_missing": top3,
     }
 
 
 def _print_coverage_batch_text(rows: list[dict], with_subs: bool) -> None:
     """Render the batch-mode text table. Columns:
-    archetype(30) tier(4) owned%(6) missing-WC(12) [with-subs(7)] top3."""
+    archetype(30) tier(4) score(7) owned%(6) missing-WC(12) [with-subs(7)] top3.
+
+    `score` (composite = tier_weight * base_pct) is always shown so the
+    default --rank composite ordering is legible without re-running.
+    """
     if with_subs:
         header = (
-            f"{'archetype':<30} {'tier':<4} {'owned':<6} "
+            f"{'archetype':<30} {'tier':<4} {'score':<7} {'owned':<6} "
             f"{'missing-WC':<12} {'subs':<6} top-3 missing"
         )
     else:
         header = (
-            f"{'archetype':<30} {'tier':<4} {'owned':<6} "
+            f"{'archetype':<30} {'tier':<4} {'score':<7} {'owned':<6} "
             f"{'missing-WC':<12} top-3 missing"
         )
     print(header)
@@ -3836,17 +3870,18 @@ def _print_coverage_batch_text(rows: list[dict], with_subs: bool) -> None:
         )
         owned_str = f"{r['owned_pct']:.2f}"
         tier_str = r["tier"] or "-"
+        score_str = f"{r['composite']:.4f}"
         top3_str = ", ".join(r["top3_missing"]) if r["top3_missing"] else "-"
         if with_subs:
             sub_pct = r["with_subs_pct"]
             sub_str = f"{sub_pct:.2f}" if sub_pct is not None else "-"
             print(
-                f"{r['archetype'][:30]:<30} {tier_str:<4} "
+                f"{r['archetype'][:30]:<30} {tier_str:<4} {score_str:<7} "
                 f"{owned_str:<6} {wc_str:<12} {sub_str:<6} {top3_str}"
             )
         else:
             print(
-                f"{r['archetype'][:30]:<30} {tier_str:<4} "
+                f"{r['archetype'][:30]:<30} {tier_str:<4} {score_str:<7} "
                 f"{owned_str:<6} {wc_str:<12} {top3_str}"
             )
 
@@ -3942,12 +3977,26 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    if args.with_subs:
+    # Rank dispatch. `composite` (default) favours tier × ownership;
+    # `quality` is tier-first with ownership as a tiebreaker; `ownership`
+    # preserves the legacy sort. The --min filter still applies to the
+    # ownership-style metric (with_subs_pct when --with-subs, else
+    # owned_pct) regardless of rank — "show me decks I can actually
+    # build" is independent of how we order them.
+    rank = getattr(args, "rank", "composite")
+    if rank == "ownership":
+        if args.with_subs:
+            rows.sort(
+                key=lambda r: (-(r["with_subs_pct"] or 0.0), r["archetype"]),
+            )
+        else:
+            rows.sort(key=lambda r: (-r["owned_pct"], r["archetype"]))
+    elif rank == "quality":
         rows.sort(
-            key=lambda r: (-(r["with_subs_pct"] or 0.0), r["archetype"]),
+            key=lambda r: (-r["tier_weight"], -r["owned_pct"], r["archetype"]),
         )
-    else:
-        rows.sort(key=lambda r: (-r["owned_pct"], r["archetype"]))
+    else:  # composite
+        rows.sort(key=lambda r: (-r["composite"], r["archetype"]))
 
     if args.min is not None:
         key = "with_subs_pct" if args.with_subs else "owned_pct"
@@ -5545,6 +5594,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--min", type=float, default=None, metavar="N",
         help="filter rows below this fraction in [0,1] (ranking metric)",
+    )
+    s.add_argument(
+        "--rank", choices=["ownership", "quality", "composite"],
+        default="composite",
+        help="sort key: ownership (legacy), quality (tier-first), "
+        "composite (default: tier × ownership)",
     )
     s.set_defaults(func=cmd_coverage)
 
