@@ -29,6 +29,7 @@ Subcommands:
     diff <a.txt> <b.txt>          per-card delta between two deck files
     suggest-subs <deck.txt> -f F  propose owned replacements for missing cards
     fetch-meta <format>           scrape a meta source -> decks/<fmt>/ + meta.json
+    freq <format>                 card-frequency index over decks/<fmt>/*.txt
     shells --format F             cluster owned cards by keyword/type/theme
 
 Run `mtg <subcommand> --help` for details.
@@ -37,6 +38,7 @@ Run `mtg <subcommand> --help` for details.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import glob as glob_mod
 import hashlib
 import io
@@ -4075,6 +4077,328 @@ def _shell_cluster_rows(
     return rows
 
 
+# ---------- meta-corpus card frequency index ------------------------------
+
+
+def _corpus_deck_files(fmt: str) -> list[Path]:
+    """Sorted MTGA-export deck files in `decks/<fmt>/`.
+
+    Excludes JSON sidecars (`meta.json`, `_freq.json`, `_*.json`) so the
+    corpus enumerator never tries to `parse_deck` a JSON blob. Returns []
+    if the directory doesn't exist.
+    """
+    corpus_dir = ROOT / "decks" / fmt
+    if not corpus_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for p in sorted(corpus_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".txt":
+            continue
+        if p.name.startswith("_"):
+            continue
+        out.append(p)
+    return out
+
+
+def _archetype_for_deck(deck_path: Path) -> str:
+    """Pretty archetype name from sidecar, falling back to filename stem."""
+    meta = _load_deck_meta(deck_path)
+    arch = meta.get("archetype")
+    if isinstance(arch, str) and arch.strip():
+        return arch
+    return deck_path.stem
+
+
+def _compute_freq_index(fmt: str) -> dict:
+    """Walk `decks/<fmt>/*.txt` and tally per-card stats.
+
+    Schema is consumer-stable (F2/F3/F4 read this directly):
+      - `deck_count` / `deck_pct` — main+sideboard combined membership
+      - `total_main` / `total_sideboard` — copy split (commander &
+        companion fold into main: 1 commander + 1 companion = 1 main copy
+        each, matching how the deck legally plays)
+      - `archetypes` — sorted unique archetype slugs (filename stems by
+        default; sidecar `archetype` overrides for human-readable runs)
+      - `basic` flag — every deck has Forests; consumers ranking by
+        `deck_pct` should drop them rather than have us drop them here
+        (single source of truth for "is X a basic" lives in `_is_basic`)
+    """
+    files = _corpus_deck_files(fmt)
+    if not files:
+        return {
+            "format": fmt,
+            "computed_at": _dt.date.today().isoformat(),
+            "corpus_size": 0,
+            "total_card_copies": 0,
+            "unresolved_cards": 0,
+            "cards": {},
+        }
+
+    # Per-card running stats keyed by canonical Scryfall name.
+    stats: dict[str, dict[str, Any]] = {}
+    archetypes_per_card: dict[str, set[str]] = {}
+    total_copies = 0
+    unresolved = 0
+
+    for path in files:
+        slug = path.stem
+        archetype = _archetype_for_deck(path)
+        # Per-deck membership: a card present in main + sideboard counts
+        # as one deck for `deck_count` (spec: "main+sideboard combined").
+        seen_in_deck: set[str] = set()
+        for entry in parse_deck(path):
+            if entry.section == "maybeboard":
+                continue
+            if entry.section not in {"deck", "commander", "companion", "sideboard"}:
+                continue
+            card = _resolve_card(entry.name)
+            if card is None:
+                unresolved += entry.count
+                continue
+            name = card.get("name") or entry.name
+            row = stats.get(name)
+            if row is None:
+                row = {
+                    "deck_count": 0,
+                    "deck_pct": 0.0,
+                    "total_copies": 0,
+                    "total_main": 0,
+                    "total_sideboard": 0,
+                    "avg_copies_per_appearing_deck": 0.0,
+                    "basic": _is_basic(card),
+                    "archetypes": [],
+                }
+                stats[name] = row
+                archetypes_per_card[name] = set()
+            if entry.section == "sideboard":
+                row["total_sideboard"] += entry.count
+            else:
+                # `deck`, `commander`, `companion` all play from main.
+                row["total_main"] += entry.count
+            row["total_copies"] += entry.count
+            total_copies += entry.count
+            if name not in seen_in_deck:
+                seen_in_deck.add(name)
+                row["deck_count"] += 1
+                archetypes_per_card[name].add(archetype or slug)
+
+    corpus_size = len(files)
+    for name, row in stats.items():
+        row["deck_pct"] = round(row["deck_count"] / corpus_size, 4)
+        row["avg_copies_per_appearing_deck"] = round(
+            row["total_copies"] / row["deck_count"], 2
+        ) if row["deck_count"] else 0.0
+        row["archetypes"] = sorted(archetypes_per_card[name])
+
+    return {
+        "format": fmt,
+        "computed_at": _dt.date.today().isoformat(),
+        "corpus_size": corpus_size,
+        "total_card_copies": total_copies,
+        "unresolved_cards": unresolved,
+        "cards": stats,
+    }
+
+
+def _freq_index_path(fmt: str) -> Path:
+    return ROOT / "decks" / fmt / "_freq.json"
+
+
+def _freq_index_is_stale(fmt: str) -> bool:
+    """True if `_freq.json` is missing or older than any deck file."""
+    idx_path = _freq_index_path(fmt)
+    if not idx_path.exists():
+        return True
+    idx_mtime = idx_path.stat().st_mtime
+    for p in _corpus_deck_files(fmt):
+        if p.stat().st_mtime > idx_mtime:
+            return True
+    # Sidecar bumps too: archetype names sourced from there.
+    sidecar = ROOT / "decks" / fmt / "meta.json"
+    if sidecar.exists() and sidecar.stat().st_mtime > idx_mtime:
+        return True
+    return False
+
+
+def _write_freq_index(fmt: str, index: dict) -> Path:
+    """Atomic-ish write of the freq index. Returns the path."""
+    out_path = _freq_index_path(fmt)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, out_path)
+    return out_path
+
+
+def _load_freq_index(
+    fmt: str, *, rebuild_if_stale: bool = True
+) -> dict | None:
+    """Read (and optionally rebuild) the freq index for `fmt`.
+
+    Returns None when no corpus exists for the format (caller decides
+    whether that's an error). Otherwise returns the schema dict; when
+    `rebuild_if_stale` is True and the on-disk index is missing or older
+    than the corpus, regenerates and writes it (with a stderr notice).
+    """
+    files = _corpus_deck_files(fmt)
+    if not files:
+        return None
+    idx_path = _freq_index_path(fmt)
+    if rebuild_if_stale and _freq_index_is_stale(fmt):
+        print(f"[info] rebuilding freq index for {fmt}", file=sys.stderr)
+        index = _compute_freq_index(fmt)
+        _write_freq_index(fmt, index)
+        return index
+    if not idx_path.exists():
+        return None
+    try:
+        return json.loads(idx_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"[warn] freq index unreadable ({e}); recomputing in-memory",
+            file=sys.stderr,
+        )
+        return _compute_freq_index(fmt)
+
+
+def _freq_rows_sorted(index: dict) -> list[tuple[str, dict]]:
+    """Sort cards by deck_pct desc, deck_count desc, then name."""
+    cards = index.get("cards") or {}
+    return sorted(
+        cards.items(),
+        key=lambda kv: (
+            -float(kv[1].get("deck_pct") or 0.0),
+            -int(kv[1].get("deck_count") or 0),
+            kv[0],
+        ),
+    )
+
+
+def cmd_freq(args: argparse.Namespace) -> int:
+    """Card-frequency index over `decks/<fmt>/*.txt`.
+
+    Three viewing modes:
+      * default — top 30 cards by `deck_pct` as a text table
+      * --card NAME — single-row lookup (resolved through Scryfall so
+        casing / A-prefix / multi-face front-only inputs all hit)
+      * --json [--all] — machine-readable; top 30 unless `--all`
+      * --rebuild — force recompute, write `_freq.json`, print summary
+      * --no-rebuild — read-only; never touch disk on stale index
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    files = _corpus_deck_files(fmt)
+    if not files:
+        print(f"no corpus for {fmt}", file=sys.stderr)
+        return 1
+
+    if args.rebuild:
+        index = _compute_freq_index(fmt)
+        out_path = _write_freq_index(fmt, index)
+        size_b = out_path.stat().st_size
+        print(
+            f"wrote {out_path} "
+            f"(corpus={index['corpus_size']}, "
+            f"unique_cards={len(index['cards'])}, "
+            f"copies={index['total_card_copies']}, "
+            f"unresolved={index['unresolved_cards']}, "
+            f"size={size_b}B)"
+        )
+        return 0
+
+    index = _load_freq_index(fmt, rebuild_if_stale=not args.no_rebuild)
+    if index is None:
+        print(
+            f"no _freq.json for {fmt} (run with --rebuild)",
+            file=sys.stderr,
+        )
+        return 1
+
+    cards = index.get("cards") or {}
+
+    if args.card:
+        # Resolve through Scryfall so user input casing / A-prefix /
+        # front-face-only forms all map to the canonical key.
+        card = _resolve_card(args.card)
+        canonical = (card.get("name") if card else args.card) or args.card
+        row = cards.get(canonical)
+        if row is None:
+            print(
+                f"{canonical}: not in {fmt} freq index",
+                file=sys.stderr,
+            )
+            return 1
+        if args.json:
+            _emit_json({"name": canonical, **row})
+            return 0
+        print(f"{canonical}")
+        print(
+            f"  deck_count : {row['deck_count']} / "
+            f"{index['corpus_size']}  ({row['deck_pct'] * 100:.1f}%)"
+        )
+        print(
+            f"  copies     : {row['total_copies']} "
+            f"(main={row['total_main']}, sb={row['total_sideboard']}, "
+            f"avg/deck={row['avg_copies_per_appearing_deck']})"
+        )
+        if row.get("basic"):
+            print("  basic      : yes")
+        if row.get("archetypes"):
+            print("  archetypes :")
+            for a in row["archetypes"]:
+                print(f"    - {a}")
+        return 0
+
+    rows = _freq_rows_sorted(index)
+    limit = None if args.all else 30
+    shown = rows if limit is None else rows[:limit]
+
+    if args.json:
+        _emit_json({
+            "format": index["format"],
+            "computed_at": index["computed_at"],
+            "corpus_size": index["corpus_size"],
+            "total_card_copies": index["total_card_copies"],
+            "unresolved_cards": index.get("unresolved_cards", 0),
+            "shown": len(shown),
+            "total_unique_cards": len(rows),
+            "cards": [{"name": n, **r} for n, r in shown],
+        })
+        return 0
+
+    print(
+        f"freq (fmt={fmt}, corpus={index['corpus_size']}, "
+        f"unique={len(rows)}, copies={index['total_card_copies']})"
+    )
+    print()
+    print(
+        f"  {'name':<40} {'pct':>6} {'decks':>5} "
+        f"{'copies':>6} {'main':>5} {'sb':>4}  basic"
+    )
+    print(f"  {'-' * 40} {'-' * 6} {'-' * 5} {'-' * 6} {'-' * 5} {'-' * 4}  -----")
+    for name, row in shown:
+        basic_marker = "yes" if row.get("basic") else ""
+        print(
+            f"  {name[:40]:<40} "
+            f"{row['deck_pct'] * 100:>5.1f}% "
+            f"{row['deck_count']:>5} "
+            f"{row['total_copies']:>6} "
+            f"{row['total_main']:>5} "
+            f"{row['total_sideboard']:>4}  {basic_marker}"
+        )
+    if limit is not None and len(rows) > limit:
+        print(f"\n  ... {len(rows) - limit} more (use --all)")
+    return 0
+
+
 def cmd_shells(args: argparse.Namespace) -> int:
     """Group owned, format-legal cards into synergy clusters.
 
@@ -4546,9 +4870,20 @@ _META_CACHE_TTL_SECS = 24 * 3600
 
 # Sources where `docs/sources.md` records "occasional 403; retry once".
 # `_fetch_meta_page` honours this for the index fetch; per-archetype
-# sub-resource fetches inside `parse_mtggoldfish` use the same retry
-# helper in `_common.py`.
-_FETCH_META_RETRY_403 = frozenset({"mtggoldfish"})
+# sub-resource fetches inside `parse_mtggoldfish` / `parse_mtgdecks`
+# use the same retry helper in `_common.py`. mtgdecks sits behind
+# Cloudflare and historically 403s scripted requests (see
+# `docs/sources.md`); the probe on 2026-05-01 returned 200 with a
+# vanilla UA, but the retry-once policy is cheap insurance.
+_FETCH_META_RETRY_403 = frozenset({"mtggoldfish", "mtgdecks"})
+
+# Sources that need a `Referer` header on the index fetch. mtgdecks
+# documents Referer as required for archetype/deck sub-resources; the
+# index fetch sends the source root so the whole flow is consistently
+# attributed and stays inside the documented contract.
+_FETCH_META_INDEX_REFERER = {
+    "mtgdecks": "https://mtgdecks.net/",
+}
 
 
 def _meta_cache_path(source: str, url: str) -> Path:
@@ -4581,6 +4916,7 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
     text = _common.http_get_text(
         url,
         retry_403_once=source in _FETCH_META_RETRY_403,
+        referer=_FETCH_META_INDEX_REFERER.get(source),
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5019,6 +5355,33 @@ def main(argv: list[str] | None = None) -> int:
         help="filter rows below this fraction in [0,1] (ranking metric)",
     )
     s.set_defaults(func=cmd_coverage)
+
+    s = sub.add_parser(
+        "freq",
+        help="card-frequency index over decks/<fmt>/*.txt (popularity prior)",
+    )
+    s.add_argument(
+        "format",
+        help="Arena format (must have a corpus under decks/<format>/)",
+    )
+    s.add_argument(
+        "--rebuild", action="store_true",
+        help="recompute the index and write decks/<fmt>/_freq.json",
+    )
+    s.add_argument(
+        "--no-rebuild", action="store_true",
+        help="read-only: never auto-rebuild a stale index",
+    )
+    s.add_argument(
+        "--card", default=None, metavar="NAME",
+        help="show this card's row (deck_count, deck_pct, archetypes)",
+    )
+    s.add_argument(
+        "--all", action="store_true",
+        help="show every card (default: top 30 by deck_pct)",
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_freq)
 
     s = sub.add_parser(
         "shells",
