@@ -3251,17 +3251,44 @@ _PRIMARY_CARD_TYPES = frozenset({
 _SUPERTYPES = ("legendary", "basic", "snow", "world")
 
 
+def _freq_score_adjustment(deck_pct: float | None) -> float:
+    """Frequency-aware score adjustment for sub candidates.
+
+    Bias substitutions toward cards that actually appear in real decks of
+    the format, not toward random Scryfall hits:
+      * deck_pct >= 0.10  -> +1.0 (corpus-popular staple)
+      * deck_pct <  0.05  -> -2.0 (rare/random card masquerading as a sub)
+      * 0.05 <= deck_pct < 0.10 -> 0.0 (no adjustment)
+      * None (card absent from freq index) -> 0.0 (don't penalize cards
+        from sets newer than the corpus)
+    """
+    if deck_pct is None:
+        return 0.0
+    if deck_pct >= 0.10:
+        return 1.0
+    if deck_pct < 0.05:
+        return -2.0
+    return 0.0
+
+
 def _suggest_subs_score(
     c: dict,
     cand_roles: set[str],
     missing_roles: set[str],
     missing_cmc: float,
     is_rare_role,
+    *,
+    cand_deck_pct: float | None = None,
 ) -> float:
     """Score one candidate card against one missing slot.
 
     Components are summed, then multiplied by 1.5 if the missing slot
-    fills a role that's rare in the deck's pool (T=3, see caller).
+    fills a role that's rare in the deck's pool (T=3, see caller). The
+    frequency adjustment (see `_freq_score_adjustment`) is added AFTER
+    the rare-role multiplier so that a "popular" candidate is rewarded
+    by the same +1.0 regardless of role-rarity, and a "random Scryfall
+    hit" is penalized by the same -2.0 — the freq term is about whether
+    the card belongs in real decks, not about how it fits this slot.
     """
     inter = len(cand_roles & missing_roles)
     role_term = 3.0 * inter / max(1, len(cand_roles))
@@ -3275,7 +3302,63 @@ def _suggest_subs_score(
     # candidate hurts disproportionately, so we boost rare-role matches.
     if any(is_rare_role(r) for r in (cand_roles & missing_roles)):
         score *= 1.5
+    score += _freq_score_adjustment(cand_deck_pct)
     return score
+
+
+def _anchor_names(
+    entries: list[DeckEntry],
+    fmt: str,
+    freq_index: dict | None,
+    *,
+    deck_pct_threshold: float = 0.50,
+) -> set[str]:
+    """Canonical names of "anchor" cards in the deck.
+
+    A card is an anchor (must NEVER be substituted) iff EITHER:
+      * It is the commander (Brawl identity envelope — replacing it
+        invalidates every other card; cmd_suggest_subs already preserves
+        the commander row, this just propagates the same status into
+        coverage / JSON / text).
+      * Its `deck_pct` in the freq index for this format is >=
+        `deck_pct_threshold` (default 0.50, i.e. shows up in 50%+ of
+        corpus decks for the format) — these are the format's real
+        staples; missing them means "you can't build this format right
+        now," not "swap them out."
+
+    Anchors are sourced from main + commander + companion only;
+    sideboard cards never count as anchors (they're already optional in
+    a way main/commander cards aren't).
+    """
+    anchors: set[str] = set()
+    is_brawl = fmt in BRAWL_FORMATS
+    if is_brawl:
+        for e in entries:
+            if e.section != "commander":
+                continue
+            c = _resolve_card(e.name)
+            if c is not None:
+                anchors.add((c.get("name") or e.name))
+    if freq_index is None:
+        return anchors
+    cards = freq_index.get("cards") or {}
+    for e in entries:
+        if e.section not in {"deck", "commander", "companion"}:
+            continue
+        c = _resolve_card(e.name)
+        if c is None:
+            continue
+        # Basic lands are never anchors regardless of deck_pct (every
+        # deck plays Forests).
+        if _is_basic(c):
+            continue
+        name = c.get("name") or e.name
+        row = cards.get(name)
+        if row is None:
+            continue
+        if float(row.get("deck_pct") or 0.0) >= deck_pct_threshold:
+            anchors.add(name)
+    return anchors
 
 
 def _run_suggest_subs(
@@ -3286,6 +3369,9 @@ def _run_suggest_subs(
     max_per_card: int = 5,
     *,
     quiet: bool = False,
+    anchor_check: bool = True,
+    max_sub_pct: float = 0.30,
+    freq_index: dict | None = None,
 ) -> dict:
     """Pure-compute core of `suggest-subs`.
 
@@ -3300,22 +3386,51 @@ def _run_suggest_subs(
     `quiet=True` so machine-readable output isn't polluted by per-deck
     candidate noise; the human text path leaves the warning visible.
 
+    Sub-fidelity floor (F-batch):
+      * `anchor_check=True` (default) protects format staples and the
+        commander from substitution — anchor slots emit a
+        `replacement: None`, `reason: "anchor"` row instead of a
+        candidate list.
+      * Candidate scoring is biased toward corpus-popular cards via
+        `_freq_score_adjustment` (uses `freq_index` if supplied; loaded
+        on demand otherwise).
+      * `subs_pct = cards_substituted / non_basic_main_size`. When that
+        exceeds `max_sub_pct`, the rewrite is "unacceptable" — the
+        result dict carries `subs_acceptable: False`, the `--apply`
+        path refuses the write, and `_coverage_with_subs_pct` clamps
+        with-subs coverage to native ownership.
+
     Caller is responsible for:
       - calling `_warn_if_stale()` / `_warn_if_collection_stale()`
       - validating `fmt` against ARENA_FORMATS
       - checking deck_path existence
       - loading idx and snap
-
-    `quiet=True` suppresses informational stderr lines (e.g. game-changer
-    drop warnings). JSON-emitting callers (coverage --batch --with-subs
-    --json, suggest-subs --json) set this so stderr noise doesn't visually
-    corrupt JSON the user is capturing.
     """
     from collections import Counter
 
     entries = parse_deck(deck_path)
     owned_by_name = _aggregate_by_name(idx, _cards_owned(snap))
     missing = _compute_missing(idx, deck_path, owned_by_name)
+
+    # Freq index for the deck's format — used both for anchor detection
+    # and for the per-candidate frequency-aware score adjustment. Cached
+    # once per run so we don't re-read the JSON per missing slot.
+    if freq_index is None:
+        try:
+            freq_index = _load_freq_index(fmt, rebuild_if_stale=False)
+        except Exception:
+            freq_index = None
+    freq_cards = (freq_index or {}).get("cards") or {}
+
+    def _deck_pct_for(name: str) -> float | None:
+        row = freq_cards.get(name)
+        if row is None:
+            return None
+        return float(row.get("deck_pct") or 0.0)
+
+    anchors = (
+        _anchor_names(entries, fmt, freq_index) if anchor_check else set()
+    )
 
     # Build the deck's role pool for the rare-role frequency check —
     # every resolved commander/deck/sideboard card contributes its tag
@@ -3381,6 +3496,7 @@ def _run_suggest_subs(
 
     fillable = 0
     unfilled = 0
+    anchor_unfilled = 0
     json_missing: list[dict] = []
 
     for slot in missing:
@@ -3390,7 +3506,31 @@ def _run_suggest_subs(
         miss_cmc = slot["cmc"]
         miss_game_changer = bool(miss_card.get("game_changer"))
 
-        candidates: list[tuple[float, dict, dict, bool, bool]] = []
+        # Anchor preservation: a card is an anchor if it's the commander
+        # OR appears in >= 50% of corpus decks for this format. Anchors
+        # are NEVER substituted — when missing, the deck is fundamentally
+        # not buildable and the slot is emitted with `replacement: None`,
+        # `reason: "anchor"`. cmd_suggest_subs renders this as
+        # `ANCHOR (missing)` and refuses to fill it during --apply.
+        if miss_name in anchors:
+            unfilled += 1
+            anchor_unfilled += 1
+            json_missing.append({
+                "card": miss_name,
+                "needed": slot["needed"],
+                "owned": slot["owned"],
+                "deficit": slot["deficit"],
+                "roles": sorted(miss_roles),
+                "cmc": miss_cmc,
+                "type_line": slot["type_line"],
+                "anchor": True,
+                "replacement": None,
+                "reason": "anchor",
+                "candidates": [],
+            })
+            continue
+
+        candidates: list[tuple[float, dict, dict, bool, bool, float | None]] = []
         for cand_name_lc, info in owned_by_name.items():
             cand_display = info.get("name") or ""
             if cand_display == miss_name:
@@ -3435,13 +3575,17 @@ def _run_suggest_subs(
                         file=sys.stderr,
                     )
                 continue
+            cand_deck_pct = _deck_pct_for(cand_display)
             score = _suggest_subs_score(
-                c, cand_roles, miss_roles, miss_cmc, _is_rare_role
+                c, cand_roles, miss_roles, miss_cmc, _is_rare_role,
+                cand_deck_pct=cand_deck_pct,
             )
             rare_boost = any(
                 _is_rare_role(r) for r in (cand_roles & miss_roles)
             )
-            candidates.append((score, c, info, rare_boost, cand_game_changer))
+            candidates.append((
+                score, c, info, rare_boost, cand_game_changer, cand_deck_pct,
+            ))
 
         candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
         candidates = candidates[:max_per_card]
@@ -3459,6 +3603,7 @@ def _run_suggest_subs(
             "roles": sorted(miss_roles),
             "cmc": miss_cmc,
             "type_line": slot["type_line"],
+            "anchor": False,
             "candidates": [
                 {
                     "name": c.get("name"),
@@ -3469,19 +3614,61 @@ def _run_suggest_subs(
                     "type_line": c.get("type_line") or "",
                     "rare_role_boost": rare_boost,
                     "game_changer": gc,
+                    "deck_pct": (
+                        round(cand_deck_pct, 4)
+                        if cand_deck_pct is not None else None
+                    ),
                 }
-                for score, c, info, rare_boost, gc in candidates
+                for score, c, info, rare_boost, gc, cand_deck_pct in candidates
             ],
         })
+
+    # Sub-pct cap denominator: every non-basic copy in main + commander
+    # + companion. Sideboard is excluded per spec; basic lands too
+    # (every deck plays Forests, swapping them isn't a "fidelity"
+    # event). Numerator: every copy we'd actually substitute (anchors
+    # NEVER count — if we're refusing to swap them, they're not part
+    # of the rewrite churn). A slot with zero candidates also doesn't
+    # count toward subs_pct (we couldn't substitute it even if we
+    # wanted to); the result is still surfaced via `unfilled`.
+    non_basic_main = 0
+    for e in entries:
+        if e.section not in {"deck", "commander", "companion"}:
+            continue
+        c = _resolve_card(e.name)
+        if c is not None and _is_basic(c):
+            continue
+        non_basic_main += e.count
+
+    cards_substituted = 0
+    for slot in json_missing:
+        if slot.get("anchor"):
+            continue
+        if not slot.get("candidates"):
+            continue
+        cards_substituted += slot["deficit"]
+
+    if non_basic_main > 0:
+        subs_pct = cards_substituted / non_basic_main
+    else:
+        subs_pct = 0.0
+    subs_acceptable = subs_pct <= max_sub_pct
 
     return {
         "deck": str(deck_path),
         "format": fmt,
+        "anchors": sorted(anchors),
         "missing": json_missing,
+        "subs_pct": round(subs_pct, 4),
+        "subs_acceptable": subs_acceptable,
+        "max_sub_pct": max_sub_pct,
+        "non_basic_main": non_basic_main,
+        "cards_substituted": cards_substituted,
         "summary": {
             "missing_cards": len(missing),
             "fillable": fillable,
             "unfilled": unfilled,
+            "anchor_unfilled": anchor_unfilled,
         },
     }
 
@@ -3497,20 +3684,32 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     {
       "deck": "decks/foo/v1.txt",
       "format": "brawl",
+      "anchors": ["Card Name", ...],
+      "subs_acceptable": true,         # false when subs_pct > --max-sub-pct
+      "subs_pct": 0.18,                # cards_substituted / non_basic_main
+      "max_sub_pct": 0.30,
+      "non_basic_main": 60,
+      "cards_substituted": 11,
       "missing": [
         {
           "card": "Sheoldred, the Apocalypse",
           "needed": 1, "owned": 0, "deficit": 1,
           "roles": ["threat"], "cmc": 4,
           "type_line": "Legendary Creature — Phyrexian Praetor",
+          "anchor": false,
+          # When anchor: candidates=[], replacement=None, reason="anchor"
           "candidates": [
             {"name": "...", "score": 7.5, "owned": 2, "roles": [...],
              "cmc": 4, "type_line": "...",
-             "rare_role_boost": false, "game_changer": false}
+             "rare_role_boost": false, "game_changer": false,
+             "deck_pct": 0.12}
           ]
         }
       ],
-      "summary": {"missing_cards": 7, "fillable": 5, "unfilled": 2}
+      "summary": {
+        "missing_cards": 7, "fillable": 5, "unfilled": 2,
+        "anchor_unfilled": 1,
+      }
     }
     """
     _warn_if_stale()
@@ -3522,6 +3721,11 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         return 2
     if args.max_per_card < 1:
         print("--max-per-card must be >= 1", file=sys.stderr)
+        return 2
+    if not (0.0 <= args.max_sub_pct <= 1.0):
+        print(
+            "--max-sub-pct must be between 0.0 and 1.0", file=sys.stderr,
+        )
         return 2
     deck_path = Path(args.deck)
     if not deck_path.exists():
@@ -3542,13 +3746,18 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     idx = _load_index()
 
     result = _run_suggest_subs(
-        deck_path, fmt, idx, snap, args.max_per_card, quiet=args.json,
+        deck_path, fmt, idx, snap, args.max_per_card,
+        quiet=args.json,
+        anchor_check=not args.no_anchor_check,
+        max_sub_pct=args.max_sub_pct,
     )
     json_missing = result["missing"]
     summary = result["summary"]
     missing_count = summary["missing_cards"]
     fillable = summary["fillable"]
     unfilled = summary["unfilled"]
+    subs_acceptable = result["subs_acceptable"]
+    subs_pct = result["subs_pct"]
     entries = parse_deck(deck_path)
     is_brawl = fmt in BRAWL_FORMATS
     max_copies = 1 if is_brawl else 4
@@ -3564,7 +3773,20 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         miss_cmc = slot["cmc"]
         miss_roles = slot["roles"]
         slot_candidates = slot["candidates"]
+        is_anchor = bool(slot.get("anchor"))
         text_block: list[str] = []
+        if is_anchor:
+            text_block.append(
+                f"ANCHOR (missing): {slot['deficit']}x {miss_name} "
+                f"(cmc={int(miss_cmc) if float(miss_cmc).is_integer() else miss_cmc}, "
+                f"roles=[{','.join(miss_roles)}])"
+            )
+            text_block.append(
+                "  this card is a format staple or the commander; "
+                "no substitution offered — craft it or pick another deck."
+            )
+            text_chunks.append("\n".join(text_block))
+            continue
         text_block.append(
             f"MISSING: {slot['deficit']}x {miss_name} "
             f"(cmc={int(miss_cmc) if float(miss_cmc).is_integer() else miss_cmc}, "
@@ -3586,6 +3808,18 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         text_chunks.append("\n".join(text_block))
 
     # --apply: rewrite the deck with the top-scored candidate per slot.
+    # Sub fidelity floor: if the proposed rewrite swaps more than
+    # --max-sub-pct of the deck (default 30%), refuse the write — the
+    # output would be a "different deck wearing the same name," not a
+    # substitution. Anchor slots are unfilled by construction (they're
+    # the format staples / commander we promised never to swap).
+    if args.apply is not None and not subs_acceptable:
+        print(
+            f"[error] sub fraction {subs_pct * 100:.1f}% exceeds "
+            f"{args.max_sub_pct * 100:.0f}% cap; rewrite refused",
+            file=sys.stderr,
+        )
+        return 2
     if args.apply is not None:
         # Each candidate name can appear at most max_copies times across
         # the substituted deck (1 in Brawl, 4 elsewhere). The same
@@ -3681,10 +3915,26 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
             for chunk in text_chunks:
                 print(chunk)
                 print()
+            anchor_unfilled = summary.get("anchor_unfilled", 0)
+            extras = []
+            if anchor_unfilled:
+                extras.append(f"anchor_unfilled={anchor_unfilled}")
+            extras.append(f"subs_pct={subs_pct * 100:.1f}%")
+            extras.append(
+                "acceptable" if subs_acceptable else "UNACCEPTABLE"
+            )
             print(
                 f"summary: missing={missing_count}, "
-                f"fillable={fillable}, unfilled={unfilled}"
+                f"fillable={fillable}, unfilled={unfilled}, "
+                + ", ".join(extras)
             )
+            if not subs_acceptable:
+                print(
+                    f"[warn] sub fraction {subs_pct * 100:.1f}% exceeds "
+                    f"{args.max_sub_pct * 100:.0f}% cap — this rewrite "
+                    f"would be a different deck. --apply will refuse.",
+                    file=sys.stderr,
+                )
     return 0
 
 
@@ -3724,8 +3974,16 @@ def _coverage_with_subs_pct(
 
     `with_subs_pct = (owned_count + filled_deficit) / total_count`, where
     `filled_deficit` only counts slots that have at least one candidate
-    (top-scored candidate fills the slot). Slots with zero candidates
-    keep their deficit unfilled.
+    AND aren't anchors (anchors are the deck's commander or format
+    staples; we promised never to substitute them, so a missing anchor
+    is unfilled by construction).
+
+    Sub-fidelity floor: when the rewrite is unacceptable
+    (`subs_pct > max_sub_pct`, i.e. > 30% of the deck would be swapped)
+    we clamp `with_subs_pct` to the native `owned_pct`. Otherwise
+    coverage --with-subs would still report 100% for decks that are
+    only "buildable" by gutting them — which is exactly the bug the
+    fidelity floor exists to fix.
 
     `quiet` is forwarded to `_run_suggest_subs` so the per-candidate
     `[warn] dropping game-changer ...` stderr noise stays out of
@@ -3733,9 +3991,14 @@ def _coverage_with_subs_pct(
     """
     if total_need == 0:
         return 1.0
+    owned_pct = total_have / total_need
     result = _run_suggest_subs(deck_path, fmt, idx, snap, quiet=quiet)
+    if not result.get("subs_acceptable", True):
+        return owned_pct
     filled = 0
     for slot in result["missing"]:
+        if slot.get("anchor"):
+            continue
         if slot["candidates"]:
             filled += slot["deficit"]
     return (total_have + filled) / total_need
@@ -5551,6 +5814,20 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--apply", default=None, metavar="OUT",
         help="write a substituted deck to OUT (validates clean for -f)",
+    )
+    s.add_argument(
+        "--max-sub-pct", type=float, default=0.30, metavar="N",
+        help=(
+            "refuse --apply when more than N (0.0-1.0) of the deck "
+            "would be substituted (default: 0.30 = 30%%)"
+        ),
+    )
+    s.add_argument(
+        "--no-anchor-check", action="store_true",
+        help=(
+            "disable anchor preservation (commander + format staples "
+            "with deck_pct >= 0.50) — power-user override"
+        ),
     )
     s.add_argument(
         "--json", action="store_true",
