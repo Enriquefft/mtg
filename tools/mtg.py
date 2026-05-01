@@ -3133,12 +3133,16 @@ def _resolve_deck_card(idx: dict, e: DeckEntry) -> dict | None:
 def _deck_demand(
     idx: dict, deck_path: Path
 ) -> tuple[dict[str, dict], list[DeckEntry]]:
-    """Aggregate per-name demand from a deck file (mainboard + commander)."""
+    """Aggregate per-name demand from a deck file (mainboard + commander
+    + sideboard + companion). Companion lives outside the 60/100 main
+    but the player must still own it; treating it like sideboard keeps
+    coverage / suggest-subs / wildcards consistent across all formats
+    (Lurrus brawl, Yorion standard, etc)."""
     entries = parse_deck(deck_path)
     demand: dict[str, dict] = {}
     unresolved: list[DeckEntry] = []
     for e in entries:
-        if e.section in ("commander", "deck", "sideboard"):
+        if e.section in ("commander", "deck", "sideboard", "companion"):
             card = _resolve_deck_card(idx, e)
             if card is None:
                 unresolved.append(e)
@@ -5146,7 +5150,12 @@ def _warn_if_corpus_stale(fmt: str) -> None:
         return
     try:
         data = json.loads(sidecar.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"[warn] corpus sidecar for {fmt} unreadable ({e}); "
+            f"skipping freshness check",
+            file=sys.stderr,
+        )
         return
     if not isinstance(data, dict) or not data:
         return
@@ -6376,14 +6385,24 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     # URL is appended to `also_seen_at` for traceability. Disk-resident
     # losers (`evicted`) are removed so the corpus stays canonical.
     existing_hashes = _existing_corpus_hashes(out_dir)
-    decks, dedup_dropped_decks, evicted = _common.dedup_decks(
+    decks, dedup_dropped_decks, eviction_map = _common.dedup_decks(
         decks, existing_hashes=existing_hashes,
     )
     dedup_dropped = len(dedup_dropped_decks)
-    _evict_corpus_slugs(out_dir, evicted)
 
+    # Truncate winners BEFORE eviction. If a winner that wants to evict
+    # an on-disk deck falls outside the cap, evicting anyway would leave
+    # the user with neither (loser unlinked, winner never written).
+    # `eviction_map` is `winner_hash -> evicted_slug` so we can filter
+    # to only surviving winners after the cap.
     if effective_limit is not None and effective_limit > 0:
         decks = decks[:effective_limit]
+    survived_hashes = {_common.cards_hash(d) for d in decks}
+    evicted = [
+        slug for h, slug in eviction_map.items() if h in survived_hashes
+    ]
+
+    _evict_corpus_slugs(out_dir, evicted)
 
     sidecar = _write_meta_corpus(decks, out_dir)
 
@@ -6683,19 +6702,20 @@ def _recommend_compute(
     """Pure-compute core for `cmd_recommend`.
 
     Returns ``(meta, deck_rows, shell_rows)`` where:
-      * `meta` is the run header (format, min, top, max_sub_pct, plus
-        `corpus_size` / `decks_considered` / `buildable_count` so the
-        text and JSON renderers stay in sync on the same numbers).
+      * `meta` is the run header (format, min, top, max_sub_pct, quality,
+        quality_dropped, corpus_size, decks_considered, buildable_count,
+        craft_priority) — every field both the text and JSON renderers
+        need so they stay in sync on the same numbers.
       * `deck_rows` are `_coverage_row` outputs (with F2 sidecar fields
-        + `build_status` enum) sorted by composite desc and capped at
-        `--top`. Already filtered against `--min` (via
+        + `build_status` enum + `role_match_score` + `craft_ladder`)
+        sorted by composite desc, then by `--quality` filter, then
+        capped at `--top`. Already filtered against `--min` (via
         `owned_pct + with_subs_pct < 2 * min` — the F2 clamp means
         with_subs_pct == owned_pct when subs are unacceptable, so this
         also catches `NEEDS_STAPLES` decks that are nowhere close).
-      * `shell_rows` are non-empty cluster->archetype matches when
-        `--include-shells` is set OR fewer than 3 BUILDABLE decks
-        survived the filter (the spec's auto-fallback so the user
-        always gets *something* actionable).
+      * `shell_rows` are non-empty cluster->archetype matches, emitted
+        unconditionally so Claude can weigh them alongside the deck
+        list. Cheap to compute (set intersections over owned cards).
     """
     fmt = args.format.lower()
     min_threshold = float(args.min)
@@ -6765,8 +6785,9 @@ def _recommend_compute(
         # Strict tier: sources that publish per-deck winrates (untapped,
         # aetherhub) — high signal. Plus derived/invented decks (Claude-
         # composed off the corpus) which carry their own provenance and
-        # validate cleanly. Everything else (user-built moxfield/
-        # archidekt, winrate-less scrapes) drops out.
+        # validate cleanly. Everything else (user-built moxfield lists,
+        # winrate-less scrapes from mtgazone/mtggoldfish/mtgdecks) drops
+        # out.
         pre = len(filtered)
         filtered = [
             r for r in filtered
@@ -6939,8 +6960,11 @@ def cmd_recommend(args: argparse.Namespace) -> int:
       1. Ranked deck recommendations (composite-sorted, capped at
          --top; per-deck build_status: BUILDABLE / NEEDS_STAPLES /
          BLOCKED).
-      2. Shell -> archetype bridge (always with --include-shells; auto
-         when < 3 BUILDABLE decks survive the --min filter).
+      2. Shell -> archetype bridge (emitted unconditionally; cheap to
+         compute, useful even when buildable count is high because it
+         surfaces novel shells the corpus doesn't yet have decks for).
+      3. Craft priority (top missing cards across the filtered corpus,
+         sorted by decks_unlocked).
 
     Stale freq index emits a one-line stderr warn — `recommend` reads
     `_freq.json` for sub-scoring + shell match weighting, so the user
@@ -8218,13 +8242,6 @@ def main(argv: list[str] | None = None) -> int:
         help="cap ranked deck list at N (default: 10)",
     )
     s.add_argument(
-        "--include-shells", action="store_true",
-        help=(
-            "always emit the shell->archetype bridge section (otherwise "
-            "auto-shown only when < 3 BUILDABLE decks survive --min)"
-        ),
-    )
-    s.add_argument(
         "--max-sub-pct", type=float, default=0.30, metavar="N",
         help=(
             "F2 sub-fidelity floor: clamp with_subs_pct to owned_pct "
@@ -8239,8 +8256,8 @@ def main(argv: list[str] | None = None) -> int:
             "corpus deck. 'strict' keeps only decks from sources that "
             "publish per-deck winrates (untapped, aetherhub) plus "
             "user-derived/invented decks under data/corpus/<fmt>/derived/. "
-            "Drops user-built lists from moxfield/archidekt and "
-            "winrate-less scrapes from mtgazone/mtggoldfish/mtgdecks."
+            "Drops user-built lists from moxfield and winrate-less "
+            "scrapes from mtgazone/mtggoldfish/mtgdecks."
         ),
     )
     _add_json_flag(s)

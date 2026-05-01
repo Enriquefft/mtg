@@ -187,7 +187,6 @@ def slugify(text: str) -> str:
 # = winner when two sources publish the same multiset. Order rationale:
 #   * untapped — Arena-native, all formats, the only automated brawl source.
 #   * moxfield — largest user-built corpus on the open web, brawl king.
-#   * archidekt — second-largest user-built; format coverage parity.
 #   * aetherhub — Arena-native w/ winrates, smaller volume.
 #   * mtgazone / mtggoldfish / mtgdecks — legacy curated/paper-tilted.
 # New parsers should be inserted at their evidence-supported position;
@@ -196,7 +195,6 @@ def slugify(text: str) -> str:
 SOURCE_PRIORITY: tuple[str, ...] = (
     "untapped",
     "moxfield",
-    "archidekt",
     "aetherhub",
     "mtgazone",
     "mtggoldfish",
@@ -292,7 +290,7 @@ def dedup_decks(
     decks: list[ParsedDeck],
     *,
     existing_hashes: dict[str, tuple[str, str]] | None = None,
-) -> tuple[list[ParsedDeck], list[ParsedDeck], list[str]]:
+) -> tuple[list[ParsedDeck], list[ParsedDeck], dict[str, str]]:
     """Cross-source dedup by `cards_hash` identity.
 
     Within `decks`, when two entries share a hash, keep the one whose
@@ -305,23 +303,25 @@ def dedup_decks(
       * loses (gets dropped, existing stays) if existing has higher priority;
       * wins (kept, existing's slug returned for caller to unlink) otherwise.
 
-    Returns `(kept, dropped_fresh, evicted_existing_slugs)`:
+    Returns `(kept, dropped_fresh, eviction_map)`:
       * `kept` — fresh decks to write to disk;
       * `dropped_fresh` — fresh decks collapsed away (intra-batch losers
         and on-disk-existing wins);
-      * `evicted_existing_slugs` — on-disk slugs the caller must unlink
-        (and prune from sidecar) because a fresh higher-priority source
-        beat them.
+      * `eviction_map` — `cards_hash -> on-disk slug` for every disk
+        deck a fresh winner wants to replace. Caller filters by which
+        winners actually survived a post-dedup cap, then unlinks the
+        survivors' eviction targets. Returning the hash (not a flat
+        list of slugs) lets the caller correlate evictions with winners
+        without re-running the priority comparison.
     """
     by_hash: dict[str, ParsedDeck] = {}
     dropped: list[ParsedDeck] = []
-    evicted: list[str] = []
+    eviction_map: dict[str, str] = {}
     existing_hashes = existing_hashes or {}
 
     for deck in decks:
         h = cards_hash(deck)
         if not h:
-            # Hashless deck (no comparable entries): keep as-is, can't dedup.
             by_hash[f"_no_hash_{id(deck)}"] = deck
             continue
 
@@ -342,12 +342,10 @@ def dedup_decks(
         if prior is not None:
             prior_source, prior_slug = prior
             if _source_rank(prior_source) <= _source_rank(deck.source):
-                # Existing on disk wins; drop this fresh entry.
                 dropped.append(deck)
                 continue
-            # Fresh entry wins; existing slug needs eviction by caller.
-            evicted.append(prior_slug)
+            eviction_map[h] = prior_slug
 
         by_hash[h] = deck
 
-    return list(by_hash.values()), dropped, evicted
+    return list(by_hash.values()), dropped, eviction_map
