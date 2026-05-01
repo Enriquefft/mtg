@@ -3799,6 +3799,9 @@ _SUPERTYPES_SET = frozenset({"legendary", "basic", "snow", "world", "ongoing"})
 _FALLBACK_INDEX: dict | None = None  # in-process memo; keyed by cache_key
 
 
+_ORACLE_TOKENS_MEMO: dict[str, frozenset[str]] = {}
+
+
 def _oracle_tokens(card: dict) -> frozenset[str]:
     """Normalized token set for Jaccard similarity.
 
@@ -3806,7 +3809,15 @@ def _oracle_tokens(card: dict) -> frozenset[str]:
     2. Strip reminder text (parenthesised clauses).
     3. Replace card's own name (and short front-face name for DFCs) with "~".
     4. Lowercase, split on punctuation+whitespace, filter empties.
+
+    Memoized by oracle_id (stable across reprints). Each missing slot
+    re-asks for the same set hundreds of times during candidate scoring.
     """
+    oracle_id = card.get("oracle_id")
+    if oracle_id is not None:
+        cached = _ORACLE_TOKENS_MEMO.get(oracle_id)
+        if cached is not None:
+            return cached
     parts: list[str] = []
     base_text = card.get("oracle_text") or ""
     if base_text:
@@ -3823,7 +3834,10 @@ def _oracle_tokens(card: dict) -> frozenset[str]:
         for variant in {cname, short}:
             if variant:
                 full = full.replace(variant, "~")
-    return frozenset(_TOKEN_RX.findall(full.lower()))
+    tokens = frozenset(_TOKEN_RX.findall(full.lower()))
+    if oracle_id is not None:
+        _ORACLE_TOKENS_MEMO[oracle_id] = tokens
+    return tokens
 
 
 def _primary_type(type_line: str) -> str:
@@ -3841,6 +3855,8 @@ def _primary_type(type_line: str) -> str:
 
 
 _FALLBACK_CACHE_MEMO: dict | None = None
+_FALLBACK_CACHE_DIRTY: bool = False
+_FALLBACK_FLUSH_REGISTERED: bool = False
 
 
 def _fallback_load_cache() -> dict:
@@ -3865,17 +3881,45 @@ def _fallback_load_cache() -> dict:
     return _FALLBACK_CACHE_MEMO
 
 
-def _fallback_save_cache(cache: dict) -> None:
-    global _FALLBACK_CACHE_MEMO
+def _fallback_flush_cache() -> None:
+    """Persist accumulated fallback-cache entries to disk.
+
+    Registered via atexit on the first dirtying write. Batches all
+    in-process additions into a single JSON dump — avoids per-entry
+    rewrites of the (growing) cache file during recommend's per-deck
+    suggest-subs sweep.
+    """
+    global _FALLBACK_CACHE_DIRTY
+    if not _FALLBACK_CACHE_DIRTY or _FALLBACK_CACHE_MEMO is None:
+        return
     try:
         DATA.mkdir(parents=True, exist_ok=True)
-        STRICTLYBETTER_FALLBACK_CACHE.write_text(json.dumps(cache, indent=2))
-        _FALLBACK_CACHE_MEMO = cache
+        STRICTLYBETTER_FALLBACK_CACHE.write_text(
+            json.dumps(_FALLBACK_CACHE_MEMO, indent=2)
+        )
+        _FALLBACK_CACHE_DIRTY = False
     except OSError as e:
         print(
             f"[warn] could not write strictlybetter fallback cache: {e}",
             file=sys.stderr,
         )
+
+
+def _fallback_save_cache(cache: dict) -> None:
+    """Mark the in-process cache dirty; defer the disk write to atexit.
+
+    A single recommend run can compute hundreds of new fallback entries;
+    writing the whole JSON file after each one was 4+ seconds of disk I/O.
+    Caller must have already updated `_FALLBACK_CACHE_MEMO` via reference
+    (cache and memo point to the same dict in normal use).
+    """
+    global _FALLBACK_CACHE_MEMO, _FALLBACK_CACHE_DIRTY, _FALLBACK_FLUSH_REGISTERED
+    _FALLBACK_CACHE_MEMO = cache
+    _FALLBACK_CACHE_DIRTY = True
+    if not _FALLBACK_FLUSH_REGISTERED:
+        import atexit
+        atexit.register(_fallback_flush_cache)
+        _FALLBACK_FLUSH_REGISTERED = True
 
 
 def _heuristic_functional_reprints(card_name: str, fmt: str) -> list[str]:
@@ -4099,6 +4143,9 @@ def _archetype_prior(
     return 0.0
 
 
+_PIP_VECTOR_MEMO: dict[str, dict[str, int] | None] = {}
+
+
 def _pip_vector(card: dict) -> dict[str, int] | None:
     """Per-color pip count for the card's mana cost.
 
@@ -4109,13 +4156,20 @@ def _pip_vector(card: dict) -> dict[str, int] | None:
     backsides without a cost, etc) so the caller can short-circuit
     pip-shape scoring (per §4 graceful degradation).
     """
+    oracle_id = card.get("oracle_id")
+    if oracle_id is not None and oracle_id in _PIP_VECTOR_MEMO:
+        return _PIP_VECTOR_MEMO[oracle_id]
     cost = (card.get("mana_cost") or "").strip()
     if not cost:
+        if oracle_id is not None:
+            _PIP_VECTOR_MEMO[oracle_id] = None
         return None
     vec: dict[str, int] = {col: 0 for col in _COLORS}
     for tok in _PIP_RE.findall(cost):
         for col in _pip_colors(tok):
             vec[col] += 1
+    if oracle_id is not None:
+        _PIP_VECTOR_MEMO[oracle_id] = vec
     return vec
 
 
@@ -5201,17 +5255,24 @@ def _format_for_deck_path(p: Path) -> str:
     return "brawl"
 
 
+_DECK_META_FILE_MEMO: dict[Path, dict] = {}
+
+
 def _load_deck_meta(deck_path: Path) -> dict:
     """Return the meta.json entry for `deck_path` (or {} if absent)."""
     meta_path = deck_path.parent / "meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(meta, dict):
-        return {}
+    meta = _DECK_META_FILE_MEMO.get(meta_path)
+    if meta is None:
+        if not meta_path.exists():
+            _DECK_META_FILE_MEMO[meta_path] = {}
+            return {}
+        try:
+            data = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            _DECK_META_FILE_MEMO[meta_path] = {}
+            return {}
+        meta = data if isinstance(data, dict) else {}
+        _DECK_META_FILE_MEMO[meta_path] = meta
     entry = meta.get(deck_path.name)
     if isinstance(entry, dict):
         return entry
