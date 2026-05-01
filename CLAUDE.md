@@ -117,7 +117,7 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
     direct downgrades; owned matches outrank every heuristic candidate
     and are tagged `[strictlybetter]` in text output (`strictlybetter:
     true` in `--json`). First run with strictlybetter enabled performs
-    a one-time ~4-minute bulk fetch of the obsoletes corpus into
+    a one-time ~10-minute bulk fetch of the obsoletes corpus into
     `data/strictlybetter-cache.json` (7d TTL); thereafter lookups are
     in-memory. Add `--no-strictlybetter` for offline / network-failure
     mode (skips the bulk fetch entirely).
