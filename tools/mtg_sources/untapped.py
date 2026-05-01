@@ -756,6 +756,30 @@ def parse_untapped(
         if not entries:
             continue
 
+        # Drop untapped placeholder rows (e.g. brawl `laelia-the-blade-
+        # reforged`: commander + 5 nonlands + 94 Mountains). Two-signal
+        # conjunction needed — real mono-color constructed has <15
+        # unique nonlands too, but never a single basic >=50% of deck.
+        unique_nonlands = 0
+        deck_total = 0
+        max_basic = 0
+        for e in entries:
+            if e.section != "deck":
+                continue
+            deck_total += e.count
+            printing = resolve_name(e.name)
+            if printing is None:
+                continue
+            type_line = printing.get("type_line") or ""
+            if "Land" not in type_line:
+                unique_nonlands += 1
+                continue
+            if "Basic" in type_line and e.count > max_basic:
+                max_basic = e.count
+        basic_share = (max_basic / deck_total) if deck_total else 0.0
+        if unique_nonlands < 15 and basic_share >= 0.5:
+            continue
+
         # Slug from the URL (already lowercase, hyphenated, ASCII).
         # De-dup by appending -2, -3 if untapped reused a slug across
         # archetype IDs (very rare; mostly happens for "boros-burn"
