@@ -150,6 +150,12 @@ class ParsedDeck:
                sidecar so a deck imported short (e.g. 56/60) is visible
                instead of silently corrupted. Per-card stderr would be
                noisy across a 30-deck fetch; one integer is enough.
+    `variant_count` total near-duplicate copies of this archetype seen
+               in the fetch (including self). 1 = unique. Set by
+               `dedup_decks` near-dup clustering pass.
+    `variants` lightweight back-pointers to collapsed near-duplicates.
+               Each entry: `{slug, source, url}`. Empty for unclustered
+               decks. Surfaced in the sidecar for traceability.
     """
 
     slug: str
@@ -167,6 +173,10 @@ class ParsedDeck:
     # decks seen in only one source. Surfaces in the sidecar so a later
     # session can see "same list also lives at <urls>".
     also_seen_at: list[str] = field(default_factory=list)
+    # Near-duplicate clustering. Populated by the second pass in
+    # `dedup_decks` (Jaccard ≥ 0.85). Default 1 / [] for unclustered.
+    variant_count: int = 1
+    variants: list[dict] = field(default_factory=list)
 
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
@@ -286,16 +296,155 @@ def is_stub_deck(
     return unique_nonlands < 15 and basic_share >= 0.5
 
 
+_BASIC_LANDS: frozenset[str] = frozenset({
+    "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
+    "Snow-Covered Plains", "Snow-Covered Island", "Snow-Covered Swamp",
+    "Snow-Covered Mountain", "Snow-Covered Forest",
+})
+
+# Near-dup threshold: decks sharing ≥ this fraction of their combined
+# non-basic card-slot multiset are considered the same archetype.
+_NEAR_DUP_JACCARD_THRESHOLD: float = 0.85
+
+
+def _cards_multiset(deck: ParsedDeck) -> dict[str, int]:
+    """Sorted (name → count) multiset used for near-dup Jaccard similarity.
+
+    Same scope as `cards_hash`: main-deck + commander + companion, basics
+    excluded. Returns an empty dict for skeletal / corrupt decks (zero
+    comparable entries) — callers treat those as non-clusterable.
+    """
+    pairs: dict[str, int] = {}
+    for e in deck.entries:
+        if e.section not in {"deck", "commander", "companion"}:
+            continue
+        pairs[e.name] = pairs.get(e.name, 0) + e.count
+    for basic in _BASIC_LANDS:
+        pairs.pop(basic, None)
+    return pairs
+
+
+def _jaccard_multiset(a: dict[str, int], b: dict[str, int]) -> float:
+    """Jaccard similarity over two card-count multisets.
+
+    Treats each copy as a distinct element (4x Counterspell contributes
+    4 to the intersection when both decks run 4; min(4,3)=3 when one
+    runs 3). Returns 0.0 when both sets are empty.
+
+    J(A,B) = |A ∩ B| / |A ∪ B|
+    For multisets: intersection = Σ min(a_i, b_i),
+                   union        = Σ max(a_i, b_i).
+    """
+    if not a and not b:
+        return 0.0
+    inter = 0
+    union = 0
+    keys = set(a) | set(b)
+    for k in keys:
+        av = a.get(k, 0)
+        bv = b.get(k, 0)
+        inter += min(av, bv)
+        union += max(av, bv)
+    return inter / union if union else 0.0
+
+
+def _cluster_near_dups(
+    decks: list[ParsedDeck],
+) -> tuple[list[ParsedDeck], list[ParsedDeck]]:
+    """Greedy single-linkage clustering over Jaccard multiset similarity.
+
+    Two decks belong to the same cluster if their card-multiset Jaccard
+    similarity is ≥ `_NEAR_DUP_JACCARD_THRESHOLD` (0.85). Within each
+    cluster, the deck with the highest SOURCE_PRIORITY (lowest rank
+    index) is the canonical winner; ties broken by winrate * sample
+    descending (more evidence first), then by slug ascending for
+    determinism.
+
+    Algorithm:
+      1. Sort all decks by priority key (source rank asc, then
+         -winrate*sample desc, then slug asc) so the best candidate
+         comes first.
+      2. Walk sorted list; for each unclaimed deck, start a new cluster.
+         Scan all later unclaimed decks — if Jaccard(cluster_rep, other)
+         ≥ threshold, absorb other into the cluster.
+      3. Cluster representative keeps its `ParsedDeck` unchanged except
+         that `variant_count` and `variants` are populated.
+
+    O(n²) over card-set comparisons. Acceptable for n < 2000 per format.
+
+    Returns `(winners, near_dup_dropped)`.
+    """
+    if len(decks) <= 1:
+        return list(decks), []
+
+    def _sort_key(d: ParsedDeck) -> tuple:
+        # Lower source rank = higher priority = sorts first.
+        src = _source_rank(d.source)
+        # Higher winrate×sample = more evidence = sorts first → negate.
+        wr = d.winrate if d.winrate is not None else 0.0
+        samp = d.sample if d.sample is not None else 0
+        return (src, -(wr * samp), d.slug)
+
+    ordered = sorted(decks, key=_sort_key)
+
+    # Precompute multisets once — each deck pays the iteration cost once
+    # rather than once per comparison pair.
+    multisets: list[dict[str, int]] = [_cards_multiset(d) for d in ordered]
+
+    claimed = [False] * len(ordered)
+    winners: list[ParsedDeck] = []
+    dropped: list[ParsedDeck] = []
+
+    for i, rep in enumerate(ordered):
+        if claimed[i]:
+            continue
+        claimed[i] = True
+        rep_ms = multisets[i]
+
+        # Skip decks that are effectively empty (corrupt / stub decks
+        # that survived stub-filter); they can't form meaningful clusters.
+        if not rep_ms:
+            winners.append(rep)
+            continue
+
+        cluster_variants: list[dict] = []
+
+        for j in range(i + 1, len(ordered)):
+            if claimed[j]:
+                continue
+            other_ms = multisets[j]
+            if not other_ms:
+                continue
+            if _jaccard_multiset(rep_ms, other_ms) >= _NEAR_DUP_JACCARD_THRESHOLD:
+                claimed[j] = True
+                other = ordered[j]
+                cluster_variants.append({
+                    "slug": other.slug,
+                    "source": other.source,
+                    "url": other.url,
+                })
+                dropped.append(other)
+
+        if cluster_variants:
+            rep.variant_count = 1 + len(cluster_variants)
+            rep.variants = cluster_variants
+
+        winners.append(rep)
+
+    return winners, dropped
+
+
 def dedup_decks(
     decks: list[ParsedDeck],
     *,
     existing_hashes: dict[str, tuple[str, str]] | None = None,
 ) -> tuple[list[ParsedDeck], list[ParsedDeck], dict[str, str]]:
-    """Cross-source dedup by `cards_hash` identity.
+    """Cross-source dedup by exact `cards_hash` then near-dup clustering.
 
-    Within `decks`, when two entries share a hash, keep the one whose
-    source has higher SOURCE_PRIORITY (lower index). The loser's `url`
-    is appended to the winner's `also_seen_at`.
+    Pass 1 — Exact dedup (unchanged):
+      Within `decks`, when two entries share a hash, keep the one whose
+      source has higher SOURCE_PRIORITY (lower index). The loser's `url`
+      is appended to the winner's `also_seen_at`.
 
     `existing_hashes` (optional) maps `cards_hash → (source, slug)` for
     decks already on disk in the same corpus dir. A fresh deck colliding
@@ -303,10 +452,17 @@ def dedup_decks(
       * loses (gets dropped, existing stays) if existing has higher priority;
       * wins (kept, existing's slug returned for caller to unlink) otherwise.
 
+    Pass 2 — Near-dup clustering (new):
+      Greedy single-linkage Jaccard ≥ 0.85 over the non-basic card
+      multiset. Decks that differ by 1-2 cards (same archetype uploaded
+      multiple times with minor tweaks) collapse to one canonical
+      representative. The winner's `variant_count` and `variants` fields
+      are populated. Near-dup losers are appended to `dropped_fresh`.
+
     Returns `(kept, dropped_fresh, eviction_map)`:
-      * `kept` — fresh decks to write to disk;
-      * `dropped_fresh` — fresh decks collapsed away (intra-batch losers
-        and on-disk-existing wins);
+      * `kept` — fresh decks to write to disk (after both passes);
+      * `dropped_fresh` — fresh decks collapsed away (exact losers +
+        near-dup losers);
       * `eviction_map` — `cards_hash -> on-disk slug` for every disk
         deck a fresh winner wants to replace. Caller filters by which
         winners actually survived a post-dedup cap, then unlinks the
@@ -348,4 +504,11 @@ def dedup_decks(
 
         by_hash[h] = deck
 
-    return list(by_hash.values()), dropped, eviction_map
+    # Pass 2: near-dup clustering (Jaccard ≥ 0.85) over exact-dedup
+    # survivors. Runs unconditionally — near-dup pollution is wrong,
+    # not a tuning knob (per CLAUDE.md §"Zero workarounds").
+    exact_survivors = list(by_hash.values())
+    clustered_winners, near_dup_dropped = _cluster_near_dups(exact_survivors)
+    dropped.extend(near_dup_dropped)
+
+    return clustered_winners, dropped, eviction_map
