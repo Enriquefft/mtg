@@ -178,6 +178,7 @@ def parse_mtgdecks(
     fetched: str,
     url: str,
     resolve_name: Callable[[str], dict | None],
+    **_: object,
 ) -> list[ParsedDeck]:
     """Parse the mtgdecks `/Historic` page into a list of `ParsedDeck`.
 

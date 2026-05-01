@@ -87,6 +87,10 @@ from mtg_sources.mtgdecks import (  # noqa: E402
     parse_mtgdecks,
     url_for_format as mtgdecks_url_for_format,
 )
+from mtg_sources.untapped import (  # noqa: E402
+    parse_untapped,
+    url_for_format as untapped_url_for_format,
+)
 
 ROOT = Path(os.environ.get("MTG_ROOT") or Path(__file__).resolve().parent.parent)
 DATA = ROOT / "data"
@@ -5437,17 +5441,19 @@ _FETCH_META_PARSERS = {
     "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
     "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
     "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format),
+    "untapped": (parse_untapped, untapped_url_for_format),
 }
 
 # Sources the spec lists in the `--source` choices but that we have not
 # wired a parser for. Listed explicitly so `argparse` accepts the choice
 # and `cmd_fetch_meta` can emit a deferred-source error message rather
 # than argparse's generic "invalid choice" — gives Claude an actionable
-# pointer to docs/sources.md. untapped's tier-list and deck pages are a
-# Next.js SPA shell with no server-rendered decklists; the underlying
-# api.mtga.untapped.gg endpoints return 403 to anonymous calls. Stays
-# deferred until either the SPA gains SSR or a sanctioned API path opens.
-_FETCH_META_DEFERRED_SOURCES = ("untapped",)
+# pointer to docs/sources.md. Empty as of 2026-05-01: untapped used to
+# live here (Next.js SPA + 403'd API), but the `__NEXT_DATA__` SSR
+# block carries the deck list (or a `decksQueryUrl` to a /free API
+# endpoint that 200s anonymously) and the V4 deckstring decoder lifts
+# the binary -> Scryfall-printing chain into mtg_sources.untapped.
+_FETCH_META_DEFERRED_SOURCES: tuple[str, ...] = ()
 
 _META_CACHE_TTL_SECS = 24 * 3600
 
@@ -5616,9 +5622,17 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         print(f"fetch failed: {url} -> {e.reason}", file=sys.stderr)
         return 1
 
+    # `limit` is a soft hint to the parser: sources with large per-
+    # archetype HTTP fan-out (untapped's historic-brawl walk is 1470
+    # archetype pages × 2 sub-fetches each) can short-circuit instead
+    # of fetching everything just to have `decks[:limit]` slice it
+    # down post-parse. Every parser's signature accepts (and ignores
+    # if not useful) `limit` via `**_` — see mtg_sources/*.py.
     try:
         decks = parse_fn(
-            html_text, fmt, fetched=fetched, url=url, resolve_name=_resolve_card,
+            html_text, fmt,
+            fetched=fetched, url=url, resolve_name=_resolve_card,
+            limit=args.limit,
         )
     except ValueError as e:
         print(f"parser drift on {url}: {e}", file=sys.stderr)

@@ -7,7 +7,7 @@ sites occasionally surface an old article in a sidebar.
 
 For each source: `WebFetch <url>` from inside Claude to pull a snapshot.
 
-Last verified: 2026-04-30.
+Last verified: 2026-05-01.
 
 ## Bot-block reality (read before WebFetching)
 
@@ -17,7 +17,7 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | host | status | decision |
 |---|---|---|
 | `api.scryfall.com` | 200 | canonical, always use |
-| `mtga.untapped.gg` | 200 (page) / 403 (api) | **API-only, scrape blocked as of 2026-04-30 — deferred.** Tier-list and deck pages are a Next.js SPA shell with no server-rendered decklists; the underlying `api.mtga.untapped.gg` JSON endpoints return 403 to anonymous calls. Manual research / WebFetch only. |
+| `mtga.untapped.gg` | 200 | **primary `fetch-meta` parser for Brawl + 100x corpus boost for Historic/Pioneer/Standard/Alchemy/Timeless.** Re-enabled 2026-05-01. Each `/constructed/<slug>/archetypes/<id>/...` page server-renders decks via `__NEXT_DATA__.ssrProps.apiDeckData.data` (Historic / Brawl / Pioneer / Alchemy / Timeless), with two API fallbacks for Standard (fully client-rendered) and post-rotation Brawl. The analytics endpoint at `api.mtga.untapped.gg/api/v1/analytics/query/decks_by_event_scope_and_rank_v2/free` is **anonymous-accessible** (no 403); earlier finding was wrong. Decks come over the wire as V4 base64url+LEB128 deckstrings, decoded via the mtgajson `loc_en.json` titleId crosswalk and resolved through Scryfall. |
 | `mtgazone.com` | 200 | **primary `fetch-meta` parser.** Tier-list pages (e.g. `/<format>-bo1-metagame-tier-list/`) carry server-rendered `<div class="deck-block">` decklists; deck-article URLs do not. |
 | `mtgaassistant.net` | 200 | secondary, Brawl meta breakdown |
 | `magic.wizards.com` | 200 | official ban announcements |
@@ -45,12 +45,26 @@ per format unless we have a real signal differential).
 Multi-deck-per-archetype output is a later feature; v0 ships singletons
 to mirror mtgazone's shape.
 
-**`aetherhub.com` (manual-only):** hosts the largest user-submitted
-Historic Brawl decklist corpus + commander meta-share derived from it.
-Nothing free replaces this for H-Brawl scope. If the user asks for deeper
-H-Brawl meta than untapped + mtgaassistant give us, ask them to browse
-aetherhub manually and paste the relevant page text into the session — do
-not WebFetch it.
+**`untapped.gg` (re-enabled 2026-05-01):** untapped is now the only
+automated Brawl source — `fetch-meta --source untapped brawl` walks
+`https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic-brawl`
+and emits one 100-card singleton per archetype (commander first, then
+companion if any, then 99 deck cards). Format-name mapping inside the
+parser: `brawl` -> `historic-brawl` (matches the rest of the toolkit's
+"`-f brawl` = Historic Brawl" convention). The same parser also covers
+`historic`, `standard`, `pioneer`, `alchemy`, `timeless` with sample
+sizes 100x larger than mtgazone's tier-list snapshot (untapped's corpus
+is millions of MTGA matches/month vs. mtgazone's hand-curated handful).
+Three resolution paths inside `_fetch_archetype_decks`: SSR-embedded
+(Historic / Brawl / Pioneer / Alchemy / Timeless), SSR-suggested API
+(post-rotation tail), and format-wide API (Standard, fully
+client-rendered) with poll-on-202 for untapped's async-query backend.
+
+**`aetherhub.com` (manual-only):** retained as a *secondary* H-Brawl
+cross-check now that untapped is the primary automated source. If the
+user asks for an even deeper signal than untapped publishes, ask them
+to browse aetherhub manually and paste the relevant page text into
+the session — do not WebFetch it.
 
 ## Card data + legalities (canonical)
 
@@ -69,34 +83,34 @@ All URLs below are WebFetch-safe (return 200 to scripted requests).
 Listed primary → fallback per format.
 
 ### Historic Brawl (Scryfall key: `brawl`)
-- https://mtga.untapped.gg/constructed/historic-brawl/tier-list — **API-only, scrape blocked (deferred)**; manual research only
-- https://mtgaassistant.net/Meta/Historic-Brawl/ — meta breakdown
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic-brawl — `fetch-meta --source untapped brawl` (verified 2026-05-01; 1470 archetypes, 100-card singleton with commander; format CLI key `brawl` maps to untapped slug `historic-brawl`)
+- https://mtgaassistant.net/Meta/Historic-Brawl/ — meta breakdown (manual cross-reference)
 
 ### Standard Brawl (Scryfall key: `standardbrawl`)
 - https://mtgazone.com/standard-brawl/ — deck articles only; mtgazone publishes no Brawl tier list, so `fetch-meta` does not support this format
 - https://mtgaassistant.net/Meta/Brawl
 
 ### Standard
-- https://www.mtggoldfish.com/metagame/standard
-- https://mtga.untapped.gg/constructed/standard/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=standard — `fetch-meta --source untapped standard` (verified 2026-05-01; uses path 3 / format-wide API + poll-on-202 — Standard archetype pages are fully client-rendered)
+- https://www.mtggoldfish.com/metagame/standard — `fetch-meta --source mtggoldfish standard`
 - https://mtgazone.com/standard-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone standard`
 
 ### Alchemy
-- https://mtga.untapped.gg/constructed/alchemy/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=alchemy — `fetch-meta --source untapped alchemy` (verified 2026-05-01)
 - https://mtgazone.com/alchemy-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone alchemy`
 
 ### Historic
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic — `fetch-meta --source untapped historic` (verified 2026-05-01; SSR-embedded decks)
 - https://www.mtggoldfish.com/metagame/historic — `fetch-meta --source mtggoldfish historic`
-- https://mtga.untapped.gg/constructed/historic/tier-list — **API-only, scrape blocked (deferred)**; manual research only
 - https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
 - https://mtgdecks.net/Historic — `fetch-meta --source mtgdecks historic` (verified 2026-05-01; one deck per archetype, most-recent submission; tier from row class, winrate + sample from index columns)
 
 ### Timeless
-- https://mtga.untapped.gg/constructed/timeless/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=timeless — `fetch-meta --source untapped timeless` (verified 2026-05-01)
 - https://mtgazone.com/timeless-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone timeless`
 
 ### Pioneer (Arena's Explorer format draws from this pool)
-- https://mtga.untapped.gg/constructed/explorer/tier-list — **API-only, scrape blocked (deferred)**; manual research only
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=pioneer — `fetch-meta --source untapped pioneer` (verified 2026-05-01; untapped serves Pioneer archetype pages under `/constructed/pioneer/...` directly. The analytics API uses `Explorer_Ladder` as the event_name internally — same telemetry bucket — but the sitemap and page URLs use `pioneer`)
 - https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer` (also reached via `--source mtgazone pioneer`)
 - https://www.mtggoldfish.com/metagame/pioneer — paper Pioneer; retry once on 403
 

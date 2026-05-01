@@ -102,8 +102,10 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
     ```bash
     tools/mtg fetch-meta historic --out decks/historic/ --limit 30
     ```
-    mtgazone is primary; mtggoldfish wired (works for `pioneer`/
-    `standard`); untapped deferred — see `docs/sources.md`.
+    Sources: `mtgazone`, `mtggoldfish`, `mtgdecks`, `untapped` (the only
+    automated Brawl source — `--source untapped brawl`; also covers
+    `historic`/`standard`/`pioneer`/`alchemy`/`timeless` with much larger
+    samples than mtgazone). See `docs/sources.md`.
     Add `--no-cache` to bypass `data/meta-cache/`, `--json` for stdout output.
 
 13. **For owned-card replacements** preserving role/CMC/CI/companion:

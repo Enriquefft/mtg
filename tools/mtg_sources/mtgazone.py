@@ -187,6 +187,7 @@ def parse_mtgazone(
     fetched: str,
     url: str,
     resolve_name: Callable[[str], dict | None],
+    **_: object,
 ) -> list[ParsedDeck]:
     """Parse a mtgazone tier-list page into a list of `ParsedDeck`.
 

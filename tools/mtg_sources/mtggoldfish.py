@@ -145,6 +145,7 @@ def parse_mtggoldfish(
     fetched: str,
     url: str,
     resolve_name: Callable[[str], dict | None],
+    **_: object,
 ) -> list[ParsedDeck]:
     """Parse mtggoldfish's `/metagame/<fmt>` page into `ParsedDeck` list.
 
