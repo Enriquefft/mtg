@@ -114,10 +114,13 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
     tools/mtg suggest-subs decks/<name>/v0.txt -f brawl --apply decks/<name>/v0-subbed.txt
     ```
     Consults strictlybetter.eu for functional reprints + community-validated
-    direct upgrades; owned matches outrank every heuristic candidate and
-    are tagged `[strictlybetter]` in text output (`strictlybetter: true`
-    in `--json`). Cached at `data/strictlybetter-cache.json` (7d TTL).
-    Add `--no-strictlybetter` for offline / network-failure mode.
+    direct downgrades; owned matches outrank every heuristic candidate
+    and are tagged `[strictlybetter]` in text output (`strictlybetter:
+    true` in `--json`). First run with strictlybetter enabled performs
+    a one-time ~4-minute bulk fetch of the obsoletes corpus into
+    `data/strictlybetter-cache.json` (7d TTL); thereafter lookups are
+    in-memory. Add `--no-strictlybetter` for offline / network-failure
+    mode (skips the bulk fetch entirely).
 
 14. **For novel-deck shell discovery** (cluster owned cards):
     ```bash

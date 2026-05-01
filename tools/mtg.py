@@ -104,15 +104,31 @@ SCRYFALL_API = "https://api.scryfall.com"
 
 # strictlybetter.eu — community-curated functional-reprint + direct-upgrade
 # database. Used by `suggest-subs` to prefer rules-text-equivalent owned
-# alternatives over heuristic role/CMC matches. The functional_reprints
-# endpoint returns the entire DB in one bulk response (per_page=200,
-# last_page=1, no name search), so we fetch once and invert it locally.
-# The obsoletes endpoint supports partial-match search on card name and
-# is queried per-missing-card. Both are cached at STRICTLYBETTER_CACHE
-# with a 7-day TTL. API guide: https://www.strictlybetter.eu/api-guide
+# alternatives over heuristic role/CMC matches. Both endpoints are bulk:
+#   * /api/functional_reprints — single page (per_page=200, last_page=1).
+#   * /api/obsoletes           — paginated (per_page server-capped at 50,
+#     ~384 pages / ~19,200 rows total). The per-card variant
+#     `/api/obsoletes/<name>` is partial-match on the *inferiors* side
+#     only and CANNOT be used to find rows where `<name>` is the
+#     superior, so we fetch the full corpus once and build a reverse
+#     index `superior_lc -> {inferior_names}` in memory.
+# Both are cached at STRICTLYBETTER_CACHE with a 7-day TTL.
+# API guide: https://www.strictlybetter.eu/api-guide
 STRICTLYBETTER_API = "https://www.strictlybetter.eu/api"
 STRICTLYBETTER_TTL_S = 7 * 24 * 3600
 STRICTLYBETTER_THROTTLE_S = 0.65  # under 100 req/min cap
+STRICTLYBETTER_OBSOLETES_PER_PAGE = 50  # server-cap; values above are clamped
+# Schema version for the on-disk cache. Bump when the meaning of a cache
+# field changes so a stale cache from a prior schema is dropped instead
+# of silently serving wrong-direction data.
+#   v1 — initial: obsoletes returned UPGRADES (wrong for sub-suggest)
+#   v2 — obsoletes per-card flipped to DOWNGRADES (still broken: the
+#        per-card endpoint can't surface rows where the queried card is
+#        the superior, so most downgrades are missed)
+#   v3 — obsoletes is now bulk-fetched once (raw row list under
+#        cache["obsoletes"]={"fetched_at","rows"}) and a reverse index
+#        is built in memory; correct for sub-suggest in both directions
+STRICTLYBETTER_CACHE_SCHEMA = 3
 
 ARENA_FORMATS = {
     "standard",
@@ -3281,23 +3297,34 @@ _SUPERTYPES = ("legendary", "basic", "snow", "world")
 #       "groups": [["Llanowar Elves", "Elvish Mystic", ...], ...],
 #   }
 #   "obsoletes": {
-#       "<card-name-lower>": {
-#           "fetched_at": "...",
-#           "names": ["Lightning Bolt", "Galvanic Blast", ...],
-#       }, ...
+#       "fetched_at": "2026-05-01T12:34:56+00:00",
+#       "rows": [
+#           {"id": ..., "upvotes": ..., "downvotes": ...,
+#            "inferiors": [{"name": "Shock", ...}, ...],
+#            "superiors": [{"name": "Lightning Bolt", ...}, ...],
+#            "labels": {"strictly_better": true, ...}}, ...
+#       ],
 #   }
 #
-# Functional reprints come from a SINGLE bulk fetch (the API endpoint
-# returns the whole DB regardless of name segment — confirmed via
-# api-guide). Obsoletes are per-card (partial-match search). A "good"
-# obsolete entry is filtered to `labels.strictly_better=True` AND
-# `upvotes > downvotes` so we don't promote disputed community claims.
+# Both come from BULK fetches:
+#   * functional_reprints: single page (per_page=200, last_page=1).
+#   * obsoletes: ~384 pages, server-capped at per_page=50, total ~19,200
+#     rows. The per-card variant `/api/obsoletes/<name>` only matches on
+#     the inferiors side, so it can't surface rows where the queried
+#     card is the superior — we have to fetch the full corpus once and
+#     build a reverse index `superior_lc -> {inferior_names}` locally.
+#
+# A "good" obsoletes row is filtered to `labels.strictly_better=True`
+# AND `upvotes > downvotes` so we don't promote disputed community
+# claims. The bulk fetch costs ~4 minutes wall-clock at the 0.65s
+# throttle but happens at most once per 7d.
 #
 # `_strictlybetter_subs(card_name)` returns the union of functional
-# reprints and good obsoletes for a card. Empty list on miss / network
-# failure / 404 — never raises. The candidate-loop in `_run_suggest_subs`
-# then intersects this with the user's collection and applies a fixed
-# +1000 score boost so any owned reprint outranks every heuristic match.
+# reprints and validated downgrades for a card. Empty list on miss /
+# network failure — never raises. The candidate-loop in
+# `_run_suggest_subs` then intersects this with the user's collection
+# and applies a fixed +1000 score boost so any owned reprint outranks
+# every heuristic match.
 
 
 def _strictlybetter_load_cache() -> dict:
@@ -3307,8 +3334,13 @@ def _strictlybetter_load_cache() -> dict:
     `_strictlybetter_save_cache`. Corrupt JSON is logged and replaced —
     we never crash the CLI over a malformed sub-cache.
     """
+    skeleton = {
+        "schema": STRICTLYBETTER_CACHE_SCHEMA,
+        "functional_reprints": None,
+        "obsoletes": None,
+    }
     if not STRICTLYBETTER_CACHE.exists():
-        return {"functional_reprints": None, "obsoletes": {}}
+        return dict(skeleton)
     try:
         data = json.loads(STRICTLYBETTER_CACHE.read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -3317,13 +3349,17 @@ def _strictlybetter_load_cache() -> dict:
             "starting fresh in-memory",
             file=sys.stderr,
         )
-        return {"functional_reprints": None, "obsoletes": {}}
+        return dict(skeleton)
     if not isinstance(data, dict):
-        return {"functional_reprints": None, "obsoletes": {}}
+        return dict(skeleton)
+    if data.get("schema") != STRICTLYBETTER_CACHE_SCHEMA:
+        # Stale schema — drop everything and refetch on demand. The
+        # functional_reprints groups are direction-agnostic and could in
+        # principle be preserved, but the cache is small and refetching
+        # once is cheaper than version-aware partial migrations.
+        return dict(skeleton)
     data.setdefault("functional_reprints", None)
-    data.setdefault("obsoletes", {})
-    if not isinstance(data["obsoletes"], dict):
-        data["obsoletes"] = {}
+    data.setdefault("obsoletes", None)
     return data
 
 
@@ -3394,73 +3430,96 @@ def _strictlybetter_fetch_functional_reprints() -> list[list[str]] | None:
     return groups
 
 
-def _strictlybetter_fetch_obsoletes(card_name: str) -> list[str] | None:
-    """Per-card fetch of community-validated direct upgrades.
+def _strictlybetter_fetch_obsoletes_bulk() -> list[dict] | None:
+    """Paginate the entire `/api/obsoletes` corpus.
 
-    Returns the list of card names that are strictly better than
-    `card_name` AND have net-positive votes (`upvotes > downvotes`) AND
-    `labels.strictly_better=True`. Empty list = API hit, no entries.
-    None = network/HTTP failure (caller should not cache None).
+    Returns the flat list of raw rows (preserving `inferiors`,
+    `superiors`, `labels`, `upvotes`, `downvotes`) so the caller can
+    build whatever index it wants. The per-card variant
+    (`/api/obsoletes/<name>`) only partial-matches on the inferiors
+    side, so it cannot surface rows where the queried card is itself
+    the superior — bulk is the only correct path for sub-suggest.
+
+    Returns None on transport failure of any page; caller MUST NOT
+    cache a partial corpus (next CLI invocation can retry cleanly).
+    `per_page` is server-capped at 50 regardless of request value, so
+    we walk every `last_page` reported by page 1.
+
+    Honors `STRICTLYBETTER_THROTTLE_S` between requests to stay under
+    the 100 req/min limit. Prints a progress line every 50 pages to
+    stderr — this is a multi-minute fetch and silent would be wrong.
     """
-    quoted = urllib.parse.quote(card_name, safe="")
-    url = f"{STRICTLYBETTER_API}/obsoletes/{quoted}"
-    try:
-        payload = _get_json(url)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            # 404 means "no entries", not a transport error — cache empty.
-            return []
-        print(
-            f"[warn] strictlybetter obsoletes fetch failed for "
-            f"{card_name!r}: HTTP {e.code}",
-            file=sys.stderr,
-        )
-        return None
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        print(
-            f"[warn] strictlybetter obsoletes fetch failed for "
-            f"{card_name!r}: {e}",
-            file=sys.stderr,
-        )
-        return None
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("data") or []
-    upgrades: list[str] = []
-    seen: set[str] = set()
-    name_lc = card_name.lower()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        labels = row.get("labels") or {}
-        if not labels.get("strictly_better"):
-            continue
+    base = (
+        f"{STRICTLYBETTER_API}/obsoletes"
+        f"?per_page={STRICTLYBETTER_OBSOLETES_PER_PAGE}"
+    )
+    rows: list[dict] = []
+    last_fetch = 0.0
+    page = 1
+    last_page: int | None = None
+    while True:
+        gap = time.monotonic() - last_fetch
+        if last_fetch and gap < STRICTLYBETTER_THROTTLE_S:
+            time.sleep(STRICTLYBETTER_THROTTLE_S - gap)
+        url = f"{base}&page={page}"
         try:
-            up = int(row.get("upvotes") or 0)
-            down = int(row.get("downvotes") or 0)
-        except (TypeError, ValueError):
-            continue
-        if up <= down:
-            continue
-        # The query is a partial match — the row is only relevant if
-        # `card_name` actually appears as an inferior. Skip rows where
-        # `card_name` is the superior (we don't want to suggest cards
-        # that the queried card is *better* than).
-        inferiors = [
-            (c.get("name") or "").strip()
-            for c in (row.get("inferiors") or [])
-            if isinstance(c, dict)
-        ]
-        if not any(n.lower() == name_lc for n in inferiors):
-            continue
-        for c in row.get("superiors") or []:
-            if not isinstance(c, dict):
-                continue
-            nm = (c.get("name") or "").strip()
-            if nm and nm.lower() != name_lc and nm.lower() not in seen:
-                seen.add(nm.lower())
-                upgrades.append(nm)
-    return upgrades
+            payload = _get_json(url)
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            OSError,
+            ValueError,
+        ) as e:
+            print(
+                f"[warn] strictlybetter obsoletes bulk fetch failed at "
+                f"page {page}: {e}; downgrade preference disabled this run",
+                file=sys.stderr,
+            )
+            return None
+        last_fetch = time.monotonic()
+        if not isinstance(payload, dict):
+            print(
+                f"[warn] strictlybetter obsoletes bulk: page {page} "
+                "returned non-dict payload; aborting",
+                file=sys.stderr,
+            )
+            return None
+        page_rows = payload.get("data") or []
+        if not isinstance(page_rows, list):
+            print(
+                f"[warn] strictlybetter obsoletes bulk: page {page} "
+                "missing `data` list; aborting",
+                file=sys.stderr,
+            )
+            return None
+        for row in page_rows:
+            if isinstance(row, dict):
+                rows.append(row)
+        if last_page is None:
+            try:
+                last_page = int(payload.get("last_page") or 0) or None
+            except (TypeError, ValueError):
+                last_page = None
+            if last_page:
+                print(
+                    f"[strictlybetter] obsoletes bulk fetch: "
+                    f"{last_page} pages total (~{last_page * 50} rows)",
+                    file=sys.stderr,
+                )
+        if last_page and (page % 50 == 0 or page == last_page):
+            print(
+                f"[strictlybetter] obsoletes bulk fetch: "
+                f"page {page}/{last_page}",
+                file=sys.stderr,
+            )
+        if last_page is not None and page >= last_page:
+            break
+        if last_page is None and not page_rows:
+            # Defensive: no last_page reported and an empty page —
+            # treat as end-of-stream rather than looping forever.
+            break
+        page += 1
+    return rows
 
 
 # Per-process memo: cache the inverted functional-reprints index after
@@ -3469,7 +3528,7 @@ def _strictlybetter_fetch_obsoletes(card_name: str) -> list[str] | None:
 # file N times. Keyed by None (single global) — the underlying cache
 # file is the SoT, this is just an O(1) accessor.
 _STRICTLYBETTER_REPRINT_INDEX: dict[str, set[str]] | None = None
-_STRICTLYBETTER_OBSOLETE_LAST_FETCH: float = 0.0
+_STRICTLYBETTER_OBSOLETE_INDEX: dict[str, set[str]] | None = None
 
 
 def _strictlybetter_reprint_index(
@@ -3511,8 +3570,85 @@ def _strictlybetter_reprint_index(
     return inverted
 
 
+def _strictlybetter_obsoletes_index(
+    cache: dict, *, refresh: bool = False
+) -> dict[str, set[str]]:
+    """superior_name_lc -> set of inferior names (community-validated).
+
+    Built from the bulk row-list under `cache["obsoletes"]["rows"]`.
+    Triggers a bulk fetch when the cached rows are missing or stale
+    (7d TTL on the bulk timestamp); on fetch failure, returns an empty
+    index (no preference contribution this run, no crash).
+
+    Filter rules — only "good" downgrades survive:
+      * `labels.strictly_better == True`
+      * `upvotes > downvotes` (community-validated)
+      * Skip self-references (defensive: an `id`-paired self-row would
+        promote a card as a sub for itself)
+      * Inferiors keep their original casing for output; index key is
+        lowercase so callers don't have to canonicalize.
+    """
+    global _STRICTLYBETTER_OBSOLETE_INDEX
+    if _STRICTLYBETTER_OBSOLETE_INDEX is not None and not refresh:
+        return _STRICTLYBETTER_OBSOLETE_INDEX
+    sub = cache.get("obsoletes") or {}
+    fetched_at = sub.get("fetched_at") if isinstance(sub, dict) else None
+    rows = sub.get("rows") if isinstance(sub, dict) else None
+    if (
+        not isinstance(rows, list)
+        or not _strictlybetter_is_fresh(fetched_at)
+        or refresh
+    ):
+        fresh_rows = _strictlybetter_fetch_obsoletes_bulk()
+        if fresh_rows is not None:
+            cache["obsoletes"] = {
+                "fetched_at": _strictlybetter_now(),
+                "rows": fresh_rows,
+            }
+            _strictlybetter_save_cache(cache)
+            rows = fresh_rows
+        elif not isinstance(rows, list):
+            # First-ever call failed — return empty so caller degrades
+            # gracefully. Don't memoize (next run might succeed).
+            return {}
+    inverted: dict[str, set[str]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        labels = row.get("labels") or {}
+        if not labels.get("strictly_better"):
+            continue
+        try:
+            up = int(row.get("upvotes") or 0)
+            down = int(row.get("downvotes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if up <= down:
+            continue
+        superiors = [
+            (c.get("name") or "").strip()
+            for c in (row.get("superiors") or [])
+            if isinstance(c, dict)
+        ]
+        inferiors = [
+            (c.get("name") or "").strip()
+            for c in (row.get("inferiors") or [])
+            if isinstance(c, dict)
+        ]
+        for sup in superiors:
+            if not sup:
+                continue
+            sup_lc = sup.lower()
+            for inf in inferiors:
+                if not inf or inf.lower() == sup_lc:
+                    continue
+                inverted.setdefault(sup_lc, set()).add(inf)
+    _STRICTLYBETTER_OBSOLETE_INDEX = inverted
+    return inverted
+
+
 def _strictlybetter_subs(card_name: str) -> list[str]:
-    """Names that are functional reprints OR community-validated upgrades.
+    """Names that are functional reprints OR community-validated downgrades.
 
     Single-call entry point used by `_run_suggest_subs`. Reads/refreshes
     the on-disk cache as needed (7d TTL). Empty list on miss, malformed
@@ -3524,39 +3660,19 @@ def _strictlybetter_subs(card_name: str) -> list[str]:
     cache = _strictlybetter_load_cache()
     out: list[str] = []
     seen: set[str] = set()
+    key = name.lower()
 
     reprint_idx = _strictlybetter_reprint_index(cache)
-    for n in reprint_idx.get(name.lower(), ()):
-        if n.lower() not in seen:
+    for n in reprint_idx.get(key, ()):
+        if n.lower() not in seen and n.lower() != key:
             seen.add(n.lower())
             out.append(n)
 
-    key = name.lower()
-    obs_cache = cache.get("obsoletes") or {}
-    entry = obs_cache.get(key)
-    fetched_at = (entry or {}).get("fetched_at") if isinstance(entry, dict) else None
-    if not isinstance(entry, dict) or not _strictlybetter_is_fresh(fetched_at):
-        # Throttle to stay under 100 req/min — the api-guide rate limit.
-        global _STRICTLYBETTER_OBSOLETE_LAST_FETCH
-        now = time.monotonic()
-        gap = now - _STRICTLYBETTER_OBSOLETE_LAST_FETCH
-        if gap < STRICTLYBETTER_THROTTLE_S:
-            time.sleep(STRICTLYBETTER_THROTTLE_S - gap)
-        _STRICTLYBETTER_OBSOLETE_LAST_FETCH = time.monotonic()
-        upgrades = _strictlybetter_fetch_obsoletes(name)
-        if upgrades is not None:
-            entry = {"fetched_at": _strictlybetter_now(), "names": upgrades}
-            obs_cache[key] = entry
-            cache["obsoletes"] = obs_cache
-            _strictlybetter_save_cache(cache)
-        else:
-            entry = None  # transport failure — don't poison the cache
-
-    if isinstance(entry, dict):
-        for n in entry.get("names") or []:
-            if isinstance(n, str) and n and n.lower() not in seen:
-                seen.add(n.lower())
-                out.append(n)
+    obsolete_idx = _strictlybetter_obsoletes_index(cache)
+    for n in obsolete_idx.get(key, ()):
+        if n.lower() not in seen and n.lower() != key:
+            seen.add(n.lower())
+            out.append(n)
     return out
 
 
