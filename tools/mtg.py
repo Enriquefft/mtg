@@ -4954,12 +4954,20 @@ def _shell_cluster_rows(
 # ---------- meta-corpus card frequency index ------------------------------
 
 
-def _corpus_deck_files(fmt: str) -> list[Path]:
+def _corpus_deck_files(fmt: str, *, include_derived: bool = False) -> list[Path]:
     """Sorted MTGA-export deck files in `data/corpus/<fmt>/`.
 
     Excludes JSON sidecars (`meta.json`, `_freq.json`, `_*.json`) so the
     corpus enumerator never tries to `parse_deck` a JSON blob. Returns []
     if the directory doesn't exist.
+
+    `include_derived=True` additionally appends `data/corpus/<fmt>/derived/
+    *.txt` (machine-rewritten ownership-maximized variants from
+    `cmd_derive`). Off by default so freq index + archetype-anchor
+    computation see only the source-of-truth corpus — derived decks
+    sourced from those priors must not feed back into them. `recommend`
+    and other consumer-side walks pass True so user-derived variants
+    surface alongside the originals.
     """
     corpus_dir = CORPUS / fmt
     if not corpus_dir.is_dir():
@@ -4973,6 +4981,17 @@ def _corpus_deck_files(fmt: str) -> list[Path]:
         if p.name.startswith("_"):
             continue
         out.append(p)
+    if include_derived:
+        derived_dir = corpus_dir / "derived"
+        if derived_dir.is_dir():
+            for p in sorted(derived_dir.iterdir()):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() != ".txt":
+                    continue
+                if p.name.startswith("_"):
+                    continue
+                out.append(p)
     return out
 
 
@@ -6419,7 +6438,7 @@ def _recommend_compute(
     max_sub_pct = float(args.max_sub_pct)
     quiet = bool(getattr(args, "json", False))
 
-    deck_paths = _corpus_deck_files(fmt)
+    deck_paths = _corpus_deck_files(fmt, include_derived=True)
     snap = _load_collection()  # checked by caller; never None here.
     assert snap is not None
 
@@ -6636,7 +6655,7 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if not _corpus_deck_files(fmt):
+    if not _corpus_deck_files(fmt, include_derived=True):
         msg = (
             f"[warn] no corpus for {fmt} — "
             f"run tools/mtg fetch-meta {fmt} first"
@@ -6693,6 +6712,246 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         return 0
 
     _print_recommend_text(meta, decks, shells)
+    return 0
+
+
+# ---------- derive / invent (composition primitives) --------------------
+
+
+def _format_from_corpus_path(deck_path: Path) -> str | None:
+    """If `deck_path` resolves under data/corpus/<fmt>/, return fmt.
+
+    Used by `derive` so the user doesn't have to repeat the format
+    every time — the corpus layout already encodes it. Returns None
+    when the path isn't under the corpus root or the parent dir is
+    not an Arena format slug.
+    """
+    try:
+        rel = deck_path.resolve().relative_to(CORPUS.resolve())
+    except ValueError:
+        return None
+    parts = rel.parts
+    if not parts:
+        return None
+    fmt = parts[0]
+    return fmt if fmt in ARENA_FORMATS else None
+
+
+def _apply_subs_to_entries(
+    entries: list[DeckEntry],
+    json_missing: list[dict],
+    idx: dict,
+    is_brawl: bool,
+) -> list[DeckEntry]:
+    """Lift the `cmd_suggest_subs --apply` rewrite into a reusable helper.
+
+    Walks `json_missing` (output of `_run_suggest_subs`), picks the
+    top-scored candidate per non-anchor slot whose remaining copy
+    capacity covers the deficit, and rewrites `entries` accordingly.
+    Anchors and slots without a viable candidate pass through
+    unchanged. Commander entries are never substituted.
+
+    The `--apply` body in `cmd_suggest_subs` was the source — extracted
+    verbatim to keep `derive` and `--apply` on identical mechanics.
+    """
+    max_copies = 1 if is_brawl else 4
+    deck_copies: dict[str, int] = {}
+    for e in entries:
+        if e.section in {"commander", "deck", "sideboard"}:
+            deck_copies[e.name] = deck_copies.get(e.name, 0) + e.count
+
+    used: dict[str, int] = dict(deck_copies)
+    top_by_name: dict[str, tuple[str, int]] = {}
+    for json_slot in json_missing:
+        if json_slot.get("anchor"):
+            continue
+        slot_deficit = json_slot["deficit"]
+        chosen_name: str | None = None
+        for entry in json_slot["candidates"]:
+            cname = entry["name"]
+            resolved = _resolve_card(cname)
+            if resolved is not None and _is_basic(resolved):
+                chosen_name = cname
+                break
+            if max_copies - used.get(cname, 0) >= slot_deficit:
+                chosen_name = cname
+                break
+        if chosen_name is None:
+            continue
+        resolved = _resolve_card(chosen_name)
+        if resolved is None or not _is_basic(resolved):
+            used[chosen_name] = used.get(chosen_name, 0) + slot_deficit
+        top_by_name[json_slot["card"].lower()] = (chosen_name, slot_deficit)
+
+    new_entries: list[DeckEntry] = []
+    for e in entries:
+        key = e.name.lower()
+        if e.section == "commander":
+            new_entries.append(e)
+            continue
+        if key in top_by_name and e.section in {"deck", "sideboard"}:
+            cand_name, deficit = top_by_name[key]
+            take = min(deficit, e.count)
+            remaining = e.count - take
+            if remaining > 0:
+                new_entries.append(DeckEntry(
+                    remaining, e.name, e.set_code, e.collector, e.section,
+                ))
+            printings = idx["by_name"].get(cand_name.lower()) or []
+            if not printings:
+                new_entries.append(e)
+                continue
+            p = printings[0]
+            new_entries.append(DeckEntry(
+                take, cand_name,
+                (p.get("set") or "").upper(),
+                str(p.get("collector_number") or ""),
+                e.section,
+            ))
+            top_by_name[key] = (cand_name, deficit - take)
+            if top_by_name[key][1] <= 0:
+                del top_by_name[key]
+        else:
+            new_entries.append(e)
+    return new_entries
+
+
+def cmd_derive(args: argparse.Namespace) -> int:
+    """Ownership-maximized variant of a corpus deck.
+
+    Substrate: `_run_suggest_subs` over the source deck, then apply the
+    top-scored candidate to every non-anchor slot. Anchors (commander +
+    format staples per `_anchor_names`) stay verbatim — when missing,
+    the derived deck inherits the gap and `anchor_unfilled` flags it
+    in the provenance sidecar so `recommend` can still surface the
+    "needs anchor" status.
+
+    Default output: `data/corpus/<fmt>/derived/<source-slug>.txt`.
+    Format auto-detected from the source path's parent slug; --format
+    overrides for off-corpus inputs.
+
+    Provenance sidecar `data/corpus/<fmt>/derived/_meta.json` carries
+    `{output: {source_slug, source_path, source_origin, source_url,
+    derived_at, subs_pct, subs_acceptable, cards_substituted,
+    anchor_unfilled, missing_total, fillable, unfilled}}`. Re-runnable;
+    each invocation overwrites both the .txt and the matching sidecar
+    entry. Re-runs surface drift (e.g. new printings, freshly-collected
+    cards changing the candidate ranking).
+
+    derive raises subs_pct's ceiling: the goal is substitution, so a
+    20% rewrite cap (suggest-subs default) defeats the point. Default
+    here is 1.0 (no cap); override with --max-sub-pct if you want the
+    F2 fidelity floor enforced.
+    """
+    _warn_if_stale()
+    _warn_if_collection_stale()
+
+    deck_path = Path(args.deck)
+    if not deck_path.exists():
+        print(f"deck file not found: {deck_path}", file=sys.stderr)
+        return 2
+
+    inferred_fmt = _format_from_corpus_path(deck_path)
+    fmt = (args.format or inferred_fmt or "").lower()
+    if not fmt:
+        print(
+            f"could not infer format from {deck_path} (not under "
+            f"data/corpus/<fmt>/); pass --format explicitly",
+            file=sys.stderr,
+        )
+        return 2
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.max_per_card < 1:
+        print("--max-per-card must be >= 1", file=sys.stderr)
+        return 2
+    if not (0.0 <= args.max_sub_pct <= 1.0):
+        print("--max-sub-pct must be between 0.0 and 1.0", file=sys.stderr)
+        return 2
+
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    idx = _load_index()
+
+    result = _run_suggest_subs(
+        deck_path, fmt, idx, snap, args.max_per_card,
+        quiet=True,
+        anchor_check=True,
+        max_sub_pct=args.max_sub_pct,
+        strictlybetter=not args.no_strictlybetter,
+    )
+
+    entries = parse_deck(deck_path)
+    is_brawl = fmt in BRAWL_FORMATS
+    new_entries = _apply_subs_to_entries(
+        entries, result["missing"], idx, is_brawl,
+    )
+
+    out_path = (
+        Path(args.out) if args.out
+        else CORPUS / fmt / "derived" / f"{deck_path.stem}.txt"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_mtga_export(out_path, new_entries)
+
+    sidecar_path = out_path.parent / "_meta.json"
+    sidecar: dict[str, dict] = {}
+    if sidecar_path.exists():
+        try:
+            existing = json.loads(sidecar_path.read_text())
+            if isinstance(existing, dict):
+                sidecar = existing
+        except (OSError, json.JSONDecodeError):
+            pass
+    src_meta = _load_deck_meta(deck_path)
+    sidecar[out_path.name] = {
+        "source_slug": deck_path.stem,
+        "source_path": str(deck_path),
+        "source_origin": src_meta.get("source"),
+        "source_url": src_meta.get("url"),
+        "derived_at": time.strftime("%Y-%m-%d", time.gmtime()),
+        "subs_pct": result["subs_pct"],
+        "subs_acceptable": result["subs_acceptable"],
+        "cards_substituted": result["cards_substituted"],
+        "anchor_unfilled": result["summary"]["anchor_unfilled"],
+        "missing_total": result["summary"]["missing_cards"],
+        "fillable": result["summary"]["fillable"],
+        "unfilled": result["summary"]["unfilled"],
+    }
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True) + "\n"
+    )
+
+    payload = {
+        "source": str(deck_path),
+        "derived": str(out_path),
+        "format": fmt,
+        "subs_pct": result["subs_pct"],
+        "subs_acceptable": result["subs_acceptable"],
+        "cards_substituted": result["cards_substituted"],
+        "anchor_unfilled": result["summary"]["anchor_unfilled"],
+        "missing_total": result["summary"]["missing_cards"],
+        "fillable": result["summary"]["fillable"],
+        "unfilled": result["summary"]["unfilled"],
+    }
+    if args.json:
+        _emit_json(payload)
+        return 0
+
+    print(f"derived {deck_path.name} -> {out_path}")
+    print(
+        f"  subs_pct={result['subs_pct'] * 100:.1f}%  "
+        f"acceptable={result['subs_acceptable']}  "
+        f"substituted={result['cards_substituted']}  "
+        f"anchors_missing={result['summary']['anchor_unfilled']}/"
+        f"{result['summary']['missing_cards']}"
+    )
     return 0
 
 
@@ -7134,6 +7393,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_recommend)
+
+    s = sub.add_parser(
+        "derive",
+        help="rewrite a corpus deck with owned substitutions "
+             "(per-slot top suggest-subs candidate); writes to "
+             "data/corpus/<fmt>/derived/<slug>.txt by default",
+    )
+    s.add_argument("deck", help="source MTGA-export .txt (typically under data/corpus/<fmt>/)")
+    s.add_argument(
+        "-f", "--format", default=None,
+        help=(
+            "Arena format (auto-inferred when deck lives under "
+            "data/corpus/<fmt>/; required otherwise)"
+        ),
+    )
+    s.add_argument(
+        "--out", default=None, metavar="PATH",
+        help="output path (default: data/corpus/<fmt>/derived/<source-slug>.txt)",
+    )
+    s.add_argument(
+        "--max-per-card", type=int, default=5, metavar="N",
+        help="suggest-subs candidate pool size per missing slot (default: 5)",
+    )
+    s.add_argument(
+        "--max-sub-pct", type=float, default=1.0, metavar="N",
+        help=(
+            "F2 sub-fidelity floor (0.0-1.0). Default 1.0 (no cap) since "
+            "derive's job *is* substitution; pass a lower value to enforce "
+            "the suggest-subs fidelity ceiling."
+        ),
+    )
+    s.add_argument(
+        "--no-strictlybetter", action="store_true",
+        help="skip strictlybetter.eu lookup (offline; pure heuristic ranking)",
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_derive)
 
     args = p.parse_args(argv)
     return args.func(args)
