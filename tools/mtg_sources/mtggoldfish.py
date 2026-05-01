@@ -209,7 +209,7 @@ def parse_mtggoldfish(
         except urllib.error.URLError:
             continue
 
-        entries = _entries_from_archetype_page(arch_html, resolve_name)
+        entries, unresolved = _entries_from_archetype_page(arch_html, resolve_name)
         if not entries:
             # Drift: archetype page rendered but no parseable cards.
             continue
@@ -229,6 +229,7 @@ def parse_mtggoldfish(
             sample=sample,
             fetched=fetched,
             entries=entries,
+            unresolved=unresolved,
         ))
 
     return decks
@@ -236,20 +237,22 @@ def parse_mtggoldfish(
 
 def _entries_from_archetype_page(
     arch_html: str, resolve_name: Callable[[str], dict | None],
-) -> list[DeckEntry]:
-    """Extract DeckEntry list from a `/archetype/<slug>` page.
+) -> tuple[list[DeckEntry], int]:
+    """Extract (DeckEntry list, dropped-copies count) from `/archetype/<slug>`.
 
     Pulls the hidden `deck_input[deck]` form field, splits on the
     literal `sideboard` line (lowercase, mtggoldfish-specific), and
     resolves each `<count> <name>` row through `resolve_name`. Cards
     that don't resolve to a Scryfall printing are dropped — emitting a
     deck-line MTGA would reject on import is worse than emitting a
-    short deck.
+    short deck — and the dropped copy count is returned so cmd_fetch_meta
+    can surface it via the sidecar.
     """
     out: list[DeckEntry] = []
+    unresolved = 0
     m = _DECK_INPUT_RE.search(arch_html)
     if not m:
-        return out
+        return out, unresolved
 
     body = html.unescape(m.group(1))
     section = "deck"
@@ -277,10 +280,12 @@ def _entries_from_archetype_page(
         if printing is None:
             # Card name didn't resolve — skip rather than emit a
             # deck-line MTGA would reject on import.
+            unresolved += count
             continue
         set_code = (printing.get("set") or "").upper()
         collector = printing.get("collector_number") or ""
         if not set_code or not collector:
+            unresolved += count
             continue
         out.append(DeckEntry(
             count=count,
@@ -289,4 +294,4 @@ def _entries_from_archetype_page(
             collector=collector,
             section=section,
         ))
-    return out
+    return out, unresolved

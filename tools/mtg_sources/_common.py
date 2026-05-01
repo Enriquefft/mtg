@@ -109,6 +109,11 @@ class ParsedDeck:
     `fetched`  ISO date (YYYY-MM-DD) the page was scraped.
     `entries`  list of `DeckEntry` in source order; commander/sideboard
                sections set via `DeckEntry.section`.
+    `unresolved` count of card lines the source listed but that did not
+               resolve to a Scryfall printing — surfaced through the
+               sidecar so a deck imported short (e.g. 56/60) is visible
+               instead of silently corrupted. Per-card stderr would be
+               noisy across a 30-deck fetch; one integer is enough.
     """
 
     slug: str
@@ -120,6 +125,7 @@ class ParsedDeck:
     sample: int | None
     fetched: str
     entries: list[DeckEntry] = field(default_factory=list)
+    unresolved: int = 0
 
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")

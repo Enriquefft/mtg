@@ -294,7 +294,20 @@ def _load_index() -> dict:
     return _INDEX
 
 
+_STALE_WARNED: bool = False
+
+
 def _warn_if_stale(max_age_h: float = 36.0) -> None:
+    """Warn once per process if the bulk cache is older than `max_age_h`.
+
+    Idempotent within a single CLI invocation. `cmd_check` runs five
+    sub-commands in sequence, each of which calls this at the top; without
+    the latch the user sees five identical warnings. Latching here is
+    simpler than threading a flag through every `cmd_*` helper.
+    """
+    global _STALE_WARNED
+    if _STALE_WARNED:
+        return
     if not META_JSON.exists():
         return
     meta = json.loads(META_JSON.read_text())
@@ -308,6 +321,9 @@ def _warn_if_stale(max_age_h: float = 36.0) -> None:
             f"[warn] local bulk is {age_h:.1f}h old; consider `mtg sync`",
             file=sys.stderr,
         )
+    # Latch even when not stale — the staleness verdict won't change
+    # mid-run, so re-checking on every cmd_* call is wasted file IO.
+    _STALE_WARNED = True
 
 
 # ---------- name normalization -------------------------------------------
@@ -2463,7 +2479,7 @@ def cmd_own(args: argparse.Namespace) -> int:
     if snap is None:
         sys.exit(_empty_state_message().rstrip())
     idx = _load_index()
-    name_lc = _normalize_name(args.name).lower()
+    name_lc = _normalize_name(args.name)
     printings = idx["by_name"].get(name_lc) or []
     if not printings:
         sys.exit(f"unknown card: {args.name}")
@@ -2578,7 +2594,7 @@ def _resolve_deck_card(idx: dict, e: DeckEntry) -> dict | None:
     card = idx["by_printing"].get((e.set_code.lower(), e.collector))
     if card:
         return card
-    candidates = idx["by_name"].get(_normalize_name(e.name).lower()) or []
+    candidates = idx["by_name"].get(_normalize_name(e.name)) or []
     if candidates:
         return candidates[0]
     return None
@@ -2758,6 +2774,8 @@ def _run_suggest_subs(
     idx: dict,
     snap: dict,
     max_per_card: int = 5,
+    *,
+    quiet: bool = False,
 ) -> dict:
     """Pure-compute core of `suggest-subs`.
 
@@ -2765,6 +2783,12 @@ def _run_suggest_subs(
     derives text output and `--apply` rewrites from this same dict, so the
     CLI surface and any internal caller (e.g. `coverage --with-subs`) see
     identical scoring.
+
+    `quiet=True` suppresses the per-candidate `[warn] dropping
+    game-changer ...` stderr line. JSON-emitting callers
+    (`coverage --batch --with-subs --json`, `suggest-subs --json`) pass
+    `quiet=True` so machine-readable output isn't polluted by per-deck
+    candidate noise; the human text path leaves the warning visible.
 
     Caller is responsible for:
       - calling `_warn_if_stale()` / `_warn_if_collection_stale()`
@@ -2880,12 +2904,13 @@ def _run_suggest_subs(
                 continue
             cand_game_changer = bool(c.get("game_changer"))
             if is_brawl and cand_game_changer and not miss_game_changer:
-                print(
-                    f"[warn] dropping game-changer candidate "
-                    f"{cand_display!r} for non-game-changer slot "
-                    f"{miss_name!r}",
-                    file=sys.stderr,
-                )
+                if not quiet:
+                    print(
+                        f"[warn] dropping game-changer candidate "
+                        f"{cand_display!r} for non-game-changer slot "
+                        f"{miss_name!r}",
+                        file=sys.stderr,
+                    )
                 continue
             score = _suggest_subs_score(
                 c, cand_roles, miss_roles, miss_cmc, _is_rare_role
@@ -2993,7 +3018,10 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         sys.exit(_empty_state_message().rstrip())
     idx = _load_index()
 
-    result = _run_suggest_subs(deck_path, fmt, idx, snap, args.max_per_card)
+    result = _run_suggest_subs(
+        deck_path, fmt, idx, snap, args.max_per_card,
+        quiet=getattr(args, "json", False),
+    )
     json_missing = result["missing"]
     summary = result["summary"]
     missing_count = summary["missing_cards"]
@@ -3167,6 +3195,8 @@ def _coverage_with_subs_pct(
     snap: dict,
     total_have: int,
     total_need: int,
+    *,
+    quiet: bool = False,
 ) -> float:
     """Re-run suggest-subs and fold filled deficits into coverage.
 
@@ -3174,10 +3204,14 @@ def _coverage_with_subs_pct(
     `filled_deficit` only counts slots that have at least one candidate
     (top-scored candidate fills the slot). Slots with zero candidates
     keep their deficit unfilled.
+
+    `quiet` is forwarded to `_run_suggest_subs` so the per-candidate
+    `[warn] dropping game-changer ...` stderr noise stays out of
+    `coverage --batch --with-subs --json` output.
     """
     if total_need == 0:
         return 1.0
-    result = _run_suggest_subs(deck_path, fmt, idx, snap)
+    result = _run_suggest_subs(deck_path, fmt, idx, snap, quiet=quiet)
     filled = 0
     for slot in result["missing"]:
         if slot["candidates"]:
@@ -3222,9 +3256,16 @@ def _coverage_row(
     owned: dict[str, dict],
     with_subs: bool,
     fallback_warn: list[bool],
+    *,
+    quiet: bool = False,
 ) -> dict:
     """Compute one batch-mode row. Mutates fallback_warn[0] -> True
-    when this deck's parent dir is not in ARENA_FORMATS."""
+    when this deck's parent dir is not in ARENA_FORMATS.
+
+    `quiet` is forwarded to the suggest-subs sub-call so JSON-output
+    callers don't emit the per-candidate game-changer stderr line for
+    each deck in the batch.
+    """
     parent = deck_path.parent.name
     fmt = parent if parent in ARENA_FORMATS else "brawl"
     if parent and parent not in ARENA_FORMATS:
@@ -3249,6 +3290,7 @@ def _coverage_row(
     if with_subs:
         with_subs_pct = _coverage_with_subs_pct(
             deck_path, fmt, idx, snap, total_have, total_need,
+            quiet=quiet,
         )
 
     meta = _load_deck_meta(deck_path)
@@ -3369,7 +3411,10 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     rows: list[dict] = []
     for path in deck_paths:
         rows.append(
-            _coverage_row(path, idx, snap, owned, args.with_subs, fallback_warn)
+            _coverage_row(
+                path, idx, snap, owned, args.with_subs, fallback_warn,
+                quiet=args.json,
+            )
         )
 
     if fallback_warn[0]:
@@ -3999,6 +4044,12 @@ def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
             "fetched": d.fetched,
             "archetype": d.archetype,
             "url": d.url,
+            # Number of source-listed copies the parser couldn't resolve to
+            # a Scryfall printing — the deck file is short by this much.
+            # Surfaced here (not stderr-only) so a later `validate` /
+            # `coverage` run can see why the deck has < 60/100 cards
+            # without re-running the fetch.
+            "unresolved": d.unresolved,
         }
 
     meta_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
@@ -4008,13 +4059,18 @@ def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
 def cmd_fetch_meta(args: argparse.Namespace) -> int:
     """Scrape a meta source into a directory of MTGA-export deck files.
 
-    Hard-fail policy (production-ready floor — any of these = exit 1,
-    nothing written to --out):
-      * unknown / deferred source;
-      * unsupported format for the chosen source;
-      * HTTP non-200;
-      * parser returns zero decks from a 200 page (= schema drift);
-      * resolution failures that would leave `--out` empty.
+    Hard-fail policy (production-ready floor — nothing written to --out):
+
+      Exit 2 (user error — caller asked for an impossible run):
+        * unknown / deferred source;
+        * unsupported format for any source;
+        * source does not publish a tier list for the chosen format
+          (e.g. mtggoldfish + brawl).
+
+      Exit 1 (runtime / source-side failure):
+        * HTTP non-200;
+        * parser returns zero decks from a 200 page (= schema drift);
+        * resolution failures that would leave `--out` empty.
     """
     source = args.source
     if source in _FETCH_META_DEFERRED_SOURCES:
@@ -4043,7 +4099,11 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             f"{source} does not publish a tier list for format {fmt!r}",
             file=sys.stderr,
         )
-        return 1
+        # Exit 2 (user error) — caller picked a (source, format) pair the
+        # source provably can't satisfy. Mirrors the unknown-source /
+        # unsupported-format branches above. Exit 1 stays reserved for
+        # runtime / source-side failures (HTTP, drift, zero-deck-parse).
+        return 2
 
     _warn_if_stale()
     fetched = time.strftime("%Y-%m-%d", time.gmtime())
@@ -4081,6 +4141,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     )
     sidecar = _write_meta_corpus(decks, out_dir)
 
+    total_dropped = sum(d.unresolved for d in decks)
+
     if args.json:
         print(json.dumps({
             "source": source,
@@ -4089,6 +4151,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "fetched": fetched,
             "out": str(out_dir),
             "deck_count": len(decks),
+            "unresolved_total": total_dropped,
             "decks": [
                 {
                     "slug": d.slug,
@@ -4099,6 +4162,10 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
                     "sideboard": sum(
                         e.count for e in d.entries if e.section == "sideboard"
                     ),
+                    # Source-listed copies the parser couldn't resolve
+                    # to a Scryfall printing — the deck file is short
+                    # by this much. >0 signals a partial import.
+                    "unresolved": d.unresolved,
                 }
                 for d in decks
             ],
@@ -4112,14 +4179,30 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     print(f"decks  : {len(decks)}")
     print(f"sidecar: {len(sidecar)} total entries")
     print()
-    print(f"{'tier':<4}  {'main':>4}  {'sb':>3}  {'slug':<32}  archetype")
-    print("-" * 78)
+    # `drop` column shows per-deck dropped-copy count from `ParsedDeck.unresolved`
+    # — copies the source listed but the parser couldn't resolve. > 0 means the
+    # written deck file is short by that many cards (e.g. 56/60); a footer warning
+    # surfaces the run-wide total so the operator sees corpus-level drift.
+    print(f"{'tier':<4}  {'main':>4}  {'sb':>3}  {'drop':>4}  {'slug':<32}  archetype")
+    print("-" * 84)
     for d in decks:
         main_n = sum(e.count for e in d.entries if e.section == "deck")
         sb_n = sum(e.count for e in d.entries if e.section == "sideboard")
         print(
-            f"{d.tier or '-':<4}  {main_n:>4}  {sb_n:>3}  "
+            f"{d.tier or '-':<4}  {main_n:>4}  {sb_n:>3}  {d.unresolved:>4}  "
             f"{d.slug[:32]:<32}  {d.archetype}"
+        )
+    if total_dropped:
+        # Partial-import warning: deck files were written but are short
+        # by `total_dropped` copies. Surfaces as stderr so a downstream
+        # `validate` sees the same signal even if stdout is piped away.
+        print(
+            f"[warn] {total_dropped} card cop"
+            f"{'y' if total_dropped == 1 else 'ies'} unresolved across "
+            f"{sum(1 for d in decks if d.unresolved)} deck"
+            f"{'' if sum(1 for d in decks if d.unresolved) == 1 else 's'}; "
+            f"deck files are short by that much (see `drop` column).",
+            file=sys.stderr,
         )
     return 0
 

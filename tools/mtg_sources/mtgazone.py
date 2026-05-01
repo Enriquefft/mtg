@@ -34,8 +34,10 @@ across sources.
 Cards are not given with `(SET) NUM` — just the name. We resolve each
 name through the local Scryfall index (`resolve_name`) to fill
 `set_code`/`collector` so the output matches the rest of the CLI's
-DeckEntry contract. Resolution failures are reported up to the caller
-as schema drift (see `parse_mtgazone` raising on zero entries).
+DeckEntry contract. Per-card resolution failures bump the deck's
+`unresolved` counter (surfaced through `ParsedDeck.unresolved`) so a
+short import (e.g. 56/60) is visible to the user; only an *empty*
+deck-block is treated as schema drift.
 """
 
 from __future__ import annotations
@@ -261,7 +263,7 @@ def parse_mtgazone(
         seen_slugs[slug_base] = n
         slug = slug_base if n == 1 else f"{slug_base}-{n}"
 
-        entries = _entries_from_block(body, resolve_name)
+        entries, unresolved = _entries_from_block(body, resolve_name)
         if not entries:
             # Drift: deck-block with name but no parseable cards.
             continue
@@ -276,6 +278,7 @@ def parse_mtgazone(
             sample=None,
             fetched=fetched,
             entries=entries,
+            unresolved=unresolved,
         ))
 
     return decks
@@ -283,20 +286,22 @@ def parse_mtgazone(
 
 def _entries_from_block(
     body: str, resolve_name: Callable[[str], dict | None],
-) -> list[DeckEntry]:
-    """Extract DeckEntry list for one deck-block.
+) -> tuple[list[DeckEntry], int]:
+    """Extract DeckEntry list (and dropped-copies count) for one deck-block.
 
     Walks each `<div class="decklist …">` opener in order, slices to the
     next opener, extracts cards inside that slice. Section is derived
     from the class flavour. Cards whose names don't resolve to a
     Scryfall printing are dropped — we'd otherwise emit a deck file
-    that fails `validate`. Drop count is implicit; cmd_fetch_meta
-    surfaces zero-deck outcomes as schema drift.
+    that fails `validate` — and the dropped *copy* count (sum of
+    `data-quantity` for each unresolvable name) is returned alongside
+    the entries so cmd_fetch_meta can surface it via the sidecar.
     """
     out: list[DeckEntry] = []
+    unresolved = 0
     openers = list(_DECKLIST_OPEN_RE.finditer(body))
     if not openers:
-        return out
+        return out, unresolved
 
     bounds = [m.start() for m in openers] + [len(body)]
     for i, m in enumerate(openers):
@@ -314,10 +319,12 @@ def _entries_from_block(
             if printing is None:
                 # Cannot fill set/collector — skip rather than emit a
                 # deck-line MTGA would reject on import.
+                unresolved += count
                 continue
             set_code = (printing.get("set") or "").upper()
             collector = printing.get("collector_number") or ""
             if not set_code or not collector:
+                unresolved += count
                 continue
             out.append(DeckEntry(
                 count=count,
@@ -326,4 +333,4 @@ def _entries_from_block(
                 collector=collector,
                 section=section,
             ))
-    return out
+    return out, unresolved
