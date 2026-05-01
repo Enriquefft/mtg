@@ -5976,6 +5976,27 @@ _FETCH_META_INDEX_ACCEPT = {
     "moxfield": "application/json, text/plain, */*",
 }
 
+# Per-source default --limit. The headline use case ("find every viable
+# deck I can build") needs a deep corpus; sources that scale up cleanly
+# (moxfield's user-built universe, untapped's Arena pings) get
+# format-appropriate defaults so a fresh `fetch-meta` produces a usable
+# pool without the user having to know per-source ceilings. Sources
+# whose natural ceiling is small (mtgazone/mtggoldfish/mtgdecks tier
+# lists run ~30 archetypes total) stay `None` so we take everything.
+# aetherhub's index hard-caps at 50 archetypes; matching the ceiling
+# keeps the help text honest. Wall-clock cost (per format, fresh):
+# moxfield 300 * 0.6s ~= 3min; aetherhub 50 * 0.5s ~= 25s; untapped
+# walk dominated by SPA-page latency, not deck count. User can always
+# override with --limit explicitly (incl. --limit 0 to disable the cap).
+_FETCH_META_DEFAULT_LIMIT: dict[str, int | None] = {
+    "aetherhub": 50,
+    "moxfield": 300,
+    "untapped": 250,
+    "mtgazone": None,
+    "mtggoldfish": None,
+    "mtgdecks": None,
+}
+
 
 def _meta_cache_path(source: str, url: str) -> Path:
     """Where to stash the raw HTML for `(source, url)`.
@@ -6200,11 +6221,20 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     # of fetching everything just to have `decks[:limit]` slice it
     # down post-parse. Every parser's signature accepts (and ignores
     # if not useful) `limit` via `**_` — see mtg_sources/*.py.
+    #
+    # Default-limit resolution: explicit user input wins (incl. 0 =
+    # no cap). Otherwise fall back to per-source defaults so a fresh
+    # `fetch-meta` produces a deep-enough corpus without the user
+    # knowing each source's natural ceiling.
+    if args.limit is not None:
+        effective_limit = args.limit
+    else:
+        effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
     try:
         decks = parse_fn(
             html_text, fmt,
             fetched=fetched, url=url, resolve_name=_resolve_card,
-            limit=args.limit,
+            limit=effective_limit,
         )
     except ValueError as e:
         print(f"parser drift on {url}: {e}", file=sys.stderr)
@@ -6241,8 +6271,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     dedup_dropped = len(dedup_dropped_decks)
     _evict_corpus_slugs(out_dir, evicted)
 
-    if args.limit is not None and args.limit > 0:
-        decks = decks[: args.limit]
+    if effective_limit is not None and effective_limit > 0:
+        decks = decks[:effective_limit]
 
     sidecar = _write_meta_corpus(decks, out_dir)
 
@@ -7049,7 +7079,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--limit", type=int, default=None, metavar="N",
-        help="cap deck count after parsing (default: all)",
+        help=(
+            "cap deck count after parsing. If omitted, uses the "
+            "per-source default (aetherhub=50, moxfield=300, "
+            "untapped=250; mtgazone/mtggoldfish/mtgdecks=all). "
+            "Pass --limit 0 to disable the cap entirely."
+        ),
     )
     s.add_argument(
         "--json", action="store_true",
