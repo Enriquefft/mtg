@@ -4493,6 +4493,7 @@ def _coverage_with_subs_pct(
                 "anchor_unfilled": 0,
                 "anchor_total": 0,
                 "non_basic_main": 0,
+                "strictlybetter_owned_reprints": 0,
             })
         return 1.0
     owned_pct = total_have / total_need
@@ -4508,6 +4509,7 @@ def _coverage_with_subs_pct(
                 "anchor_unfilled": 0,    # ditto
                 "anchor_total": 0,       # ditto
                 "non_basic_main": 0,     # ditto
+                "strictlybetter_owned_reprints": 0,  # ditto — short-circuit didn't enumerate slots
                 "short_circuited": True,  # signal to consumers that detail is not available
             })
         return owned_pct
@@ -4516,6 +4518,16 @@ def _coverage_with_subs_pct(
     )
     if out is not None:
         summary = result.get("summary") or {}
+        # Strictlybetter count = missing slots whose top candidates
+        # include at least one functional reprint / community-validated
+        # upgrade the user already owns. `recommend` surfaces this so
+        # Claude can prioritize decks where the "missing" cards are
+        # effectively present via owned reprints.
+        sb_reprints = sum(
+            1 for slot in (result.get("missing") or [])
+            if not slot.get("anchor")
+            and any(c.get("strictlybetter") for c in (slot.get("candidates") or []))
+        )
         out.update({
             "subs_acceptable": bool(result.get("subs_acceptable", True)),
             "subs_pct": float(result.get("subs_pct") or 0.0),
@@ -4523,6 +4535,7 @@ def _coverage_with_subs_pct(
             "anchor_unfilled": int(summary.get("anchor_unfilled") or 0),
             "anchor_total": len(result.get("anchors") or []),
             "non_basic_main": int(result.get("non_basic_main") or 0),
+            "strictlybetter_owned_reprints": sb_reprints,
         })
     if not result.get("subs_acceptable", True):
         return owned_pct
@@ -4656,8 +4669,18 @@ def _coverage_row(
         row["anchor_unfilled"] = subs_meta["anchor_unfilled"]
         row["anchor_total"] = subs_meta["anchor_total"]
         row["non_basic_main"] = subs_meta["non_basic_main"]
+        row["strictlybetter_owned_reprints"] = subs_meta.get(
+            "strictlybetter_owned_reprints", 0,
+        )
         if subs_meta.get("short_circuited"):
             row["short_circuited"] = True
+    # Surface the gating list (name, short, rarity) so `_recommend_compute`
+    # can build the cross-deck `craft_priority` ranking + per-deck
+    # `craft_ladder` without re-running `_coverage_single` per row.
+    # Stripped before emit by `_recommend_compute` (private to that
+    # consumer; not part of the published `coverage --batch` schema).
+    row["_gating"] = gating_sorted
+    row["_total_need"] = total_need
     return row
 
 
@@ -6412,6 +6435,167 @@ def _recommend_build_status(row: dict, min_threshold: float) -> str:
     return "NEEDS_STAPLES"
 
 
+_RECOMMEND_ROLE_TAGS: tuple[str, ...] = (
+    "creature", "planeswalker", "artifact", "enchantment",
+    "instant", "sorcery", "battle", "land",
+    "removal", "sweeper", "counter", "hand_attack", "peek",
+    "card_advantage", "loot", "tutor", "ramp", "recursion",
+    "wincon", "threat",
+)
+
+
+def _deck_role_distribution(
+    deck_path: Path, idx: dict,
+) -> dict[str, int]:
+    """Per-role copy count for a single deck (commander+deck+sideboard).
+
+    Returns a dict keyed by `_RECOMMEND_ROLE_TAGS`. Missing tags map
+    to 0 so downstream cosine sim has a stable vector shape across
+    decks. Unresolved cards (not in idx) are skipped silently — they
+    can't contribute to a role distribution.
+    """
+    out: dict[str, int] = {tag: 0 for tag in _RECOMMEND_ROLE_TAGS}
+    for entry in parse_deck(deck_path):
+        if entry.section not in {"commander", "deck", "sideboard"}:
+            continue
+        card = _resolve_card(entry.name)
+        if card is None:
+            continue
+        for tag in classify_card(card):
+            if tag in out:
+                out[tag] += entry.count
+    return out
+
+
+def _corpus_median_role_distribution(
+    fmt: str, idx: dict,
+) -> dict[str, float]:
+    """Per-role median across the format's corpus (top-level only).
+
+    Uses `_corpus_deck_files(fmt)` (no derived) so the baseline reflects
+    the source corpus, not the user's own derived variants. Returns
+    median-per-role, keyed by `_RECOMMEND_ROLE_TAGS`. Empty corpus =>
+    all-zero dict so cosine sim gracefully degrades to 0.0 for every
+    deck.
+    """
+    files = _corpus_deck_files(fmt)
+    if not files:
+        return {tag: 0.0 for tag in _RECOMMEND_ROLE_TAGS}
+    per_tag_counts: dict[str, list[int]] = {
+        tag: [] for tag in _RECOMMEND_ROLE_TAGS
+    }
+    for path in files:
+        dist = _deck_role_distribution(path, idx)
+        for tag, val in dist.items():
+            per_tag_counts[tag].append(val)
+    medians: dict[str, float] = {}
+    for tag, vals in per_tag_counts.items():
+        if not vals:
+            medians[tag] = 0.0
+            continue
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        mid = n // 2
+        if n % 2 == 1:
+            medians[tag] = float(vals_sorted[mid])
+        else:
+            medians[tag] = (vals_sorted[mid - 1] + vals_sorted[mid]) / 2.0
+    return medians
+
+
+def _role_cosine_similarity(
+    a: dict[str, float], b: dict[str, float],
+) -> float:
+    """Cosine similarity over the role-tag vector.
+
+    Returns 0.0 when either vector is all-zero (no role information ⇒
+    no signal). Tags missing from either dict are treated as 0.
+    """
+    keys = set(a) | set(b)
+    if not keys:
+        return 0.0
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for k in keys:
+        va = float(a.get(k) or 0.0)
+        vb = float(b.get(k) or 0.0)
+        dot += va * vb
+        norm_a += va * va
+        norm_b += vb * vb
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    import math
+    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+
+def _craft_ladder(
+    gating: list[tuple[str, int, str]],
+    total_need: int,
+    owned_pct: float,
+    max_steps: int = 5,
+) -> list[dict]:
+    """Cumulative craft path. Each step: pick the next missing card
+    (sorted by rarity desc, deficit desc, name asc), report cumulative
+    WC cost and `would_unlock_pct` (the resulting owned_pct after
+    crafting through that step).
+
+    Single-card ladder (one entry per step) — keeps the JSON small
+    and lets Claude decide whether to coalesce same-rarity steps.
+    """
+    if not gating or total_need <= 0:
+        return []
+    rungs: list[dict] = []
+    cum_cost = {"mythic": 0, "rare": 0, "uncommon": 0, "common": 0}
+    cum_filled = 0
+    for name, short, rarity in gating[:max_steps]:
+        if rarity in cum_cost:
+            cum_cost[rarity] += short
+        cum_filled += short
+        unlock_pct = round(
+            owned_pct + cum_filled / total_need, 4,
+        )
+        rungs.append({
+            "cards": [name],
+            "wc_cost": dict(cum_cost),
+            "would_unlock_pct": min(unlock_pct, 1.0),
+        })
+    return rungs
+
+
+def _craft_priority(
+    deck_rows: list[dict], max_cards: int = 20,
+) -> list[dict]:
+    """Top-level: sort missing cards by `decks_unlocked` desc.
+
+    For each card present in any deck's gating list, count how many
+    distinct decks are gated on it. WC cost = the card's rarity
+    (one wildcard per copy needed across all gated decks; the per-deck
+    deficit collapses to a single craft once you craft to 4-of /
+    1-of in your collection).
+
+    `decks_unlocked` is the more useful signal for crafting decisions
+    than raw copies needed, since the same craft (e.g. one Sheoldred)
+    unlocks many decks at once.
+    """
+    decks_per_card: dict[str, dict] = {}
+    for row in deck_rows:
+        for name, _short, rarity in row.get("_gating") or []:
+            entry = decks_per_card.setdefault(
+                name, {"card": name, "rarity": rarity, "decks_unlocked": 0},
+            )
+            entry["decks_unlocked"] += 1
+    ranked = sorted(
+        decks_per_card.values(),
+        key=lambda r: (
+            -r["decks_unlocked"],
+            -_RARITY_ORDER.get(r["rarity"], 0),
+            r["card"],
+        ),
+    )
+    return ranked[:max_cards]
+
+
 def _recommend_compute(
     args: argparse.Namespace,
 ) -> tuple[dict, list[dict], list[dict]]:
@@ -6445,6 +6629,12 @@ def _recommend_compute(
     idx = _load_index()
     owned = _aggregate_by_name(idx, _cards_owned(snap))
 
+    # Corpus role baseline for `role_match_score` — computed once per
+    # run, off the source-of-truth corpus only (derived decks excluded
+    # so a user's prior derive runs can't pull the median toward their
+    # own choices). Empty corpus => zero vector; cosine returns 0.0.
+    corpus_role_median = _corpus_median_role_distribution(fmt, idx)
+
     deck_rows: list[dict] = []
     if deck_paths:
         fallback_warn = [False]
@@ -6458,6 +6648,25 @@ def _recommend_compute(
                 include_subs_meta=True,
             )
             row["build_status"] = _recommend_build_status(row, min_threshold)
+            # Per-deck role distribution + cosine vs corpus median.
+            # Surfaces structurally-outlier decks (e.g. "no creatures",
+            # "all sweepers") so Claude can flag novelty vs convention.
+            deck_dist = _deck_role_distribution(path, idx)
+            row["role_match_score"] = round(
+                _role_cosine_similarity(deck_dist, corpus_role_median), 4,
+            )
+            # Per-deck incremental craft path (top 5 entries; cumulative
+            # WC + would_unlock_pct). Built off the gating list cached
+            # on the row by `_coverage_row`.
+            row["craft_ladder"] = _craft_ladder(
+                row.get("_gating") or [],
+                int(row.get("_total_need") or 0),
+                float(row.get("owned_pct") or 0.0),
+                max_steps=5,
+            )
+            # `--format all` cross-format unlock count is out of scope
+            # for this revision; emit None so the JSON schema is stable.
+            row["cross_format_unlock"] = None
             deck_rows.append(row)
 
     # Filter: drop decks where neither owned nor sub-pct are anywhere
@@ -6476,40 +6685,53 @@ def _recommend_compute(
     capped = filtered[:top_n]
 
     buildable_count = sum(1 for r in capped if r["build_status"] == "BUILDABLE")
-    want_shells = bool(getattr(args, "include_shells", False)) or (
-        buildable_count < 3
-    )
 
+    # Top-level craft priority — computed off the full filtered set
+    # (not just `capped`) so the ranking still reflects which crafts
+    # unlock the deepest pool of buildable decks across the corpus,
+    # not just whatever made the --top cutoff.
+    craft_priority = _craft_priority(filtered, max_cards=20)
+
+    # Shells are emitted unconditionally. Cheap to compute (set
+    # intersections over owned cards), and the shell -> archetype
+    # bridge is signal even when buildable count is high (it surfaces
+    # novel-deck shells the corpus doesn't have a deck for yet).
     shell_rows: list[dict] = []
-    if want_shells:
-        cards_owned = _cards_owned(snap)
-        clusters = _shell_cluster_rows(
-            idx, cards_owned, fmt,
-            by="keyword",
-            min_cards=15 if fmt in BRAWL_FORMATS else 24,
-            top_anchors=10,
-        )
-        archetype_anchors = _load_archetype_anchors(fmt)
-        freq_index = _load_freq_index(fmt, rebuild_if_stale=False)
-        if freq_index is None or not (freq_index.get("cards") or {}):
-            freq_index = None
-        for cl in clusters:
-            shell_names = cl.get("_card_names") or set()
-            matches = (
-                _shell_corpus_matches(
-                    shell_names, archetype_anchors, freq_index,
-                    min_pct=0.30, min_count=5,
-                )
-                if archetype_anchors else []
+    cards_owned = _cards_owned(snap)
+    clusters = _shell_cluster_rows(
+        idx, cards_owned, fmt,
+        by="keyword",
+        min_cards=15 if fmt in BRAWL_FORMATS else 24,
+        top_anchors=10,
+    )
+    archetype_anchors = _load_archetype_anchors(fmt)
+    freq_index = _load_freq_index(fmt, rebuild_if_stale=False)
+    if freq_index is None or not (freq_index.get("cards") or {}):
+        freq_index = None
+    for cl in clusters:
+        shell_names = cl.get("_card_names") or set()
+        matches = (
+            _shell_corpus_matches(
+                shell_names, archetype_anchors, freq_index,
+                min_pct=0.30, min_count=5,
             )
-            if not matches:
-                continue
-            shell_rows.append({
-                "cluster_key": cl["key"],
-                "owned_count": cl["count"],
-                "anchors": cl["anchors"],
-                "matches": matches,
-            })
+            if archetype_anchors else []
+        )
+        if not matches:
+            continue
+        shell_rows.append({
+            "cluster_key": cl["key"],
+            "owned_count": cl["count"],
+            "anchors": cl["anchors"],
+            "matches": matches,
+        })
+
+    # Strip private fields before emit — `_gating` / `_total_need` were
+    # only carried so `_craft_ladder` and `_craft_priority` could share
+    # the gating computation done by `_coverage_row`.
+    for r in capped:
+        r.pop("_gating", None)
+        r.pop("_total_need", None)
 
     meta = {
         "format": fmt,
@@ -6519,11 +6741,7 @@ def _recommend_compute(
         "corpus_size": len(deck_paths),
         "decks_considered": len(deck_rows),
         "buildable_count": buildable_count,
-        "shells_emitted": bool(shell_rows),
-        "shells_reason": (
-            "include_shells" if getattr(args, "include_shells", False)
-            else ("fallback" if buildable_count < 3 else "none")
-        ),
+        "craft_priority": craft_priority,
     }
     return meta, capped, shell_rows
 
@@ -6587,26 +6805,31 @@ def _print_recommend_text(
             print(advice)
             print()
 
-    why = meta.get("shells_reason")
-    if shells or why in {"include_shells", "fallback"}:
-        suffix = (
-            "" if why == "include_shells"
-            else "  (auto-shown: < 3 BUILDABLE decks)"
+    print("=== shell -> archetype bridge ===")
+    if not shells:
+        print("  (no clusters above match threshold)")
+    for s in shells:
+        match_strs = []
+        for m in s["matches"]:
+            pct = m["overlap_pct"] * 100
+            tier = m.get("tier") or "-"
+            match_strs.append(
+                f"{m['archetype']} [{tier}] {pct:.0f}% overlap"
+            )
+        print(
+            f"  [{s['cluster_key']}] ({s['owned_count']} owned cards)"
+            f" -> matches: {', '.join(match_strs)}"
         )
-        print(f"=== shell -> archetype bridge ==={suffix}")
-        if not shells:
-            print("  (no clusters above match threshold)")
-        for s in shells:
-            match_strs = []
-            for m in s["matches"]:
-                pct = m["overlap_pct"] * 100
-                tier = m.get("tier") or "-"
-                match_strs.append(
-                    f"{m['archetype']} [{tier}] {pct:.0f}% overlap"
-                )
+
+    cp = meta.get("craft_priority") or []
+    if cp:
+        print()
+        print("=== craft priority (unlocks across corpus) ===")
+        for entry in cp[:10]:
             print(
-                f"  [{s['cluster_key']}] ({s['owned_count']} owned cards)"
-                f" -> matches: {', '.join(match_strs)}"
+                f"  {entry['card'][:36]:<36} "
+                f"unlocks {entry['decks_unlocked']:>3} decks  "
+                f"({entry['rarity']})"
             )
 
 
@@ -6705,7 +6928,7 @@ def cmd_recommend(args: argparse.Namespace) -> int:
             "corpus_size": meta["corpus_size"],
             "decks_considered": meta["decks_considered"],
             "buildable_count": meta["buildable_count"],
-            "shells_reason": meta["shells_reason"],
+            "craft_priority": meta.get("craft_priority") or [],
             "decks": decks,
             "shells": shells,
         })
