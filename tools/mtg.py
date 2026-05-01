@@ -4637,6 +4637,10 @@ def _coverage_row(
     meta = _load_deck_meta(deck_path)
     tier_raw = meta.get("tier")
     tier = tier_raw if isinstance(tier_raw, str) and tier_raw else None
+    source_raw = meta.get("source")
+    source_origin = source_raw if isinstance(source_raw, str) and source_raw else None
+    winrate_raw = meta.get("winrate")
+    winrate = winrate_raw if isinstance(winrate_raw, (int, float)) else None
 
     tier_w = _tier_weight(tier)
     # Composite score: tier_weight * (with_subs_pct if --with-subs and
@@ -4654,6 +4658,8 @@ def _coverage_row(
         "archetype": deck_path.stem,
         "tier": tier,
         "tier_weight": tier_w,
+        "source": source_origin,
+        "winrate": winrate,
         "owned_pct": round(owned_pct, 4),
         "missing_wc": wc,
         "with_subs_pct": (
@@ -5120,6 +5126,53 @@ def _compute_freq_index(fmt: str) -> dict:
 
 def _freq_index_path(fmt: str) -> Path:
     return CORPUS / fmt / "_freq.json"
+
+
+_CORPUS_TTL_DAYS = 14
+
+
+def _warn_if_corpus_stale(fmt: str) -> None:
+    """Stderr warning when the corpus sidecar's newest `fetched` date
+    is more than `_CORPUS_TTL_DAYS` old.
+
+    Reads the per-deck `fetched: YYYY-MM-DD` strings in the meta.json
+    sidecar (not file mtimes — those bump on derive/invent runs). Two-
+    week TTL because Arena's ladder shifts on roughly that cadence with
+    each new set release; older corpora silently bias the recommend
+    ranking toward last cycle's tier list.
+    """
+    sidecar = CORPUS / fmt / "meta.json"
+    if not sidecar.exists():
+        return
+    try:
+        data = json.loads(sidecar.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict) or not data:
+        return
+    newest: str | None = None
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        fetched = entry.get("fetched")
+        if isinstance(fetched, str) and (newest is None or fetched > newest):
+            newest = fetched
+    if newest is None:
+        return
+    try:
+        fetched_dt = _dt.datetime.strptime(newest, "%Y-%m-%d").replace(
+            tzinfo=_dt.timezone.utc,
+        )
+    except ValueError:
+        return
+    age_days = (_dt.datetime.now(_dt.timezone.utc) - fetched_dt).days
+    if age_days > _CORPUS_TTL_DAYS:
+        print(
+            f"[warn] corpus for {fmt} is {age_days} days old "
+            f"(newest fetch {newest}, TTL {_CORPUS_TTL_DAYS}d); "
+            f"consider tools/mtg fetch-meta {fmt} --no-cache",
+            file=sys.stderr,
+        )
 
 
 def _freq_index_is_stale(fmt: str) -> bool:
@@ -6297,6 +6350,22 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     decks = [d for d in decks if not _common.is_stub_deck(d, _resolve_card)]
     stub_dropped = pre_stub - len(decks)
 
+    # Quality gate: source-published winrate floor. Only filters decks
+    # that carry a winrate (untapped, aetherhub); decks without a
+    # winrate signal are kept (the gate is opt-in per fetch — caller
+    # should not switch to a winrate-less source and expect this to
+    # do anything).
+    winrate_dropped = 0
+    if args.min_winrate is not None:
+        floor = args.min_winrate
+        kept: list[_common.ParsedDeck] = []
+        for d in decks:
+            if d.winrate is not None and d.winrate < floor:
+                winrate_dropped += 1
+                continue
+            kept.append(d)
+        decks = kept
+
     out_dir = Path(args.out) if args.out else (
         CORPUS / fmt
     )
@@ -6330,6 +6399,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "deck_count": len(decks),
             "unresolved_total": total_dropped,
             "stub_dropped": stub_dropped,
+            "winrate_dropped": winrate_dropped,
             "dedup_dropped": dedup_dropped,
             "evicted_existing": len(evicted),
             "decks": [
@@ -6360,6 +6430,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     print(f"decks  : {len(decks)}")
     if stub_dropped:
         print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
+    if winrate_dropped:
+        print(f"winrate: {winrate_dropped} dropped (< {args.min_winrate:.2%})")
     if dedup_dropped:
         print(f"dedup  : {dedup_dropped} fresh decks collapsed (cross-source)")
     if evicted:
@@ -6442,6 +6514,15 @@ _RECOMMEND_ROLE_TAGS: tuple[str, ...] = (
     "card_advantage", "loot", "tutor", "ramp", "recursion",
     "wincon", "threat",
 )
+
+# Sources that publish per-deck winrate signal — used by recommend's
+# --quality strict to gate on Arena-native tournament/match data instead
+# of curated user-built lists. Derived/invented decks bypass the gate
+# (they validate cleanly off the corpus and carry their own provenance).
+_RECOMMEND_STRICT_SOURCES: frozenset[str] = frozenset({
+    "untapped",
+    "aetherhub",
+})
 
 
 def _deck_role_distribution(
@@ -6681,6 +6762,21 @@ def _recommend_compute(
         r for r in deck_rows
         if (r["owned_pct"] + (r["with_subs_pct"] or 0.0)) >= cutoff
     ]
+    quality = getattr(args, "quality", "loose") or "loose"
+    quality_dropped = 0
+    if quality == "strict":
+        # Strict tier: sources that publish per-deck winrates (untapped,
+        # aetherhub) — high signal. Plus derived/invented decks (Claude-
+        # composed off the corpus) which carry their own provenance and
+        # validate cleanly. Everything else (user-built moxfield/
+        # archidekt, winrate-less scrapes) drops out.
+        pre = len(filtered)
+        filtered = [
+            r for r in filtered
+            if (r.get("source") in _RECOMMEND_STRICT_SOURCES)
+            or "/derived/" in r.get("deck", "")
+        ]
+        quality_dropped = pre - len(filtered)
     filtered.sort(key=lambda r: (-r["composite"], r["archetype"]))
     capped = filtered[:top_n]
 
@@ -6738,6 +6834,8 @@ def _recommend_compute(
         "min": round(min_threshold, 4),
         "top": top_n,
         "max_sub_pct": round(max_sub_pct, 4),
+        "quality": quality,
+        "quality_dropped": quality_dropped,
         "corpus_size": len(deck_paths),
         "decks_considered": len(deck_rows),
         "buildable_count": buildable_count,
@@ -6898,6 +6996,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
             print(msg, file=sys.stderr)
         return 0
 
+    _warn_if_corpus_stale(fmt)
+
     if _freq_index_is_stale(fmt):
         idx_path = _freq_index_path(fmt)
         if idx_path.exists():
@@ -6925,6 +7025,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
             "min": meta["min"],
             "top": meta["top"],
             "max_sub_pct": meta["max_sub_pct"],
+            "quality": meta.get("quality", "loose"),
+            "quality_dropped": meta.get("quality_dropped", 0),
             "corpus_size": meta["corpus_size"],
             "decks_considered": meta["decks_considered"],
             "buildable_count": meta["buildable_count"],
@@ -8081,6 +8183,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-cache", action="store_true",
         help="bypass the 24h on-disk HTML cache and re-fetch",
     )
+    s.add_argument(
+        "--min-winrate", type=float, default=None, metavar="P",
+        help=(
+            "drop decks whose source-published winrate is below P "
+            "(0.0-1.0). Only applies to sources that publish winrates "
+            "(untapped, aetherhub); decks without winrate metadata are "
+            "kept regardless. Recommended floor: 0.50."
+        ),
+    )
     s.set_defaults(func=cmd_fetch_meta)
 
     s = sub.add_parser(
@@ -8117,6 +8228,17 @@ def main(argv: list[str] | None = None) -> int:
             "F2 sub-fidelity floor: clamp with_subs_pct to owned_pct "
             "when more than N (0.0-1.0) of the deck would be substituted "
             "(default: 0.30 = 30%%)"
+        ),
+    )
+    s.add_argument(
+        "--quality", choices=("loose", "strict"), default="loose",
+        help=(
+            "deck-source quality gate. 'loose' (default) keeps every "
+            "corpus deck. 'strict' keeps only decks from sources that "
+            "publish per-deck winrates (untapped, aetherhub) plus "
+            "user-derived/invented decks under data/corpus/<fmt>/derived/. "
+            "Drops user-built lists from moxfield/archidekt and "
+            "winrate-less scrapes from mtgazone/mtggoldfish/mtgdecks."
         ),
     )
     _add_json_flag(s)
