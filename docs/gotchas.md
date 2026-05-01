@@ -4,12 +4,7 @@ These are non-obvious behaviors you'll trip over if you don't know them.
 
 ## 1. `legalities.brawl` = Historic Brawl on Arena
 
-Despite the name, Scryfall's `brawl` field tracks the 100-card singleton
-**Historic Brawl** format on Arena. Scryfall's `standardbrawl` is the
-Standard-pool variant.
-
-There is *no* `historicbrawl` key on Scryfall today (it used to exist, was
-removed after the formats consolidated).
+Format-name gotcha: see `docs/historic.md` §"Format-name gotcha".
 
 ## 2. A- prefix for Alchemy rebalanced cards
 

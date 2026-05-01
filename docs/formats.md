@@ -16,14 +16,7 @@ Format keys here match Scryfall's `legalities.<key>` field, which is what
 
 ## Naming gotcha
 
-Scryfall's **`brawl`** legality field corresponds to **Historic Brawl on
-Arena**, the 100-card singleton format. The format the user usually means
-when they say "brawl" in 2026.
-
-Scryfall's **`standardbrawl`** is the smaller Standard-pool brawl variant.
-
-So `mtg validate decks/hei-bai/v1.txt -f brawl` validates against Historic
-Brawl. There is no separate `historicbrawl` key on Scryfall today.
+Format-name gotcha: see `docs/historic.md` §"Format-name gotcha".
 
 ## Banned-as-commander
 

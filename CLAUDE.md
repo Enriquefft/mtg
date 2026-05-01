@@ -48,58 +48,71 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
    ```
    Type mix, function tags (removal/sweeper/counter/hand attack/peek/
    CA/loot/tutor/ramp/recursion/threat), curve, per-card table.
+   Sideboard: `--include-sideboard` / `--sideboard-only`.
 
-5. **For sister-card discovery** when the anchor uses a named mechanic:
+5. **For comparing two deck versions**:
+   ```bash
+   tools/mtg diff decks/<name>/v0.txt decks/<name>/v1.txt
+   ```
+   Per-card added / removed / delta between two MTGA-export files.
+
+6. **For sister-card discovery** when the anchor uses a named mechanic:
    ```bash
    tools/mtg related "<card>" -f <format>
    ```
    Every Arena-legal card sharing each keyword (rarer first). Use
    BEFORE drafting around a unique card.
 
-6. **For manabase / wildcard / companion checks**, every version:
+7. **For manabase / wildcard / companion checks**, every version:
    ```bash
    tools/mtg manabase  decks/<name>/<version>.txt   # pip demand + sources + etb-tapped
    tools/mtg wildcards decks/<name>/<version>.txt   # rarity counts (MTGA WC cost)
    tools/mtg companion decks/<name>/<version>.txt   # eligibility per companion
    ```
+   - One-shot: `tools/mtg check decks/<name>/<version>.txt -f brawl` runs
+     validate + analyze + manabase + wildcards + companion in one go (add
+     `--collection` to also run `gaps`).
 
-7. **For ad-hoc commander/staple discovery** (live Scryfall):
+8. **For ad-hoc commander/staple discovery** (live Scryfall):
    ```bash
    tools/mtg search 'legal:brawl game:arena t:legendary t:creature c=5'
    ```
    Full syntax: https://scryfall.com/docs/syntax
 
-8. **For meta info**, open `docs/sources.md` — per-format URLs with
+9. **For meta info**, open `docs/sources.md` — per-format URLs with
    last-verified dates. WebFetch when you need numbers.
 
-9. **For collection-aware decisions** (own / WC cost), populate
-   `data/collection.json` once via `tools/mtg collection {dump,import,from-decks}`,
-   then query: `collection`, `own <name>`, `gaps <deck>`, `coverage <deck>`,
-   `wantlist [--latest-only] [--decks 'decks/foo/*.txt']`. `dump` injects
-   a .NET payload (`tools/inject/`, one-time `dotnet build -c Release`)
-   into MTGA's Mono runtime (Linux/Proton + Nix shell); `from-decks` is
-   a lower bound; `wantlist` is max-shortfall across saved decks.
+10. **For collection-aware decisions** (own / WC cost), populate
+    `data/collection.json` once via `tools/mtg collection {dump,import,from-decks}`,
+    then query: `collection`, `own <name>`, `owned '<scryfall query>'`,
+    `gaps <deck>`, `coverage <deck>`,
+    `wantlist [--latest-only] [--decks 'decks/foo/*.txt']`. `dump` injects
+    a .NET payload (`tools/inject/`, one-time `dotnet build -c Release`)
+    into MTGA's Mono runtime (Linux/Proton + Nix shell); `from-decks` is
+    a lower bound; `wantlist` is max-shortfall across saved decks.
 
-10. **For batch ownership ranking** across a deck directory:
+11. **For batch ownership ranking** across a deck directory:
     ```bash
     tools/mtg coverage --batch --glob 'decks/<fmt>/*.txt' --with-subs --min 0.90 --json
     ```
     Sorts by ownership %; `--with-subs` factors in `suggest-subs` rewrites.
+    `--json` works in single-deck and batch mode.
 
-11. **For pulling a meta corpus** into the repo:
+12. **For pulling a meta corpus** into the repo:
     ```bash
     tools/mtg fetch-meta historic --out decks/historic/ --limit 30
     ```
     mtgazone is primary; mtggoldfish wired (works for `pioneer`/
     `standard`); untapped deferred — see `docs/sources.md`.
+    Add `--no-cache` to bypass `data/meta-cache/`, `--json` for stdout output.
 
-12. **For owned-card replacements** preserving role/CMC/CI/companion:
+13. **For owned-card replacements** preserving role/CMC/CI/companion:
     ```bash
-    tools/mtg suggest-subs decks/<name>/v0.txt --max-per-card 5
-    tools/mtg suggest-subs decks/<name>/v0.txt --apply decks/<name>/v0-subbed.txt
+    tools/mtg suggest-subs decks/<name>/v0.txt -f brawl --max-per-card 5
+    tools/mtg suggest-subs decks/<name>/v0.txt -f brawl --apply decks/<name>/v0-subbed.txt
     ```
 
-13. **For novel-deck shell discovery** (cluster owned cards):
+14. **For novel-deck shell discovery** (cluster owned cards):
     ```bash
     tools/mtg shells --format historic --by keyword
     tools/mtg shells --format historic --by type --min-cards 20
