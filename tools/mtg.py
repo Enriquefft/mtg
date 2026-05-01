@@ -75,6 +75,14 @@ from mtg_sources._common import (  # noqa: E402
     ParsedDeck,
     slugify,
 )
+from mtg_sources.aetherhub import (  # noqa: E402
+    parse_aetherhub,
+    url_for_format as aetherhub_url_for_format,
+)
+from mtg_sources.moxfield import (  # noqa: E402
+    parse_moxfield,
+    url_for_format as moxfield_url_for_format,
+)
 from mtg_sources.mtgazone import (  # noqa: E402
     parse_mtgazone,
     url_for_format as mtgazone_url_for_format,
@@ -5901,6 +5909,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
 # the URL without hardcoding it. Keep these two-tuple to avoid a third
 # config layer.
 _FETCH_META_PARSERS = {
+    "aetherhub": (parse_aetherhub, aetherhub_url_for_format),
+    "moxfield": (parse_moxfield, moxfield_url_for_format),
     "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
     "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
     "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format),
@@ -5935,6 +5945,35 @@ _FETCH_META_RETRY_403 = frozenset({"mtggoldfish", "mtgdecks"})
 # attributed and stays inside the documented contract.
 _FETCH_META_INDEX_REFERER = {
     "mtgdecks": "https://mtgdecks.net/",
+    "moxfield": "https://www.moxfield.com/",
+}
+
+# Sources whose index endpoint refuses the toolkit User-Agent and needs
+# a browser string. Moxfield's api2 sits behind Cloudflare and 403s
+# scripted UAs; we send the same Chrome string the parser uses for its
+# per-deck calls so the burst looks consistent.
+_FETCH_META_INDEX_USER_AGENT = {
+    "aetherhub": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "moxfield": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+# Sources that need extra headers (Origin etc.) on the index fetch.
+# Moxfield's API CORS allow-list expects an Origin matching the
+# website's; without it Cloudflare's WAF returns a generic 403 page.
+_FETCH_META_INDEX_EXTRA_HEADERS = {
+    "moxfield": {"Origin": "https://www.moxfield.com"},
+}
+
+# Accept header overrides — sources whose index endpoint serves JSON
+# (moxfield) need application/json or the API serves an HTML wrapper.
+_FETCH_META_INDEX_ACCEPT = {
+    "moxfield": "application/json, text/plain, */*",
 }
 
 
@@ -5967,8 +6006,13 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
 
     text = _common.http_get_text(
         url,
+        accept=_FETCH_META_INDEX_ACCEPT.get(
+            source, "text/html,application/xhtml+xml",
+        ),
         retry_403_once=source in _FETCH_META_RETRY_403,
         referer=_FETCH_META_INDEX_REFERER.get(source),
+        user_agent=_FETCH_META_INDEX_USER_AGENT.get(source),
+        extra_headers=_FETCH_META_INDEX_EXTRA_HEADERS.get(source),
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6989,12 +7033,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--source",
-        choices=("untapped", "mtggoldfish", "mtgazone", "mtgdecks"),
+        choices=("aetherhub", "moxfield", "untapped", "mtggoldfish", "mtgazone", "mtgdecks"),
         default="mtgazone",
         help=(
-            "meta source (default: mtgazone). 'untapped' is deferred — its "
-            "tier-list and deck pages are a JS shell with no server-rendered "
-            "decklists. 'mtgdecks' covers Historic only. See docs/sources.md."
+            "meta source (default: mtgazone). 'moxfield' = api2.moxfield.com "
+            "user-built decks (largest corpus, all formats). 'aetherhub' = "
+            "Arena-native /Metagame index w/ winrates (~50 archetypes per "
+            "format). 'untapped' = Arena-native scrape (only automated "
+            "brawl source). 'mtgdecks' covers Historic only. See docs/sources.md."
         ),
     )
     s.add_argument(

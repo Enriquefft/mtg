@@ -30,6 +30,8 @@ def http_get_text(
     retry_403_once: bool = False,
     retry_sleep_secs: float = 2.0,
     referer: str | None = None,
+    user_agent: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> str:
     """Fetch `url` as text using the shared User-Agent.
 
@@ -49,20 +51,44 @@ def http_get_text(
     but sending the header keeps us inside the documented contract and
     avoids surprises if the server hardens). Threaded through both the
     initial fetch and the retry so the second attempt looks identical.
+
+    `user_agent`: override the shared User-Agent for this call. Some
+    sources (moxfield, aetherhub) refuse the toolkit UA and require a
+    browser-like string. Default = `USER_AGENT`.
+
+    `extra_headers`: optional dict merged into the request headers
+    after Accept/User-Agent/Referer. Used by JSON APIs that demand
+    `Origin` (moxfield) or other custom headers without making each
+    one a named keyword.
     """
     try:
-        return _do_http_get(url, accept=accept, referer=referer)
+        return _do_http_get(
+            url, accept=accept, referer=referer,
+            user_agent=user_agent, extra_headers=extra_headers,
+        )
     except urllib.error.HTTPError as e:
         if retry_403_once and e.code == 403:
             time.sleep(retry_sleep_secs)
-            return _do_http_get(url, accept=accept, referer=referer)
+            return _do_http_get(
+                url, accept=accept, referer=referer,
+                user_agent=user_agent, extra_headers=extra_headers,
+            )
         raise
 
 
-def _do_http_get(url: str, *, accept: str, referer: str | None = None) -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept": accept}
+def _do_http_get(
+    url: str,
+    *,
+    accept: str,
+    referer: str | None = None,
+    user_agent: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> str:
+    headers = {"User-Agent": user_agent or USER_AGENT, "Accept": accept}
     if referer:
         headers["Referer"] = referer
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=120) as r:
         raw = r.read()
