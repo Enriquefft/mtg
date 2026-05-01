@@ -572,6 +572,39 @@ def parse_deck(path: Path) -> list[DeckEntry]:
 
 BRAWL_FORMATS = {"brawl", "standardbrawl"}
 
+# Per-format F2 sub-fidelity floor defaults for coverage/recommend.
+# Brawl variants are singleton 100-card — non-commander slots are flex by
+# design, so high sub tolerance is appropriate.  Constructed 60-card formats
+# (standard/alchemy) have intentional playsets; two missing 4-ofs is a
+# different deck, so tolerance is low.  Deeper-pool constructed formats
+# (historic/timeless/pioneer/explorer) sit in the middle — genuine functional
+# reprints exist but the deck shape is still constructed.
+# The old single global was 0.30.  All values replaced with per-format ones.
+_MAX_SUB_PCT_BY_FORMAT: dict[str, float] = {
+    "brawl":         0.55,
+    "standardbrawl": 0.55,
+    "standard":      0.22,
+    "alchemy":       0.22,
+    "historic":      0.28,
+    "timeless":      0.28,
+    "pioneer":       0.28,
+    "explorer":      0.28,
+}
+
+
+def _resolve_max_sub_pct(fmt: str, override: float | None) -> float:
+    """Return the effective F2 sub-fidelity floor for `fmt`.
+
+    When `override` is not None (user passed --max-sub-pct explicitly),
+    that value wins unconditionally.  Otherwise the per-format default
+    from `_MAX_SUB_PCT_BY_FORMAT` is used, falling back to 0.30 for any
+    unknown format (should not occur in practice since all callers
+    validate fmt against ARENA_FORMATS first).
+    """
+    if override is not None:
+        return override
+    return _MAX_SUB_PCT_BY_FORMAT.get(fmt, 0.30)
+
 
 def _write_mtga_export(path: Path, entries: list[DeckEntry]) -> None:
     """Write a deck file in MTGA-export format.
@@ -4645,6 +4678,8 @@ def _coverage_row(
     source_origin = source_raw if isinstance(source_raw, str) and source_raw else None
     winrate_raw = meta.get("winrate")
     winrate = winrate_raw if isinstance(winrate_raw, (int, float)) else None
+    sample_raw = meta.get("sample")
+    winrate_sample = sample_raw if isinstance(sample_raw, int) else None
 
     tier_w = _tier_weight(tier)
     # Composite score: tier_weight * (with_subs_pct if --with-subs and
@@ -4664,6 +4699,7 @@ def _coverage_row(
         "tier_weight": tier_w,
         "source": source_origin,
         "winrate": winrate,
+        "winrate_sample": winrate_sample,
         "owned_pct": round(owned_pct, 4),
         "missing_wc": wc,
         "with_subs_pct": (
@@ -6194,6 +6230,13 @@ def _write_meta_corpus(decks: list[ParsedDeck], out_dir: Path) -> dict:
         }
         if d.also_seen_at:
             entry["also_seen_at"] = list(d.also_seen_at)
+        # Near-dup clustering results. variant_count > 1 means this deck
+        # is the canonical representative of a cluster of near-duplicates.
+        # Persisted so `recommend` surfaces the count and downstream tools
+        # can inspect which variants were collapsed.
+        if d.variant_count > 1:
+            entry["variant_count"] = d.variant_count
+            entry["variants"] = list(d.variants)
         sidecar[deck_file.name] = entry
 
     meta_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
@@ -6767,6 +6810,60 @@ def _recommend_compute(
             )
             deck_rows.append(row)
 
+    # Winrate prior: median of all per-deck winrates in the corpus.
+    # Computed once here (single source of truth) so every deck's
+    # shrinkage uses the same anchor.  Requires >=10 decks with winrate
+    # to be meaningful; below that threshold we skip winrate weighting
+    # entirely (too few samples for the prior to be reliable).
+    #
+    # Shrinkage formula:
+    #   shrunk = (n * wr + K * prior) / (n + K)   where K = 100
+    # K = 100 means the prior is worth 100 observed matches; a 5pp real
+    # winrate edge over 50k matches is essentially unshrunken, while a
+    # 5pp edge over 30 matches gets pulled ~75% of the way back to prior.
+    #
+    # Weight coefficient 0.6: a 5pp shrunk winrate edge (0.55 vs 0.50)
+    # contributes 0.05 * 0.6 = 0.03 to composite — comparable to a ~10pp
+    # ownership edge on a tier-1 deck (0.10 * 1.25 = 0.125, scaled by
+    # deck-count variance; 0.03 sits in the same order of magnitude so
+    # winrate meaningfully tilts ranking without dominating ownership).
+    _WINRATE_PRIOR_STRENGTH = 100
+    _WINRATE_WEIGHT = 0.6
+    _WINRATE_MIN_DECKS = 10
+
+    _wr_vals = [
+        r["winrate"] for r in deck_rows
+        if r.get("winrate") is not None
+    ]
+    format_winrate_prior: float | None = None
+    format_winrate_sample_size = len(_wr_vals)
+    if len(_wr_vals) >= _WINRATE_MIN_DECKS:
+        import statistics as _statistics
+        format_winrate_prior = _statistics.median(_wr_vals)
+
+    for r in deck_rows:
+        wr = r.get("winrate")
+        n = r.get("winrate_sample") or 0
+        if format_winrate_prior is not None:
+            if wr is not None:
+                shrunk = (
+                    (n * wr + _WINRATE_PRIOR_STRENGTH * format_winrate_prior)
+                    / (n + _WINRATE_PRIOR_STRENGTH)
+                )
+            else:
+                # No winrate signal: assign the prior (correct answer,
+                # not a workaround — prior is the best estimate we have).
+                shrunk = format_winrate_prior
+            component = round((shrunk - 0.50) * _WINRATE_WEIGHT, 6)
+            r["shrunk_winrate"] = round(shrunk, 6)
+            r["winrate_component"] = component
+            # Bake winrate component into composite now so filter/sort
+            # and all downstream consumers see the updated score.
+            r["composite"] = round(r["composite"] + component, 4)
+        else:
+            r["shrunk_winrate"] = None
+            r["winrate_component"] = 0.0
+
     # Filter: drop decks where neither owned nor sub-pct are anywhere
     # close to the threshold. F2 clamps with_subs_pct == owned_pct when
     # subs are unacceptable, so persist-combo (8.5% owned, sub-pct cap
@@ -6986,6 +7083,10 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     if args.top <= 0:
         print("--top must be > 0", file=sys.stderr)
         return 2
+    # Resolve per-format default before validation so the sentinel (None)
+    # is replaced.  _resolve_max_sub_pct returns the explicit override when
+    # the user passed --max-sub-pct, otherwise the format-specific default.
+    args.max_sub_pct = _resolve_max_sub_pct(fmt, args.max_sub_pct)
     if not (0.0 < args.max_sub_pct <= 1.0):
         print("--max-sub-pct must be in (0, 1]", file=sys.stderr)
         return 2
@@ -7244,6 +7345,37 @@ def cmd_derive(args: argparse.Namespace) -> int:
         entries, result["missing"], idx, is_brawl,
     )
 
+    # --- validation gate ---------------------------------------------------
+    val_code, val_msgs = validate_deck(new_entries, fmt)
+    validation_passed = val_code == 0
+
+    if not validation_passed:
+        if args.force:
+            print(
+                f"WARNING: derived deck failed validation ({len(val_msgs)} issue(s)); "
+                f"--force: writing anyway",
+                file=sys.stderr,
+            )
+            for m in val_msgs:
+                print(f"  {m}", file=sys.stderr)
+        else:
+            print(
+                f"derive: validation failed ({len(val_msgs)} issue(s)); "
+                f"not writing {deck_path.stem}.txt",
+                file=sys.stderr,
+            )
+            for m in val_msgs:
+                print(f"  {m}", file=sys.stderr)
+            if args.json:
+                _emit_json({
+                    "source": str(deck_path),
+                    "format": fmt,
+                    "validation_passed": False,
+                    "validation_failures": val_msgs,
+                })
+            return 1
+    # -----------------------------------------------------------------------
+
     out_path = (
         Path(args.out) if args.out
         else CORPUS / fmt / "derived" / f"{deck_path.stem}.txt"
@@ -7274,6 +7406,8 @@ def cmd_derive(args: argparse.Namespace) -> int:
         "missing_total": result["summary"]["missing_cards"],
         "fillable": result["summary"]["fillable"],
         "unfilled": result["summary"]["unfilled"],
+        "validation_passed": validation_passed,
+        "validation_failures": val_msgs,
     }
     sidecar_path.write_text(
         json.dumps(sidecar, indent=2, sort_keys=True) + "\n"
@@ -7290,6 +7424,8 @@ def cmd_derive(args: argparse.Namespace) -> int:
         "missing_total": result["summary"]["missing_cards"],
         "fillable": result["summary"]["fillable"],
         "unfilled": result["summary"]["unfilled"],
+        "validation_passed": validation_passed,
+        "validation_failures": val_msgs,
     }
     if args.json:
         _emit_json(payload)
@@ -8067,6 +8203,16 @@ def main(argv: list[str] | None = None) -> int:
         help="sort key: ownership (legacy), quality (tier-first), "
         "composite (default: tier × ownership)",
     )
+    s.add_argument(
+        "--max-sub-pct", type=float, default=None, metavar="N",
+        help=(
+            "F2 sub-fidelity floor: clamp with_subs_pct to owned_pct "
+            "when more than N (0.0-1.0) of the deck would be substituted. "
+            "Omit to use the per-format default "
+            "(brawl/standardbrawl=0.55, standard/alchemy=0.22, "
+            "historic/timeless/pioneer/explorer=0.28)."
+        ),
+    )
     s.set_defaults(func=cmd_coverage)
 
     s = sub.add_parser(
@@ -8296,6 +8442,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--no-strictlybetter", action="store_true",
         help="skip strictlybetter.eu lookup (offline; pure heuristic ranking)",
+    )
+    s.add_argument(
+        "--force", action="store_true",
+        help=(
+            "write the derived deck even when validation fails; "
+            "prints a stderr warning with each failure reason. "
+            "Use for debugging derivation logic."
+        ),
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_derive)
