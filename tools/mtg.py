@@ -97,9 +97,22 @@ DATA = ROOT / "data"
 BULK_JSON = DATA / "default_cards.json"
 INDEX_PKL = DATA / "index.pkl"
 META_JSON = DATA / "bulk-meta.json"
+STRICTLYBETTER_CACHE = DATA / "strictlybetter-cache.json"
 
 SCRYFALL_BULK = "https://api.scryfall.com/bulk-data/default-cards"
 SCRYFALL_API = "https://api.scryfall.com"
+
+# strictlybetter.eu — community-curated functional-reprint + direct-upgrade
+# database. Used by `suggest-subs` to prefer rules-text-equivalent owned
+# alternatives over heuristic role/CMC matches. The functional_reprints
+# endpoint returns the entire DB in one bulk response (per_page=200,
+# last_page=1, no name search), so we fetch once and invert it locally.
+# The obsoletes endpoint supports partial-match search on card name and
+# is queried per-missing-card. Both are cached at STRICTLYBETTER_CACHE
+# with a 7-day TTL. API guide: https://www.strictlybetter.eu/api-guide
+STRICTLYBETTER_API = "https://www.strictlybetter.eu/api"
+STRICTLYBETTER_TTL_S = 7 * 24 * 3600
+STRICTLYBETTER_THROTTLE_S = 0.65  # under 100 req/min cap
 
 ARENA_FORMATS = {
     "standard",
@@ -3256,6 +3269,297 @@ _PRIMARY_CARD_TYPES = frozenset({
 _SUPERTYPES = ("legendary", "basic", "snow", "world")
 
 
+# ---------- strictlybetter.eu — functional reprints + obsoletes ----------
+#
+# Single source of truth for the rules-text-equivalent / direct-upgrade
+# mapping is the strictlybetter.eu API. The repo cache at
+# `data/strictlybetter-cache.json` is a transcription, not a parallel
+# dataset — TTL'd at 7d, refetched on miss. Two shapes:
+#
+#   "functional_reprints": {
+#       "fetched_at": "2026-05-01T12:34:56+00:00",
+#       "groups": [["Llanowar Elves", "Elvish Mystic", ...], ...],
+#   }
+#   "obsoletes": {
+#       "<card-name-lower>": {
+#           "fetched_at": "...",
+#           "names": ["Lightning Bolt", "Galvanic Blast", ...],
+#       }, ...
+#   }
+#
+# Functional reprints come from a SINGLE bulk fetch (the API endpoint
+# returns the whole DB regardless of name segment — confirmed via
+# api-guide). Obsoletes are per-card (partial-match search). A "good"
+# obsolete entry is filtered to `labels.strictly_better=True` AND
+# `upvotes > downvotes` so we don't promote disputed community claims.
+#
+# `_strictlybetter_subs(card_name)` returns the union of functional
+# reprints and good obsoletes for a card. Empty list on miss / network
+# failure / 404 — never raises. The candidate-loop in `_run_suggest_subs`
+# then intersects this with the user's collection and applies a fixed
+# +1000 score boost so any owned reprint outranks every heuristic match.
+
+
+def _strictlybetter_load_cache() -> dict:
+    """Return the on-disk cache dict, or a fresh skeleton if missing/corrupt.
+
+    Single source of truth for both subkeys; callers mutate and call
+    `_strictlybetter_save_cache`. Corrupt JSON is logged and replaced —
+    we never crash the CLI over a malformed sub-cache.
+    """
+    if not STRICTLYBETTER_CACHE.exists():
+        return {"functional_reprints": None, "obsoletes": {}}
+    try:
+        data = json.loads(STRICTLYBETTER_CACHE.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"[warn] strictlybetter cache unreadable ({e}); "
+            "starting fresh in-memory",
+            file=sys.stderr,
+        )
+        return {"functional_reprints": None, "obsoletes": {}}
+    if not isinstance(data, dict):
+        return {"functional_reprints": None, "obsoletes": {}}
+    data.setdefault("functional_reprints", None)
+    data.setdefault("obsoletes", {})
+    if not isinstance(data["obsoletes"], dict):
+        data["obsoletes"] = {}
+    return data
+
+
+def _strictlybetter_save_cache(cache: dict) -> None:
+    """Persist `cache` to disk. Best-effort: log and continue on OSError."""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        STRICTLYBETTER_CACHE.write_text(json.dumps(cache, indent=2))
+    except OSError as e:
+        print(
+            f"[warn] could not write strictlybetter cache: {e}",
+            file=sys.stderr,
+        )
+
+
+def _strictlybetter_is_fresh(fetched_at: str | None) -> bool:
+    """7-day TTL check on an ISO-8601 `fetched_at` string."""
+    if not fetched_at:
+        return False
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(fetched_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return age < STRICTLYBETTER_TTL_S
+
+
+def _strictlybetter_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _strictlybetter_fetch_functional_reprints() -> list[list[str]] | None:
+    """Bulk-fetch every functional-reprint group. Returns None on failure.
+
+    The endpoint (`/api/functional_reprints`) returns the whole DB in
+    one page (per_page=200, last_page=1) — no name search supported per
+    the api-guide. Called at most once per 7d.
+    """
+    url = f"{STRICTLYBETTER_API}/functional_reprints"
+    try:
+        payload = _get_json(url)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as e:
+        print(
+            f"[warn] strictlybetter functional_reprints fetch failed "
+            f"({e}); functional-reprint preference disabled this run",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("data") or []
+    groups: list[list[str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cards = row.get("cards") or []
+        names = [
+            (c.get("name") or "").strip()
+            for c in cards
+            if isinstance(c, dict) and (c.get("name") or "").strip()
+        ]
+        if len(names) >= 2:
+            groups.append(names)
+    return groups
+
+
+def _strictlybetter_fetch_obsoletes(card_name: str) -> list[str] | None:
+    """Per-card fetch of community-validated direct upgrades.
+
+    Returns the list of card names that are strictly better than
+    `card_name` AND have net-positive votes (`upvotes > downvotes`) AND
+    `labels.strictly_better=True`. Empty list = API hit, no entries.
+    None = network/HTTP failure (caller should not cache None).
+    """
+    quoted = urllib.parse.quote(card_name, safe="")
+    url = f"{STRICTLYBETTER_API}/obsoletes/{quoted}"
+    try:
+        payload = _get_json(url)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # 404 means "no entries", not a transport error — cache empty.
+            return []
+        print(
+            f"[warn] strictlybetter obsoletes fetch failed for "
+            f"{card_name!r}: HTTP {e.code}",
+            file=sys.stderr,
+        )
+        return None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(
+            f"[warn] strictlybetter obsoletes fetch failed for "
+            f"{card_name!r}: {e}",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("data") or []
+    upgrades: list[str] = []
+    seen: set[str] = set()
+    name_lc = card_name.lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        labels = row.get("labels") or {}
+        if not labels.get("strictly_better"):
+            continue
+        try:
+            up = int(row.get("upvotes") or 0)
+            down = int(row.get("downvotes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if up <= down:
+            continue
+        # The query is a partial match — the row is only relevant if
+        # `card_name` actually appears as an inferior. Skip rows where
+        # `card_name` is the superior (we don't want to suggest cards
+        # that the queried card is *better* than).
+        inferiors = [
+            (c.get("name") or "").strip()
+            for c in (row.get("inferiors") or [])
+            if isinstance(c, dict)
+        ]
+        if not any(n.lower() == name_lc for n in inferiors):
+            continue
+        for c in row.get("superiors") or []:
+            if not isinstance(c, dict):
+                continue
+            nm = (c.get("name") or "").strip()
+            if nm and nm.lower() != name_lc and nm.lower() not in seen:
+                seen.add(nm.lower())
+                upgrades.append(nm)
+    return upgrades
+
+
+# Per-process memo: cache the inverted functional-reprints index after
+# the first call so re-entrant `_run_suggest_subs` invocations (e.g.
+# coverage --batch --with-subs walking N decks) don't re-read the JSON
+# file N times. Keyed by None (single global) — the underlying cache
+# file is the SoT, this is just an O(1) accessor.
+_STRICTLYBETTER_REPRINT_INDEX: dict[str, set[str]] | None = None
+_STRICTLYBETTER_OBSOLETE_LAST_FETCH: float = 0.0
+
+
+def _strictlybetter_reprint_index(
+    cache: dict, *, refresh: bool = False
+) -> dict[str, set[str]]:
+    """name_lc -> set of other names in the same functional-reprint group.
+
+    Built from the `functional_reprints.groups` cache subkey. Triggers a
+    bulk fetch when missing or stale; on fetch failure, returns an
+    empty index (no preference contribution this run, no crash).
+    """
+    global _STRICTLYBETTER_REPRINT_INDEX
+    if _STRICTLYBETTER_REPRINT_INDEX is not None and not refresh:
+        return _STRICTLYBETTER_REPRINT_INDEX
+    sub = cache.get("functional_reprints") or {}
+    fetched_at = sub.get("fetched_at") if isinstance(sub, dict) else None
+    groups = sub.get("groups") if isinstance(sub, dict) else None
+    if not groups or not _strictlybetter_is_fresh(fetched_at) or refresh:
+        fresh_groups = _strictlybetter_fetch_functional_reprints()
+        if fresh_groups is not None:
+            cache["functional_reprints"] = {
+                "fetched_at": _strictlybetter_now(),
+                "groups": fresh_groups,
+            }
+            _strictlybetter_save_cache(cache)
+            groups = fresh_groups
+        elif not groups:
+            # First-ever call failed — return empty so caller degrades
+            # gracefully. Don't memoize (next run might succeed).
+            return {}
+    inverted: dict[str, set[str]] = {}
+    for grp in groups:
+        names = [n for n in grp if isinstance(n, str) and n]
+        for nm in names:
+            others = {o for o in names if o.lower() != nm.lower()}
+            if others:
+                inverted.setdefault(nm.lower(), set()).update(others)
+    _STRICTLYBETTER_REPRINT_INDEX = inverted
+    return inverted
+
+
+def _strictlybetter_subs(card_name: str) -> list[str]:
+    """Names that are functional reprints OR community-validated upgrades.
+
+    Single-call entry point used by `_run_suggest_subs`. Reads/refreshes
+    the on-disk cache as needed (7d TTL). Empty list on miss, malformed
+    response, or network failure — never raises.
+    """
+    name = (card_name or "").strip()
+    if not name:
+        return []
+    cache = _strictlybetter_load_cache()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    reprint_idx = _strictlybetter_reprint_index(cache)
+    for n in reprint_idx.get(name.lower(), ()):
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+
+    key = name.lower()
+    obs_cache = cache.get("obsoletes") or {}
+    entry = obs_cache.get(key)
+    fetched_at = (entry or {}).get("fetched_at") if isinstance(entry, dict) else None
+    if not isinstance(entry, dict) or not _strictlybetter_is_fresh(fetched_at):
+        # Throttle to stay under 100 req/min — the api-guide rate limit.
+        global _STRICTLYBETTER_OBSOLETE_LAST_FETCH
+        now = time.monotonic()
+        gap = now - _STRICTLYBETTER_OBSOLETE_LAST_FETCH
+        if gap < STRICTLYBETTER_THROTTLE_S:
+            time.sleep(STRICTLYBETTER_THROTTLE_S - gap)
+        _STRICTLYBETTER_OBSOLETE_LAST_FETCH = time.monotonic()
+        upgrades = _strictlybetter_fetch_obsoletes(name)
+        if upgrades is not None:
+            entry = {"fetched_at": _strictlybetter_now(), "names": upgrades}
+            obs_cache[key] = entry
+            cache["obsoletes"] = obs_cache
+            _strictlybetter_save_cache(cache)
+        else:
+            entry = None  # transport failure — don't poison the cache
+
+    if isinstance(entry, dict):
+        for n in entry.get("names") or []:
+            if isinstance(n, str) and n and n.lower() not in seen:
+                seen.add(n.lower())
+                out.append(n)
+    return out
+
+
 def _freq_score_adjustment(deck_pct: float | None) -> float:
     """Frequency-aware score adjustment for sub candidates.
 
@@ -3377,6 +3681,7 @@ def _run_suggest_subs(
     anchor_check: bool = True,
     max_sub_pct: float = 0.30,
     freq_index: dict | None = None,
+    strictlybetter: bool = True,
 ) -> dict:
     """Pure-compute core of `suggest-subs`.
 
@@ -3404,6 +3709,17 @@ def _run_suggest_subs(
         result dict carries `subs_acceptable: False`, the `--apply`
         path refuses the write, and `_coverage_with_subs_pct` clamps
         with-subs coverage to native ownership.
+
+    Strictlybetter preference (O3):
+      * When `strictlybetter=True` (default), `_strictlybetter_subs` is
+        consulted per missing card. Owned candidates whose name is a
+        functional reprint or community-validated direct upgrade get a
+        fixed +1000 score boost so they outrank every heuristic match.
+        Each boosted candidate carries `strictlybetter: true` in the
+        JSON output. Falls back to pure heuristic scoring when the
+        cache is empty / API unreachable / no owned reprint exists.
+      * `strictlybetter=False` skips the API lookup entirely (offline
+        mode; surfaced as `--no-strictlybetter` on `cmd_suggest_subs`).
 
     Caller is responsible for:
       - calling `_warn_if_stale()` / `_warn_if_collection_stale()`
@@ -3504,12 +3820,26 @@ def _run_suggest_subs(
     anchor_unfilled = 0
     json_missing: list[dict] = []
 
+    # Strictlybetter boost magnitude. The heuristic score peaks around
+    # ~15 (3 + 4 + 1 + 1 = 9, * 1.5 rare-role = 13.5, + 1.0 freq); +1000
+    # guarantees any rules-text-equivalent owned candidate sorts ahead
+    # of every heuristic match even when stacked with rare-role/freq.
+    SB_BOOST = 1000.0
+
     for slot in missing:
         miss_name = slot["name"]
         miss_card = slot["card"]
         miss_roles = slot["roles"]
         miss_cmc = slot["cmc"]
         miss_game_changer = bool(miss_card.get("game_changer"))
+
+        # strictlybetter.eu functional-reprint + good-obsolete set for
+        # this missing card. Lookup short-circuits when disabled or when
+        # there's no canonical name to query.
+        sb_names_lc: set[str] = set()
+        if strictlybetter and miss_name:
+            for n in _strictlybetter_subs(miss_name):
+                sb_names_lc.add(n.lower())
 
         # Anchor preservation: a card is an anchor if it's the commander
         # OR appears in >= 50% of corpus decks for this format. Anchors
@@ -3535,7 +3865,9 @@ def _run_suggest_subs(
             })
             continue
 
-        candidates: list[tuple[float, dict, dict, bool, bool, float | None]] = []
+        candidates: list[
+            tuple[float, dict, dict, bool, bool, float | None, bool]
+        ] = []
         for cand_name_lc, info in owned_by_name.items():
             cand_display = info.get("name") or ""
             if cand_display == miss_name:
@@ -3588,8 +3920,14 @@ def _run_suggest_subs(
             rare_boost = any(
                 _is_rare_role(r) for r in (cand_roles & miss_roles)
             )
+            is_strictlybetter = cand_display.lower() in sb_names_lc
+            if is_strictlybetter:
+                # Rules-text-equivalent / community-validated upgrade —
+                # outranks every heuristic match by construction.
+                score += SB_BOOST
             candidates.append((
                 score, c, info, rare_boost, cand_game_changer, cand_deck_pct,
+                is_strictlybetter,
             ))
 
         candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
@@ -3623,8 +3961,10 @@ def _run_suggest_subs(
                         round(cand_deck_pct, 4)
                         if cand_deck_pct is not None else None
                     ),
+                    "strictlybetter": sb,
                 }
-                for score, c, info, rare_boost, gc, cand_deck_pct in candidates
+                for score, c, info, rare_boost, gc, cand_deck_pct, sb
+                in candidates
             ],
         })
 
@@ -3755,6 +4095,7 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
         quiet=args.json,
         anchor_check=not args.no_anchor_check,
         max_sub_pct=args.max_sub_pct,
+        strictlybetter=not args.no_strictlybetter,
     )
     json_missing = result["missing"]
     summary = result["summary"]
@@ -3805,10 +4146,11 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
                 cand_cmc = cand["cmc"]
                 if isinstance(cand_cmc, float) and cand_cmc.is_integer():
                     cand_cmc = int(cand_cmc)
+                tag = " [strictlybetter]" if cand.get("strictlybetter") else ""
                 text_block.append(
                     f"    {cand['score']:6.3f}  {cand['owned']}x "
                     f"{cand['name']:<32} cmc={cand_cmc}  "
-                    f"roles=[{','.join(cand['roles'])}]"
+                    f"roles=[{','.join(cand['roles'])}]{tag}"
                 )
         text_chunks.append("\n".join(text_block))
 
@@ -6262,6 +6604,13 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "disable anchor preservation (commander + format staples "
             "with deck_pct >= 0.50) — power-user override"
+        ),
+    )
+    s.add_argument(
+        "--no-strictlybetter", action="store_true",
+        help=(
+            "skip strictlybetter.eu lookup; rely on heuristic scoring "
+            "only (offline mode — disables functional-reprint preference)"
         ),
     )
     s.add_argument(
