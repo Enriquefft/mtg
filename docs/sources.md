@@ -23,7 +23,7 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | `magic.wizards.com` | 200 | official ban announcements |
 | `mtggoldfish.com` | 200 (occasional 403) | primary paper meta; retry once on 403, then fall back |
 | **`aetherhub.com`** | **403** | **manual-research only** — see note below |
-| **`mtgdecks.net`** | **403** | **dropped** — see note below |
+| `mtgdecks.net` | 200 (re-verified 2026-05-01) | **third Historic source.** Earlier `403` resolved; vanilla UA gets 200. Wired as `fetch-meta --source mtgdecks historic`. |
 
 We deliberately do **not** circumvent the blocks. Headless Chromium / TLS
 impersonation (`curl-impersonate`, `curl_cffi`) would work, but: (a)
@@ -31,9 +31,19 @@ violates those sites' ToS, (b) adds heavy deps + ongoing fingerprint
 maintenance, (c) the project's "one source of truth: Scryfall" rule. The
 unique data on these sites isn't load-bearing for the deck-build loop.
 
-**`mtgdecks.net` (dropped):** aggregates paper + MTGO results. Same data
-on mtggoldfish (paper) and untapped (Arena), with larger samples. No
-unique value, no replacement work needed.
+**`mtgdecks.net` (re-enabled 2026-05-01):** Cloudflare no longer 403s
+the toolkit's vanilla UA. `fetch-meta --source mtgdecks historic` walks
+the `/Historic` archetype-index table and emits one `ParsedDeck` per
+archetype (the most-recent user-submitted decklist on each archetype
+page; mtgdecks lists by recency). Tier letters come from the index
+row's `tier-1`/`tier-2`/`rogue` class (`tier-1` -> S, `tier-2` -> A,
+`rogue` -> ""); per-archetype winrate and "Decks" count populate the
+sidecar's `winrate` and `sample` fields. Index URL is currently wired
+for Historic only — adding Standard/Pioneer would duplicate mtggoldfish
+without a curated reason and is deliberately out of scope (one source
+per format unless we have a real signal differential).
+Multi-deck-per-archetype output is a later feature; v0 ships singletons
+to mirror mtgazone's shape.
 
 **`aetherhub.com` (manual-only):** hosts the largest user-submitted
 Historic Brawl decklist corpus + commander meta-share derived from it.
@@ -76,9 +86,10 @@ Listed primary → fallback per format.
 - https://mtgazone.com/alchemy-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone alchemy`
 
 ### Historic
-- https://www.mtggoldfish.com/metagame/historic
+- https://www.mtggoldfish.com/metagame/historic — `fetch-meta --source mtggoldfish historic`
 - https://mtga.untapped.gg/constructed/historic/tier-list — **API-only, scrape blocked (deferred)**; manual research only
 - https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
+- https://mtgdecks.net/Historic — `fetch-meta --source mtgdecks historic` (verified 2026-05-01; one deck per archetype, most-recent submission; tier from row class, winrate + sample from index columns)
 
 ### Timeless
 - https://mtga.untapped.gg/constructed/timeless/tier-list — **API-only, scrape blocked (deferred)**; manual research only
@@ -100,7 +111,6 @@ Listed primary → fallback per format.
 - **mtgtop8.com** — paper-only competitive results.
 - **moxfield.com** — scraping prohibited; use only via web UI.
 - **gatherer.wizards.com** — official but slow to update and missing newer fields.
-- **mtgdecks.net** — Cloudflare 403s every WebFetch; data is duplicated by mtggoldfish + untapped (see Bot-block reality above).
 - **aetherhub.com** (auto-fetch) — Cloudflare 403s every WebFetch. Manual-only for Historic Brawl, see Bot-block reality above.
 
 ## Workflow

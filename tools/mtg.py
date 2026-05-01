@@ -82,6 +82,10 @@ from mtg_sources.mtggoldfish import (  # noqa: E402
     parse_mtggoldfish,
     url_for_format as mtggoldfish_url_for_format,
 )
+from mtg_sources.mtgdecks import (  # noqa: E402
+    parse_mtgdecks,
+    url_for_format as mtgdecks_url_for_format,
+)
 
 ROOT = Path(os.environ.get("MTG_ROOT") or Path(__file__).resolve().parent.parent)
 DATA = ROOT / "data"
@@ -4854,6 +4858,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 _FETCH_META_PARSERS = {
     "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
     "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
+    "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format),
 }
 
 # Sources the spec lists in the `--source` choices but that we have not
@@ -5452,12 +5457,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--source",
-        choices=("untapped", "mtggoldfish", "mtgazone"),
+        choices=("untapped", "mtggoldfish", "mtgazone", "mtgdecks"),
         default="mtgazone",
         help=(
             "meta source (default: mtgazone). 'untapped' is deferred — its "
             "tier-list and deck pages are a JS shell with no server-rendered "
-            "decklists. See docs/sources.md."
+            "decklists. 'mtgdecks' covers Historic only. See docs/sources.md."
         ),
     )
     s.add_argument(

@@ -27,6 +27,7 @@ def http_get_text(
     accept: str = "text/html,application/xhtml+xml",
     retry_403_once: bool = False,
     retry_sleep_secs: float = 2.0,
+    referer: str | None = None,
 ) -> str:
     """Fetch `url` as text using the shared User-Agent.
 
@@ -40,20 +41,27 @@ def http_get_text(
     delay is attempted on the first 403; any second 403 (or any other
     non-200) re-raises so the caller hard-fails per the production-
     ready floor.
+
+    `referer`: optional `Referer` header. Required by mtgdecks.net deck
+    pages per the source's spec (probe shows they 200 without it today,
+    but sending the header keeps us inside the documented contract and
+    avoids surprises if the server hardens). Threaded through both the
+    initial fetch and the retry so the second attempt looks identical.
     """
     try:
-        return _do_http_get(url, accept=accept)
+        return _do_http_get(url, accept=accept, referer=referer)
     except urllib.error.HTTPError as e:
         if retry_403_once and e.code == 403:
             time.sleep(retry_sleep_secs)
-            return _do_http_get(url, accept=accept)
+            return _do_http_get(url, accept=accept, referer=referer)
         raise
 
 
-def _do_http_get(url: str, *, accept: str) -> str:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": accept}
-    )
+def _do_http_get(url: str, *, accept: str, referer: str | None = None) -> str:
+    headers = {"User-Agent": USER_AGENT, "Accept": accept}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=120) as r:
         raw = r.read()
     return raw.decode("utf-8", errors="replace")
