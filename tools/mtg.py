@@ -4825,7 +4825,7 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
       "anchors": ["Card Name", ...],   # only hard anchors (slot_weight==1.0)
       "subs_acceptable": true,         # false when subs_pct > --max-sub-pct
       "subs_pct": 0.18,                # cards_substituted / non_basic_main
-      "max_sub_pct": 0.30,
+      "max_sub_pct": 0.55,             # explicit --max-sub-pct, else per-format default
       "non_basic_main": 60,
       "cards_substituted": 11,
       "missing": [
@@ -4876,7 +4876,8 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
     if args.max_per_card < 1:
         print("--max-per-card must be >= 1", file=sys.stderr)
         return 2
-    if not (0.0 <= args.max_sub_pct <= 1.0):
+    args.max_sub_pct = _resolve_max_sub_pct(fmt, args.max_sub_pct)
+    if not (0.0 < args.max_sub_pct <= 1.0):
         print(
             "--max-sub-pct must be between 0.0 and 1.0", file=sys.stderr,
         )
@@ -8876,10 +8877,12 @@ def main(argv: list[str] | None = None) -> int:
         help="write a substituted deck to OUT (validates clean for -f)",
     )
     s.add_argument(
-        "--max-sub-pct", type=float, default=0.30, metavar="N",
+        "--max-sub-pct", type=float, default=None, metavar="N",
         help=(
             "refuse --apply when more than N (0.0-1.0) of the deck "
-            "would be substituted (default: 0.30 = 30%%)"
+            "would be substituted. Omit to use the per-format default "
+            "(brawl/standardbrawl=0.55, standard/alchemy=0.22, "
+            "historic/timeless/pioneer/explorer=0.28)."
         ),
     )
     s.add_argument(
