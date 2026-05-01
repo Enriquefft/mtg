@@ -4075,6 +4075,10 @@ def _shell_cluster_rows(
             "colors": colors_str,
             "color_pairs": color_pairs,
             "anchors": anchors,
+            # Full owned-card name set for the cluster — `cmd_shells`
+            # uses this for `--match-corpus` overlap and pops it before
+            # emitting JSON so the public schema stays anchor-only.
+            "_card_names": {c["name"] for c in cards},
         })
 
     rows.sort(key=lambda r: (-r["count"], r["key"]))
@@ -4403,6 +4407,126 @@ def cmd_freq(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- shells <-> corpus archetype matching --------------------------
+
+
+def _load_archetype_anchors(fmt: str) -> dict[str, dict]:
+    """Per-archetype canonical card sets for `shells --match-corpus`.
+
+    Walks `decks/<fmt>/*.txt` (excluding sidecars + `_freq.json`) and
+    returns ``{archetype_slug: {"cards": set[str], "size": int,
+    "tier": str | None}}``. Anchor cards are non-basic-land main +
+    commander + companion + sideboard entries resolved through
+    `_resolve_card` (so casing / A-prefix / multi-face inputs all hit a
+    canonical name). `size` is the count of distinct non-basic anchors
+    — the denominator for `overlap_pct`. Returns ``{}`` when the corpus
+    is empty so callers can short-circuit cleanly.
+    """
+    files = _corpus_deck_files(fmt)
+    if not files:
+        return {}
+    out: dict[str, dict] = {}
+    for path in files:
+        slug = path.stem
+        names: set[str] = set()
+        for entry in parse_deck(path):
+            if entry.section == "maybeboard":
+                continue
+            card = _resolve_card(entry.name)
+            if card is None:
+                continue
+            if _is_basic(card):
+                continue
+            name = card.get("name") or entry.name
+            names.add(name)
+        meta = _load_deck_meta(path)
+        tier_raw = meta.get("tier")
+        tier = (
+            tier_raw if isinstance(tier_raw, str) and tier_raw.strip()
+            else None
+        )
+        out[slug] = {
+            "cards": names,
+            "size": len(names),
+            "tier": tier,
+        }
+    return out
+
+
+def _shell_corpus_matches(
+    shell_cards: set[str],
+    anchors: dict[str, dict],
+    freq: dict | None,
+    min_pct: float,
+    min_count: int,
+) -> list[dict]:
+    """Rank archetypes by overlap with `shell_cards`, filter, cap at 3.
+
+    `shell_cards` — set of canonical names in the cluster (already
+    basics-excluded by `_shell_cluster_rows`). For each archetype we
+    compute the raw overlap, the per-card weight from the freq index
+    (`weight = 1 - min(deck_pct, 0.5)`, so corpus-wide staples count
+    half and singletons count ~0.9), and the two ratios callers care
+    about. Sort key: `weighted_overlap` desc when freq is available,
+    else `anchor_overlap` desc; tie-break by archetype slug for stable
+    output.
+    """
+    shell_size = len(shell_cards)
+    if not anchors or shell_size == 0:
+        return []
+    freq_cards: dict[str, dict] = (freq or {}).get("cards") or {}
+
+    def _weight(name: str) -> float:
+        row = freq_cards.get(name)
+        if not row:
+            # Card unknown to the freq index = effectively unique.
+            return 1.0
+        pct_raw = row.get("deck_pct")
+        try:
+            pct = float(pct_raw) if pct_raw is not None else 0.0
+        except (TypeError, ValueError):
+            pct = 0.0
+        return 1.0 - (pct if pct < 0.5 else 0.5)
+
+    rows: list[dict] = []
+    for slug, info in anchors.items():
+        arch_cards: set[str] = info["cards"]
+        arch_size = info["size"]
+        if arch_size == 0:
+            continue
+        intersect = shell_cards & arch_cards
+        anchor_overlap = len(intersect)
+        if anchor_overlap < min_count:
+            continue
+        overlap_pct = anchor_overlap / arch_size
+        if overlap_pct < min_pct:
+            continue
+        if freq is not None:
+            weighted = sum(_weight(n) for n in intersect)
+        else:
+            weighted = float(anchor_overlap)
+        rows.append({
+            "archetype": slug,
+            "tier": info.get("tier"),
+            "anchor_overlap": anchor_overlap,
+            "archetype_size_nonbasic": arch_size,
+            "overlap_pct": round(overlap_pct, 4),
+            "shell_size": shell_size,
+            "shell_coverage_pct": round(anchor_overlap / shell_size, 4),
+            "weighted_overlap": round(weighted, 2),
+        })
+
+    if freq is not None:
+        rows.sort(
+            key=lambda r: (-r["weighted_overlap"], r["archetype"]),
+        )
+    else:
+        rows.sort(
+            key=lambda r: (-r["anchor_overlap"], r["archetype"]),
+        )
+    return rows[:3]
+
+
 def cmd_shells(args: argparse.Namespace) -> int:
     """Group owned, format-legal cards into synergy clusters.
 
@@ -4459,6 +4583,51 @@ def cmd_shells(args: argparse.Namespace) -> int:
     if args.limit is not None:
         clusters = clusters[: args.limit]
 
+    # `--match-corpus`: bridge each owned-card cluster to known
+    # archetypes by overlapping shell cards against deck files in
+    # `decks/<fmt>/`. Computed here (post-cluster) so the existing
+    # bucketing logic stays untouched. Empty corpus -> warn once and
+    # set every cluster's `matches` to []; missing freq index ->
+    # fall back to unweighted ranking with a one-shot stderr [info].
+    match_corpus = bool(getattr(args, "match_corpus", False))
+    archetype_anchors: dict[str, dict] = {}
+    freq_index: dict | None = None
+    if match_corpus:
+        archetype_anchors = _load_archetype_anchors(fmt)
+        if not archetype_anchors:
+            print(
+                f"[warn] no corpus for {fmt} — --match-corpus reports "
+                f"empty matches",
+                file=sys.stderr,
+            )
+        else:
+            freq_index = _load_freq_index(fmt, rebuild_if_stale=True)
+            if freq_index is None or not (freq_index.get("cards") or {}):
+                print(
+                    f"[info] no freq index for {fmt}; "
+                    f"--match-corpus falling back to unweighted overlap",
+                    file=sys.stderr,
+                )
+                freq_index = None
+        for cl in clusters:
+            shell_names = cl.get("_card_names") or set()
+            if archetype_anchors:
+                cl["matches"] = _shell_corpus_matches(
+                    shell_names,
+                    archetype_anchors,
+                    freq_index,
+                    args.match_min,
+                    args.match_anchors,
+                )
+            else:
+                cl["matches"] = []
+
+    # Pop the internal-only full card-name set before any output —
+    # `_card_names` is a sentinel for `--match-corpus` and never
+    # belongs in the JSON schema or text rendering.
+    for cl in clusters:
+        cl.pop("_card_names", None)
+
     if args.json:
         json.dump(
             {
@@ -4502,6 +4671,24 @@ def cmd_shells(args: argparse.Namespace) -> int:
                     f"{a['rarity']:<7} cmc {cmc_str:<3} "
                     f"{a['color_identity']:<4}"
                 )
+        if match_corpus:
+            matches = cl.get("matches") or []
+            if matches:
+                print("    matches:")
+                for m in matches:
+                    pct = m["overlap_pct"] * 100
+                    cov = m["shell_coverage_pct"] * 100
+                    weighted = m["weighted_overlap"]
+                    print(
+                        f"      {m['archetype'][:24]:<24} "
+                        f"overlap={pct:>4.0f}% "
+                        f"({m['anchor_overlap']}/"
+                        f"{m['archetype_size_nonbasic']} anchors), "
+                        f"shell-cov={cov:>4.0f}%, "
+                        f"weighted={weighted}"
+                    )
+            else:
+                print("    matches: (none above threshold)")
         print()
     return 0
 
@@ -5411,6 +5598,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "--limit", type=int, default=None, metavar="N",
         help="cap clusters listed (default: all)",
+    )
+    s.add_argument(
+        "--match-corpus", action="store_true",
+        help="for each shell, list the top 3 corpus archetypes whose "
+             "card lists overlap most",
+    )
+    s.add_argument(
+        "--match-min", type=float, default=0.30,
+        help="minimum overlap_pct to report a match (default: 0.30)",
+    )
+    s.add_argument(
+        "--match-anchors", type=int, default=5,
+        help="minimum anchor_overlap count to report a match (default: 5)",
     )
     s.add_argument(
         "--json", action="store_true",
