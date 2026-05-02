@@ -87,9 +87,12 @@ _FORMAT_MAP = {
     "historic": "historic",
     "timeless": "timeless",
     "pioneer": "pioneer",
+    # Moxfield's filter naming inverts our naming: their `historicBrawl`
+    # is our `brawl` (Historic Brawl), and their `brawl` is our
+    # `standardbrawl` (Standard Brawl).  Verified 2026-05-02:
+    # `fmt=brawl` returns 3337 results, all `format=brawl`.
     "brawl": "historicBrawl",
-    # standardbrawl deliberately omitted: probe shows fmt=standardBrawl
-    # returns no results from this endpoint. If ever needed, re-probe.
+    "standardbrawl": "brawl",
 }
 
 

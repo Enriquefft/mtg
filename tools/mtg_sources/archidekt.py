@@ -70,7 +70,8 @@ _FORMAT_MAP = {
     "historic": 19,
     "timeless": 18,
     "pioneer": 6,
-    "brawl": 20,
+    "brawl": 20,           # Historic Brawl
+    "standardbrawl": 3,    # Standard Brawl (verified 2026-05-02 via deck-API)
 }
 
 

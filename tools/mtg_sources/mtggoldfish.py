@@ -68,11 +68,16 @@ from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
 # Arena-niche and the curated source list pins us to the three with
 # meaningful sample sizes; adding more without a re-curate would silently
 # expand scope past what the project's source-of-truth doc declares.
+# `historic` and `explorer` deliberately omitted: re-verified 2026-05-02
+# the metagame pages for these formats now SSR a single "Other" archetype
+# tile (the catch-all bucket) and stream the remaining tiles via Turbo.
+# The SSR-tile parser sees only the placeholder and surfaces 0 decks.
+# Standard and pioneer still SSR ~15 tiles, so they keep working.
+# Re-add `historic` / `explorer` here once a Turbo-aware deep parser ships
+# (see docs/corpus-expansion-followups.md item #1).
 _URL_TEMPLATES = {
     "standard": "https://www.mtggoldfish.com/metagame/standard",
-    "historic": "https://www.mtggoldfish.com/metagame/historic",
     "pioneer": "https://www.mtggoldfish.com/metagame/pioneer",
-    "explorer": "https://www.mtggoldfish.com/metagame/explorer",
 }
 
 

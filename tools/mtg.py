@@ -558,7 +558,7 @@ def cmd_legal(args: argparse.Namespace) -> int:
     if not c:
         print(f"card not found: {args.name}", file=sys.stderr)
         return 1
-    legal = (c.get("legalities") or {}).get(fmt, "not_legal")
+    legal = _legality_status(c, fmt)
     on_arena = "arena" in (c.get("games") or [])
     is_legal = legal == "legal" and on_arena
     if getattr(args, "json", False):
@@ -688,9 +688,14 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
                 f"brawl: expected exactly 1 commander, got "
                 f"{sum(e.count for e in commanders)}"
             )
+        # Historic Brawl (our `brawl`) = 100-card singleton.
+        # Standard Brawl (our `standardbrawl`) = 60-card singleton.
+        expected_size = 100 if fmt == "brawl" else 60
         total = sum(e.count for e in commanders) + sum(e.count for e in deck)
-        if total != 100:
-            msgs.append(f"brawl: deck size must be 100, got {total}")
+        if total != expected_size:
+            msgs.append(
+                f"brawl: deck size must be {expected_size}, got {total}"
+            )
         # singleton (basic lands exempt)
         seen: dict[str, int] = {}
         for e in deck + commanders:
@@ -761,7 +766,7 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
             )
         if "arena" not in (c.get("games") or []):
             msgs.append(f"not on arena: {e.name}")
-        legal = (c.get("legalities") or {}).get(fmt, "not_legal")
+        legal = _legality_status(c, fmt)
         if legal != "legal":
             msgs.append(f"{legal} in {fmt}: {e.name}")
         if cmdr_identity is not None:
@@ -810,6 +815,30 @@ _CORPUS_VALIDATION_DROP_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+def _legality_status(card: dict, fmt: str) -> str:
+    """Scryfall legality status for ``fmt`` with ``explorer`` alias.
+
+    Scryfall publishes no ``legalities.explorer`` key — Arena's Explorer
+    is the Arena-available subset of Pioneer.  For ``fmt='explorer'`` we
+    derive: 'legal' iff ``pioneer == 'legal'`` AND the card is on Arena;
+    paper-Pioneer cards return 'not_legal'.  Other formats look up the
+    key directly with default ``'not_legal'``.
+
+    Returns the legality string ('legal', 'not_legal', 'banned', etc.)
+    so callers that print ``f"{status} in {fmt}: {name}"`` get the same
+    shape regardless of the alias.
+    """
+    legalities = card.get("legalities") or {}
+    if fmt == "explorer":
+        pioneer = legalities.get("pioneer", "not_legal")
+        if pioneer != "legal":
+            return pioneer
+        if "arena" not in (card.get("games") or []):
+            return "not_legal"
+        return "legal"
+    return legalities.get(fmt, "not_legal")
+
+
 def _validate_for_corpus(
     entries: list[DeckEntry], fmt: str
 ) -> tuple[bool, list[str]]:
@@ -837,7 +866,7 @@ def _validate_for_corpus(
 def _card_legal_in(c: dict, fmt: str) -> bool:
     if "arena" not in (c.get("games") or []):
         return False
-    return ((c.get("legalities") or {}).get(fmt, "not_legal") == "legal")
+    return _legality_status(c, fmt) == "legal"
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -884,7 +913,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 bad_n += 1
                 continue
             on_arena = "arena" in (c.get("games") or [])
-            legal = (c.get("legalities") or {}).get(fmt, "not_legal")
+            legal = _legality_status(c, fmt)
             ci = set(c.get("color_identity") or [])
             id_ok = (not cmdr_id) or ci.issubset(cmdr_id)
             mark = "✓" if (on_arena and legal == "legal" and id_ok) else "✗"
@@ -1298,7 +1327,7 @@ def cmd_related(args: argparse.Namespace) -> int:
         if not pkw:
             continue
         if fmt:
-            if (rep.get("legalities") or {}).get(fmt) != "legal":
+            if _legality_status(rep, fmt) != "legal":
                 continue
             if "arena" not in (rep.get("games") or []):
                 continue

@@ -104,21 +104,20 @@ from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
 # treats Pioneer/Explorer as one ladder); the sitemap URL still has
 # `pioneer` in it so the per-format mapping stays simple.
 #
-# explorer / brawl (= Standard Brawl) / standard-brawl: untapped's
-# sitemaps for these are stubs (zero archetype URLs in the probe),
-# meaning untapped doesn't publish a tier list for them. Returning
-# None here lets `cmd_fetch_meta` exit-2 with the "source does not
-# publish a tier list for format X" error path rather than fetching
-# an empty sitemap and exit-1'ing as drift.
+# `explorer` and `standardbrawl` deliberately omitted: untapped's
+# sitemaps for these slugs return a 219-byte empty `<urlset>` stub
+# (re-verified 2026-05-02), meaning untapped doesn't publish a tier
+# list for them.  Returning None here drops the source for those
+# formats at registry level, surfacing as exit-2 'unsupported' rather
+# than exit-1 'drift'.  If untapped ever starts publishing either
+# format, re-add the mapping line.
 _FMT_TO_SITEMAP_SLUG: dict[str, str] = {
     "standard":      "standard",
     "historic":      "historic",
     "pioneer":       "pioneer",
-    "explorer":      "explorer",
     "alchemy":       "alchemy",
     "timeless":      "timeless",
     "brawl":         "historic-brawl",  # our `brawl` = Historic Brawl
-    "standardbrawl": "standard-brawl",
 }
 
 
@@ -127,13 +126,10 @@ def url_for_format(fmt: str) -> str | None:
 
     untapped's sitemap index lives at `/sitemap.xml`; per-format
     archetype sitemaps are sub-resources at
-    `/sitemap/constructed-archetypes.xml?format=<slug>`. Verified
-    2026-05-01: all 9 documented format slugs return HTTP 200, but
-    `explorer` / `brawl` (= Standard Brawl) / `standard-brawl` return
-    a 219-byte empty `<urlset>` stub (untapped doesn't carry those
-    formats). We still URL them — the parser surfaces "0 archetypes"
-    via `cmd_fetch_meta`'s "0 decks extracted" drift error, which
-    accurately reflects the source.
+    `/sitemap/constructed-archetypes.xml?format=<slug>`.  Re-verified
+    2026-05-02: standard / historic / pioneer / alchemy / timeless /
+    historic-brawl all populate; explorer + standard-brawl return an
+    empty `<urlset>` stub and are omitted from `_FMT_TO_SITEMAP_SLUG`.
     """
     slug = _FMT_TO_SITEMAP_SLUG.get(fmt)
     if slug is None:
