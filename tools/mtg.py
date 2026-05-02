@@ -760,6 +760,64 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
     return (0 if not msgs else 1), msgs
 
 
+# Module-level filter for `_validate_for_corpus`. Any `validate_deck`
+# message whose first space-delimited token (or full prefix before the
+# first colon) appears here is treated as load-bearing for corpus
+# quality and propagated as a rejection reason. Companion eligibility
+# is checked elsewhere (`cmd_companion`) and does NOT surface from
+# `validate_deck`, so it never appears here. The strict ≤15 sideboard
+# check is intentionally excluded — meta scrapes routinely publish
+# 16-card sideboards (one source occasionally double-counts a flex
+# slot) and dropping the deck is more harmful than the false signal.
+#
+# Categories KEPT (matched against `validate_deck`'s msg shapes,
+# tools/mtg.py:657-760):
+#   - "brawl: expected exactly 1 commander"          (commander presence)
+#   - "brawl: deck size must be 100"                 (deck size — Brawl)
+#   - "{fmt}: main deck must be ≥60"                 (deck size — 60-card)
+#   - "singleton: <name> appears N times"            (singleton — Brawl)
+#   - "4-of: <name> appears N times"                 (4-of cap — 60-card)
+#   - "commander <name> not a legendary creature/…"  (commander presence)
+#   - "unknown card: <name>"                         (per-card resolve)
+#   - "mtga-import: '<name>' (layout=…)"             (Arena import shape)
+#   - "not on arena: <name>"                         (Arena availability)
+#   - "<legal_status> in <fmt>: <name>"              (format legality)
+#   - "identity violation: <name> adds {…}"          (color identity)
+#
+# Category DROPPED (sideboard-size strict check, false-positive risk):
+#   - "{fmt}: sideboard must be ≤15"
+#
+# Match logic: drop messages that match any DROP regex; keep all
+# others. KEEP-set is implicit (everything else from validate_deck).
+_CORPUS_VALIDATION_DROP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^[a-z]+: sideboard must be"),
+)
+
+
+def _validate_for_corpus(
+    entries: list[DeckEntry], fmt: str
+) -> tuple[bool, list[str]]:
+    """Corpus-policy validation: returns ``(ok, reasons)``.
+
+    Wraps :func:`validate_deck` and filters out the messages that are
+    not load-bearing for corpus quality (currently: the strict ≤15
+    sideboard size check). Every other rejection reason from
+    ``validate_deck`` propagates verbatim so downstream consumers can
+    aggregate by reason.
+
+    ``ok=True`` (with ``reasons=[]``) when no kept messages remain
+    after filtering. ``ok=False`` (with the kept message list) when at
+    least one load-bearing rejection survives.
+    """
+    _, msgs = validate_deck(entries, fmt)
+    kept: list[str] = [
+        m
+        for m in msgs
+        if not any(p.search(m) for p in _CORPUS_VALIDATION_DROP_PATTERNS)
+    ]
+    return (not kept), kept
+
+
 def _card_legal_in(c: dict, fmt: str) -> bool:
     if "arena" not in (c.get("games") or []):
         return False
