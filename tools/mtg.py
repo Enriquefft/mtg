@@ -99,6 +99,10 @@ from mtg_sources.untapped import (  # noqa: E402
     parse_untapped,
     url_for_format as untapped_url_for_format,
 )
+from mtg_sources.archidekt import (  # noqa: E402
+    parse_archidekt,
+    url_for_format as archidekt_url_for_format,
+)
 
 ROOT = Path(os.environ.get("MTG_ROOT") or Path(__file__).resolve().parent.parent)
 DATA = ROOT / "data"
@@ -6770,6 +6774,7 @@ _FETCH_META_PARSERS = {
     "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
     "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format),
     "untapped": (parse_untapped, untapped_url_for_format),
+    "archidekt": (parse_archidekt, archidekt_url_for_format),
 }
 
 # Sources the spec lists in the `--source` choices but that we have not
@@ -6846,7 +6851,7 @@ _FETCH_META_INDEX_ACCEPT = {
 _FETCH_META_DEFAULT_LIMIT: dict[str, int | None] = {
     "aetherhub": 50,
     "moxfield": 300,
-    "untapped": 250,
+    "untapped": 1000,
     "mtgazone": None,
     "mtggoldfish": None,
     "mtgdecks": None,
@@ -7143,9 +7148,15 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     # URL is appended to `also_seen_at` for traceability. Disk-resident
     # losers (`evicted`) are removed so the corpus stays canonical.
     existing_hashes = _existing_corpus_hashes(out_dir)
-    decks, dedup_dropped_decks, eviction_map = _common.dedup_decks(
-        decks, existing_hashes=existing_hashes,
-    )
+    if args.no_dedup:
+        # Measure collapse impact without applying it
+        _, dedup_dropped_decks, eviction_map = _common.dedup_decks(
+            decks, existing_hashes=existing_hashes,
+        )
+    else:
+        decks, dedup_dropped_decks, eviction_map = _common.dedup_decks(
+            decks, existing_hashes=existing_hashes,
+        )
     # Near-dup drops are counted off the winners' variant_count fields
     # (each winner with variant_count=N absorbed N-1 near-dups). Exact-
     # dedup drops are the remainder.
@@ -9413,12 +9424,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument(
         "--source",
-        choices=("aetherhub", "moxfield", "untapped", "mtggoldfish", "mtgazone", "mtgdecks"),
+        choices=("aetherhub", "moxfield", "untapped", "mtggoldfish", "mtgazone", "mtgdecks", "archidekt"),
         default="mtgazone",
         help=(
             "meta source (default: mtgazone). 'moxfield' = api2.moxfield.com "
-            "user-built decks (largest corpus, all formats). 'aetherhub' = "
-            "Arena-native /Metagame index w/ winrates (~50 archetypes per "
+            "user-built decks (largest corpus, all formats). 'archidekt' = "
+            "user-deckbuilder source (high novelty, different selection bias). "
+            "'aetherhub' = Arena-native /Metagame index w/ winrates (~50 archetypes per "
             "format). 'untapped' = Arena-native scrape (only automated "
             "brawl source). 'mtgdecks' covers Historic only. See docs/sources.md."
         ),
@@ -9432,7 +9444,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "cap deck count after parsing. If omitted, uses the "
             "per-source default (aetherhub=50, moxfield=300, "
-            "untapped=250; mtgazone/mtggoldfish/mtgdecks=all). "
+            "untapped=1000; mtgazone/mtggoldfish/mtgdecks/archidekt=all). "
             "Pass --limit 0 to disable the cap entirely."
         ),
     )
@@ -9451,6 +9463,14 @@ def main(argv: list[str] | None = None) -> int:
             "(0.0-1.0). Only applies to sources that publish winrates "
             "(untapped, aetherhub); decks without winrate metadata are "
             "kept regardless. Recommended floor: 0.50."
+        ),
+    )
+    s.add_argument(
+        "--no-dedup", action="store_true",
+        help=(
+            "skip near-dup deduplication (Jaccard >= 0.85 collapse). "
+            "Useful for measuring raw dedup impact; default is to deduplicate. "
+            "Collapse stats still logged either way."
         ),
     )
     s.set_defaults(func=cmd_fetch_meta)

@@ -24,6 +24,7 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | `mtggoldfish.com` | 200 (occasional 403) | primary paper meta; retry once on 403, then fall back |
 | **`aetherhub.com`** | **403** | **manual-research only** — see note below |
 | `mtgdecks.net` | 200 (re-verified 2026-05-01) | **third Historic source.** Earlier `403` resolved; vanilla UA gets 200. Wired as `fetch-meta --source mtgdecks historic`. |
+| `archidekt.com` | 200 | **user-deckbuilder source, all formats.** High novelty bias (different selection than tier-list scrapers). Wired as `fetch-meta --source archidekt <format>`. |
 
 We deliberately do **not** circumvent the blocks. Headless Chromium / TLS
 impersonation (`curl-impersonate`, `curl_cffi`) would work, but: (a)
@@ -84,6 +85,7 @@ Listed primary → fallback per format.
 
 ### Historic Brawl (Scryfall key: `brawl`)
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic-brawl — `fetch-meta --source untapped brawl` (verified 2026-05-01; 1470 archetypes, 100-card singleton with commander; format CLI key `brawl` maps to untapped slug `historic-brawl`)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt brawl` (user-built decklists, high novelty)
 - https://mtgaassistant.net/Meta/Historic-Brawl/ — meta breakdown (manual cross-reference)
 
 ### Standard Brawl (Scryfall key: `standardbrawl`)
@@ -92,25 +94,30 @@ Listed primary → fallback per format.
 
 ### Standard
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=standard — `fetch-meta --source untapped standard` (verified 2026-05-01; uses path 3 / format-wide API + poll-on-202 — Standard archetype pages are fully client-rendered)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt standard` (user-built decklists, high novelty)
 - https://www.mtggoldfish.com/metagame/standard — `fetch-meta --source mtggoldfish standard`
 - https://mtgazone.com/standard-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone standard`
 
 ### Alchemy
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=alchemy — `fetch-meta --source untapped alchemy` (verified 2026-05-01)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt alchemy` (user-built decklists, high novelty)
 - https://mtgazone.com/alchemy-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone alchemy`
 
 ### Historic
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic — `fetch-meta --source untapped historic` (verified 2026-05-01; SSR-embedded decks)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt historic` (user-built decklists, high novelty)
 - https://www.mtggoldfish.com/metagame/historic — `fetch-meta --source mtggoldfish historic`
 - https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
 - https://mtgdecks.net/Historic — `fetch-meta --source mtgdecks historic` (verified 2026-05-01; one deck per archetype, most-recent submission; tier from row class, winrate + sample from index columns)
 
 ### Timeless
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=timeless — `fetch-meta --source untapped timeless` (verified 2026-05-01)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt timeless` (user-built decklists, high novelty)
 - https://mtgazone.com/timeless-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone timeless`
 
 ### Pioneer (Arena's Explorer format draws from this pool)
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=pioneer — `fetch-meta --source untapped pioneer` (verified 2026-05-01; untapped serves Pioneer archetype pages under `/constructed/pioneer/...` directly. The analytics API uses `Explorer_Ladder` as the event_name internally — same telemetry bucket — but the sitemap and page URLs use `pioneer`)
+- https://www.archidekt.com/ — `fetch-meta --source archidekt pioneer` (user-built decklists, high novelty)
 - https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer` (also reached via `--source mtgazone pioneer`)
 - https://www.mtggoldfish.com/metagame/pioneer — paper Pioneer; retry once on 403
 

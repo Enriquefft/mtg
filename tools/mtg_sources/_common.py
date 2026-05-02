@@ -205,6 +205,7 @@ def slugify(text: str) -> str:
 SOURCE_PRIORITY: tuple[str, ...] = (
     "untapped",
     "moxfield",
+    "archidekt",
     "aetherhub",
     "mtgazone",
     "mtggoldfish",

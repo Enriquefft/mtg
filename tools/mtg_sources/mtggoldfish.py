@@ -72,6 +72,7 @@ _URL_TEMPLATES = {
     "standard": "https://www.mtggoldfish.com/metagame/standard",
     "historic": "https://www.mtggoldfish.com/metagame/historic",
     "pioneer": "https://www.mtggoldfish.com/metagame/pioneer",
+    "explorer": "https://www.mtggoldfish.com/metagame/explorer",
 }
 
 

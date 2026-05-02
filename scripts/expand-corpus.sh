@@ -17,7 +17,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # ~500MB per process; parallelism would balloon RAM and any meta.json
 # cross-write isn't a concern (each format has its own sidecar).
 if [ "$FMT" = "all" ]; then
-  ALL_FORMATS=(standard alchemy historic timeless pioneer brawl)
+  ALL_FORMATS=(standard alchemy historic timeless pioneer brawl explorer standardbrawl)
   rc=0
   for f in "${ALL_FORMATS[@]}"; do
     echo
@@ -32,9 +32,9 @@ LOG_DIR="$ROOT/data/corpus/.fetch-logs"
 mkdir -p "$LOG_DIR"
 
 # Sources to try, in priority order. moxfield first (largest corpus, no
-# throttle pain); aetherhub last (Cloudflare can JS-challenge bursts).
-# untapped is the all-formats baseline.
-SOURCES=(untapped moxfield aetherhub)
+# throttle pain); archidekt next (user-deckbuilder, high novelty); aetherhub last
+# (Cloudflare can JS-challenge bursts). untapped is the all-formats baseline.
+SOURCES=(untapped moxfield archidekt aetherhub)
 
 # Format -> sources that publish for it. Edits here keep the script
 # from wasting wall-clock on (source, format) pairs that hard-fail at
@@ -42,10 +42,10 @@ SOURCES=(untapped moxfield aetherhub)
 case "$FMT" in
   # standardbrawl: aetherhub publishes <10 decks under /Metagame/Brawl/
   # (per aetherhub.py:64) — not worth the throttle.
-  standardbrawl)              ENABLED="untapped moxfield" ;;
-  brawl)                      ENABLED="untapped moxfield aetherhub" ;;
-  standard|alchemy|historic)  ENABLED="untapped moxfield aetherhub" ;;
-  timeless|pioneer|explorer)  ENABLED="untapped moxfield aetherhub" ;;
+  standardbrawl)              ENABLED="untapped moxfield archidekt" ;;
+  brawl)                      ENABLED="untapped moxfield archidekt aetherhub" ;;
+  standard|alchemy|historic)  ENABLED="untapped moxfield archidekt aetherhub" ;;
+  timeless|pioneer|explorer)  ENABLED="untapped moxfield archidekt aetherhub" ;;
   *)                          ENABLED="${SOURCES[*]}" ;;
 esac
 

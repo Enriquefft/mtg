@@ -62,13 +62,12 @@ _TIER_NUM_TO_LETTER = {
 # the constructed-Arena formats. Pioneer is published as `explorer-bo1`
 # (the Arena-native equivalent), so the alias is built into the table.
 _URL_TEMPLATES = {
-    "standard": "https://mtgazone.com/standard-bo1-metagame-tier-list/",
-    "alchemy": "https://mtgazone.com/alchemy-bo1-metagame-tier-list/",
-    "historic": "https://mtgazone.com/historic-bo1-metagame-tier-list/",
-    "timeless": "https://mtgazone.com/timeless-bo1-metagame-tier-list/",
-    "explorer": "https://mtgazone.com/explorer-bo1-metagame-tier-list/",
-    # Pioneer on Arena = Explorer; same page.
-    "pioneer": "https://mtgazone.com/explorer-bo1-metagame-tier-list/",
+    "standard":  "https://mtgazone.com/standard-bo1-metagame-tier-list/",
+    "alchemy":   "https://mtgazone.com/alchemy-bo1-metagame-tier-list/",
+    "historic":  "https://mtgazone.com/historic-bo1-metagame-tier-list/",
+    "timeless":  "https://mtgazone.com/timeless-bo1-metagame-tier-list/",
+    "explorer":  "https://mtgazone.com/explorer-bo1-metagame-tier-list/",
+    "pioneer":   "https://mtgazone.com/explorer-bo1-metagame-tier-list/",
 }
 
 

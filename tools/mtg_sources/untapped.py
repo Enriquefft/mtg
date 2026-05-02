@@ -61,10 +61,12 @@ returns binary deckstrings + tag arrays only, no per-deck win
 counts on the /free tier). `winrate=None`, `sample` populated from
 the archetype's deck-list response when available.
 
-We take the FIRST deck per archetype (the API returns them in
-descending-frequency order). One archetype → one `ParsedDeck` matches
-the existing parsers' shape; if the user wants per-deck breadth they
-can re-parse with future per-archetype-deck-N selection.
+We take the TOP 3 DECKS per archetype (the API returns them in
+descending-frequency order) to multiply corpus breadth by ~3x without
+per-deck API bloat. Duplicates with identical lists are dropped
+downstream by `_write_meta_corpus`'s near-dup deduplication. When an
+archetype appears multiple times in the sitemap (rare), we suffix deck
+names with variant markers.
 
 Probe verified 2026-05-01 against:
   * sitemap.xml endpoints for all 9 formats
@@ -107,12 +109,14 @@ from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
 # publish a tier list for format X" error path rather than fetching
 # an empty sitemap and exit-1'ing as drift.
 _FMT_TO_SITEMAP_SLUG: dict[str, str] = {
-    "standard":  "standard",
-    "historic":  "historic",
-    "pioneer":   "pioneer",
-    "alchemy":   "alchemy",
-    "timeless":  "timeless",
-    "brawl":     "historic-brawl",  # our `brawl` = Historic Brawl
+    "standard":      "standard",
+    "historic":      "historic",
+    "pioneer":       "pioneer",
+    "explorer":      "explorer",
+    "alchemy":       "alchemy",
+    "timeless":      "timeless",
+    "brawl":         "historic-brawl",  # our `brawl` = Historic Brawl
+    "standardbrawl": "standard-brawl",
 }
 
 
@@ -568,12 +572,14 @@ def _format_wide_decks(fmt: str) -> list[dict] | None:
 # `Explorer_Ladder`. Brawl maps to `Play_Brawl_Historic` (the actual
 # event Brawl matches log to in MTGA telemetry).
 _FMT_TO_EVENT_NAME: dict[str, str] = {
-    "standard": "Ladder",
-    "historic": "Historic_Ladder",
-    "pioneer":  "Explorer_Ladder",
-    "alchemy":  "Alchemy_Ladder",
-    "timeless": "Timeless_Ladder",
-    "brawl":    "Play_Brawl_Historic",
+    "standard":      "Ladder",
+    "historic":      "Historic_Ladder",
+    "pioneer":       "Explorer_Ladder",
+    "explorer":      "Explorer_Ladder",
+    "alchemy":       "Alchemy_Ladder",
+    "timeless":      "Timeless_Ladder",
+    "brawl":         "Play_Brawl_Historic",
+    "standardbrawl": "Play_Brawl_Standard",
 }
 
 
@@ -720,7 +726,7 @@ def parse_untapped(
         return []
 
     decks: list[ParsedDeck] = []
-    seen_slugs: dict[str, int] = {}
+    seen_archetypes: dict[str, int] = {}  # Track archetype slug collisions
     total_archetypes = len(archetypes)
     target = limit if (limit is not None and limit > 0) else total_archetypes
     # Progress tick: a brawl walk at limit=250 is ~250 HTTP fetches and
@@ -750,51 +756,56 @@ def parse_untapped(
         if not api_decks:
             continue
 
-        # First deck = highest-frequency for this archetype (untapped
-        # API returns descending order). Matches mtgdecks.net's
-        # one-deck-per-archetype shape so the corpus is comparable.
-        first_deck = api_decks[0]
-        deckstring = first_deck.get("ds")
-        if not isinstance(deckstring, str) or not deckstring:
-            continue
+        # Top 3 decks = highest-frequency for this archetype (untapped
+        # API returns descending order) to multiply corpus breadth ~3x.
+        # Track archetype slug collisions separately from per-deck variants.
+        arch_count = seen_archetypes.get(slug, 0) + 1
+        seen_archetypes[slug] = arch_count
+        arch_suffix = "" if arch_count == 1 else f"-{arch_count}"
 
-        try:
-            entries, unresolved = _entries_from_deckstring(
-                deckstring, titleid_to_name, resolve_name,
-            )
-        except ValueError:
-            # V4 decode failed for this one deck (magic / version).
-            # Skip — almost certainly corrupt input, not a parser bug.
-            continue
-        if not entries:
-            continue
+        for deck_idx, deck in enumerate(api_decks[:3], start=1):
+            deckstring = deck.get("ds")
+            if not isinstance(deckstring, str) or not deckstring:
+                continue
 
-        # Stub-deck filter (basic-land padded placeholders) is applied
-        # centrally by `cmd_fetch_meta` via `_common.is_stub_deck`, so
-        # every source benefits without re-implementing the heuristic.
+            try:
+                entries, unresolved = _entries_from_deckstring(
+                    deckstring, titleid_to_name, resolve_name,
+                )
+            except ValueError:
+                # V4 decode failed for this one deck (magic / version).
+                # Skip — almost certainly corrupt input, not a parser bug.
+                continue
+            if not entries:
+                continue
 
-        # Slug from the URL (already lowercase, hyphenated, ASCII).
-        # De-dup by appending -2, -3 if untapped reused a slug across
-        # archetype IDs (very rare; mostly happens for "boros-burn"
-        # variants that diverged in the meta period).
-        n = seen_slugs.get(slug, 0) + 1
-        seen_slugs[slug] = n
-        out_slug = slug if n == 1 else f"{slug}-{n}"
+            # Stub-deck filter (basic-land padded placeholders) is applied
+            # centrally by `cmd_fetch_meta` via `_common.is_stub_deck`, so
+            # every source benefits without re-implementing the heuristic.
 
-        archetype_display = archetype_name or _slug_to_archetype(slug)
+            # Slug from the URL (already lowercase, hyphenated, ASCII).
+            # When multiple decks from the same archetype, suffix with
+            # variant marker only if deck_idx > 1. If the same slug appears
+            # in multiple archetype rows (very rare), append arch_suffix first.
+            if deck_idx == 1:
+                out_slug = f"{slug}{arch_suffix}"
+            else:
+                out_slug = f"{slug}{arch_suffix}-variant{deck_idx}"
 
-        decks.append(ParsedDeck(
-            slug=out_slug,
-            archetype=archetype_display,
-            source="untapped",
-            url=archetype_url,
-            tier="",                # untapped publishes no letter tiers
-            winrate=None,           # not on /free tier endpoints
-            sample=sample,
-            fetched=fetched,
-            entries=entries,
-            unresolved=unresolved,
-        ))
+            archetype_display = archetype_name or _slug_to_archetype(slug)
+
+            decks.append(ParsedDeck(
+                slug=out_slug,
+                archetype=archetype_display,
+                source="untapped",
+                url=archetype_url,
+                tier="",                # untapped publishes no letter tiers
+                winrate=None,           # not on /free tier endpoints
+                sample=sample,
+                fetched=fetched,
+                entries=entries,
+                unresolved=unresolved,
+            ))
 
     return decks
 

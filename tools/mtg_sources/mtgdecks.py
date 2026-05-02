@@ -28,9 +28,11 @@ and the `/Historic/h-<slug>-decklist-by-<user>-<id>` deck pages):
 * **Archetype** — server-rendered list of individual user-submitted
   decks. The first `<a href="/Historic/h-<slug>-decklist-by-<user>-<id>">`
   in document order is the most-recent submission (mtgdecks lists by
-  recency by default). v0 takes that single deck per archetype to mirror
-  mtgazone's "one-deck-per-archetype" output shape; multi-deck-per-
-  archetype is a later feature, flagged in the report but not shipped.
+  recency by default). We take the top 3 decks per archetype (most recent
+  submissions first) to multiply corpus breadth by ~3x; duplicates with
+  identical lists are dropped downstream by `_write_meta_corpus`'s
+  near-dup deduplication. When an archetype's URL appears multiple times
+  in the index (very rare), we suffix deck names with variant markers.
 
 * **Deck** — embeds the full MTGA paste verbatim in
   `<textarea id="arena_deck">Deck\n4 …\nSideboard\n…</textarea>`. Plain
@@ -133,12 +135,12 @@ _TILE_WINRATE_RE = re.compile(
 
 # --- per-archetype-page region carving -----------------------------------
 
-# Deck-page link inside an archetype page. The slug appears prefixed by
+# Deck-page links inside an archetype page. The slug appears prefixed by
 # `h-<archetype-slug>-decklist-by-<user>-<id>`. We capture the relative
-# href; document order = recency order (newest first), so the first hit
-# is the v0 singleton. Anchors on the relative `/Historic/h-` form that
-# the archetype-page deck table uses (the sidebar / footer never link to
-# `h-` URLs, so there's no false-positive risk).
+# href; document order = recency order (newest first). All matches are
+# extracted; we take up to top 3. Anchors on the relative `/Historic/h-`
+# form that the archetype-page deck table uses (the sidebar / footer never
+# link to `h-` URLs, so there's no false-positive risk).
 _DECK_LINK_RE = re.compile(
     r'href="(/Historic/h-[a-z0-9-]+-decklist-by-[a-z0-9-]+-\d+)"',
     re.IGNORECASE,
@@ -205,7 +207,7 @@ def parse_mtgdecks(
 
     # Append a sentinel so each tile body slices to the next tile's start.
     bounds = [m.start() for m in tile_matches] + [len(raw_html)]
-    seen_slugs: dict[str, int] = {}
+    seen_archetypes: dict[str, int] = {}  # Track archetype slug collisions
 
     for i, m in enumerate(tile_matches):
         body = raw_html[m.start():bounds[i + 1]]
@@ -241,7 +243,7 @@ def parse_mtgdecks(
 
         archetype_url = f"https://mtgdecks.net/Historic/{slug}"
 
-        # Fetch the archetype page to get the first deck's URL. We use
+        # Fetch the archetype page to get up to 3 deck URLs. We use
         # the index URL as Referer per the documented contract. A 4xx
         # after retry drops this archetype; the rest of the run continues.
         try:
@@ -253,47 +255,56 @@ def parse_mtgdecks(
         except urllib.error.URLError:
             continue
 
-        deck_link_m = _DECK_LINK_RE.search(arch_html)
-        if not deck_link_m:
+        # Extract up to top 3 deck links (document order = recency order).
+        deck_links = _DECK_LINK_RE.findall(arch_html)
+        if not deck_links:
             # Drift: archetype page rendered but no deck link inside.
             continue
-        deck_path = deck_link_m.group(1)
-        deck_url = "https://mtgdecks.net" + deck_path
 
-        try:
-            deck_html = http_get_text(
-                deck_url, retry_403_once=True, referer=archetype_url,
-            )
-        except urllib.error.HTTPError:
-            continue
-        except urllib.error.URLError:
-            continue
+        # Track archetype slug collisions separately from per-deck variants.
+        arch_count = seen_archetypes.get(slug, 0) + 1
+        seen_archetypes[slug] = arch_count
+        arch_suffix = "" if arch_count == 1 else f"-{arch_count}"
 
-        entries, unresolved = _entries_from_deck_page(deck_html, resolve_name)
-        if not entries:
-            # Drift: deck page rendered but textarea missing or empty.
-            continue
+        for deck_idx, deck_path in enumerate(deck_links[:3], start=1):
+            deck_url = "https://mtgdecks.net" + deck_path
 
-        # The slug from the URL is already kebab-case ASCII and unique
-        # per archetype on the index — no need to re-slugify the display
-        # name. Disambiguate with `-2`, `-3`, ... if (somehow) two index
-        # rows pointed to the same slug.
-        n = seen_slugs.get(slug, 0) + 1
-        seen_slugs[slug] = n
-        final_slug = slug if n == 1 else f"{slug}-{n}"
+            try:
+                deck_html = http_get_text(
+                    deck_url, retry_403_once=True, referer=archetype_url,
+                )
+            except urllib.error.HTTPError:
+                continue
+            except urllib.error.URLError:
+                continue
 
-        decks.append(ParsedDeck(
-            slug=final_slug,
-            archetype=archetype_raw,
-            source="mtgdecks",
-            url=deck_url,
-            tier=tier_letter,
-            winrate=winrate,
-            sample=sample,
-            fetched=fetched,
-            entries=entries,
-            unresolved=unresolved,
-        ))
+            entries, unresolved = _entries_from_deck_page(deck_html, resolve_name)
+            if not entries:
+                # Drift: deck page rendered but textarea missing or empty.
+                continue
+
+            # The slug from the URL is already kebab-case ASCII and unique
+            # per archetype on the index. When multiple decks from the same
+            # archetype, suffix with variant marker only if deck_idx > 1.
+            # If the same slug appears in multiple index rows (very rare),
+            # append arch_suffix first.
+            if deck_idx == 1:
+                final_slug = f"{slug}{arch_suffix}"
+            else:
+                final_slug = f"{slug}{arch_suffix}-variant{deck_idx}"
+
+            decks.append(ParsedDeck(
+                slug=final_slug,
+                archetype=archetype_raw,
+                source="mtgdecks",
+                url=deck_url,
+                tier=tier_letter,
+                winrate=winrate,
+                sample=sample,
+                fetched=fetched,
+                entries=entries,
+                unresolved=unresolved,
+            ))
 
     return decks
 
