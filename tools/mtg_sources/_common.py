@@ -9,12 +9,15 @@ re-deriving regex / section / multi-face rules. Single source of truth.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import urlsplit
 
 # Single source of truth for the toolkit's outbound User-Agent. Used by
 # `tools/mtg.py` (Scryfall JSON) and by per-source parsers fetching
@@ -76,6 +79,48 @@ def http_get_text(
         raise
 
 
+# Per-host HTTP connection pool. `urllib.request.urlopen` builds a
+# fresh HTTPSConnection (TCP+TLS handshake, ~150-300ms RTT-dependent)
+# per call; for a 2000-deck moxfield pull at ~500 calls (search + per-
+# deck) that adds 1-10 minutes of pure handshake. We hold one open
+# connection per `(scheme, host, port)` keyed entry and reuse it across
+# calls — http.client speaks HTTP/1.1 keep-alive natively.
+#
+# Stdlib only. urllib3 / requests are not importable in the dev shell.
+#
+# Thread safety: `_POOL_LOCK` guards both pool mutation AND the in-
+# flight HTTP I/O on a connection. http.client.HTTPSConnection is NOT
+# thread-safe (request/getresponse must run as one transaction), so the
+# lock has to span the entire request/response cycle. Today the parsers
+# are sequential within a process so this lock is uncontended; the lock
+# exists for Phase C cross-source parallelism safety.
+#
+# Pool growth is bounded by host count (~7 sources). No eviction.
+_POOL: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
+_POOL_LOCK = threading.Lock()
+
+
+def _get_conn(
+    scheme: str, host: str, port: int,
+) -> http.client.HTTPConnection:
+    """Return a pooled HTTP(S)Connection for `(scheme, host, port)`.
+
+    Caller must hold `_POOL_LOCK`. Creates a fresh connection on first
+    use; otherwise returns the cached one. http.client lazily opens the
+    socket on the first `request()` call, so the cost of cache-miss on
+    `_get_conn` itself is just object allocation.
+    """
+    key = (scheme, host, port)
+    conn = _POOL.get(key)
+    if conn is None:
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=120)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=120)
+        _POOL[key] = conn
+    return conn
+
+
 def _do_http_get(
     url: str,
     *,
@@ -84,14 +129,71 @@ def _do_http_get(
     user_agent: str | None = None,
     extra_headers: dict[str, str] | None = None,
 ) -> str:
+    parts = urlsplit(url)
+    scheme = parts.scheme
+    host = parts.hostname
+    if host is None:
+        raise ValueError(f"_do_http_get: url has no hostname: {url!r}")
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
     headers = {"User-Agent": user_agent or USER_AGENT, "Accept": accept}
     if referer:
         headers["Referer"] = referer
     if extra_headers:
         headers.update(extra_headers)
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=120) as r:
-        raw = r.read()
+
+    key = (scheme, host, port)
+
+    # Connection-died fallback: HTTP keep-alive idle-times-out after
+    # the server's keep-alive window (typically 5-30s), and a previously-
+    # pooled connection may be closed when we next try to use it. The
+    # request raises RemoteDisconnected / BadStatusLine / ConnectionError
+    # depending on which point of the cycle the FIN arrives. Retry once
+    # with a freshly-allocated connection — anything beyond that is a
+    # real network problem and re-raises so callers' retry logic
+    # (http_get_text retry-403-once) sees a normal HTTPError shape.
+    with _POOL_LOCK:
+        conn = _get_conn(scheme, host, port)
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+            reason = resp.reason
+            resp_headers = resp.getheaders()
+        except (
+            http.client.RemoteDisconnected,
+            http.client.BadStatusLine,
+            ConnectionError,
+            OSError,
+        ):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _POOL.pop(key, None)
+            conn = _get_conn(scheme, host, port)
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+            reason = resp.reason
+            resp_headers = resp.getheaders()
+
+    if status != 200:
+        # Mimic urllib.error.HTTPError exactly: callers
+        # (http_get_text retry-403-once, parsers' urllib.error.HTTPError
+        # except-clauses) check `.code` and that contract is the public
+        # surface of this function. Headers wrapped via http.client's
+        # HTTPMessage so `.headers.get(...)` works downstream.
+        hdrs = http.client.HTTPMessage()
+        for k, v in resp_headers:
+            hdrs[k] = v
+        raise urllib.error.HTTPError(url, status, reason, hdrs, None)
+
     return raw.decode("utf-8", errors="replace")
 
 # MTGA export deck-line: `<count> <Name> (<SET>) <NUM>`. The set code is
