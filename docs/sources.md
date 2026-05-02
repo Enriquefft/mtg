@@ -22,7 +22,7 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | `mtgaassistant.net` | 200 | secondary, Brawl meta breakdown |
 | `magic.wizards.com` | 200 | official ban announcements |
 | `mtggoldfish.com` | 200 (occasional 403) | primary paper meta; retry once on 403, then fall back |
-| **`aetherhub.com`** | **403** | **manual-research only** — see note below |
+| `aetherhub.com` | 200 (re-verified 2026-05-01) | **auto-fetched, all formats with `/Metagame/<slug>/`.** Earlier `403` resolved; vanilla UA gets 200 on both index and `/Deck/<slug>` pages. Wired as `fetch-meta --source aetherhub <fmt>` for brawl/standard/alchemy/historic/timeless/pioneer. |
 | `mtgdecks.net` | 200 (re-verified 2026-05-01) | **third Historic source.** Earlier `403` resolved; vanilla UA gets 200. Wired as `fetch-meta --source mtgdecks historic`. |
 | `archidekt.com` | 200 | **user-deckbuilder source, all formats.** High novelty bias (different selection than tier-list scrapers). Wired as `fetch-meta --source archidekt <format>`. |
 
@@ -61,11 +61,14 @@ Three resolution paths inside `_fetch_archetype_decks`: SSR-embedded
 (post-rotation tail), and format-wide API (Standard, fully
 client-rendered) with poll-on-202 for untapped's async-query backend.
 
-**`aetherhub.com` (manual-only):** retained as a *secondary* H-Brawl
-cross-check now that untapped is the primary automated source. If the
-user asks for an even deeper signal than untapped publishes, ask them
-to browse aetherhub manually and paste the relevant page text into
-the session — do not WebFetch it.
+**`aetherhub.com` (re-enabled 2026-05-01):** Cloudflare no longer 403s
+the toolkit's vanilla UA on either `/Metagame/<slug>/` indices or
+`/Deck/<slug>` pages. `fetch-meta --source aetherhub <fmt>` walks the
+Arena-native /Metagame index for the format and emits one ParsedDeck
+per archetype with source-published winrates. Wired into
+`scripts/expand-corpus.sh` for brawl/standard/alchemy/historic/timeless/
+pioneer; standardbrawl deliberately excluded because aetherhub
+publishes <10 decks under `/Metagame/Brawl/`.
 
 ## Card data + legalities (canonical)
 
@@ -85,6 +88,7 @@ Listed primary → fallback per format.
 
 ### Historic Brawl (Scryfall key: `brawl`)
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic-brawl — `fetch-meta --source untapped brawl` (verified 2026-05-01; 1470 archetypes, 100-card singleton with commander; format CLI key `brawl` maps to untapped slug `historic-brawl`)
+- https://aetherhub.com/Metagame/Historic-Brawl/ — `fetch-meta --source aetherhub brawl` (re-enabled 2026-05-01; ~50 archetypes with source-published winrates)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt brawl` (user-built decklists, high novelty)
 - https://mtgaassistant.net/Meta/Historic-Brawl/ — meta breakdown (manual cross-reference)
 
@@ -94,17 +98,20 @@ Listed primary → fallback per format.
 
 ### Standard
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=standard — `fetch-meta --source untapped standard` (verified 2026-05-01; uses path 3 / format-wide API + poll-on-202 — Standard archetype pages are fully client-rendered)
+- https://aetherhub.com/Metagame/Standard-BO1/ — `fetch-meta --source aetherhub standard` (re-enabled 2026-05-01)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt standard` (user-built decklists, high novelty)
 - https://www.mtggoldfish.com/metagame/standard — `fetch-meta --source mtggoldfish standard`
 - https://mtgazone.com/standard-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone standard`
 
 ### Alchemy
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=alchemy — `fetch-meta --source untapped alchemy` (verified 2026-05-01)
+- https://aetherhub.com/Metagame/Alchemy-BO1/ — `fetch-meta --source aetherhub alchemy` (re-enabled 2026-05-01)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt alchemy` (user-built decklists, high novelty)
 - https://mtgazone.com/alchemy-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone alchemy`
 
 ### Historic
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=historic — `fetch-meta --source untapped historic` (verified 2026-05-01; SSR-embedded decks)
+- https://aetherhub.com/Metagame/Historic-BO1/ — `fetch-meta --source aetherhub historic` (re-enabled 2026-05-01)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt historic` (user-built decklists, high novelty)
 - https://www.mtggoldfish.com/metagame/historic — `fetch-meta --source mtggoldfish historic`
 - https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
@@ -112,11 +119,13 @@ Listed primary → fallback per format.
 
 ### Timeless
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=timeless — `fetch-meta --source untapped timeless` (verified 2026-05-01)
+- https://aetherhub.com/Metagame/Timeless-BO1/ — `fetch-meta --source aetherhub timeless` (re-enabled 2026-05-01)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt timeless` (user-built decklists, high novelty)
 - https://mtgazone.com/timeless-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone timeless`
 
 ### Pioneer (Arena's Explorer format draws from this pool)
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=pioneer — `fetch-meta --source untapped pioneer` (verified 2026-05-01; untapped serves Pioneer archetype pages under `/constructed/pioneer/...` directly. The analytics API uses `Explorer_Ladder` as the event_name internally — same telemetry bucket — but the sitemap and page URLs use `pioneer`)
+- https://aetherhub.com/Metagame/Explorer-BO1/ — `fetch-meta --source aetherhub pioneer` (re-enabled 2026-05-01; aetherhub publishes under the Explorer-BO1 slug)
 - https://www.archidekt.com/ — `fetch-meta --source archidekt pioneer` (user-built decklists, high novelty)
 - https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer` (also reached via `--source mtgazone pioneer`)
 - https://www.mtggoldfish.com/metagame/pioneer — paper Pioneer; retry once on 403
@@ -131,7 +140,6 @@ Listed primary → fallback per format.
 - **edhrec.com** — paper Commander only; many "good" recommendations are not on Arena, are banned in Brawl, or use the wrong color-identity rules.
 - **mtgtop8.com** — paper-only competitive results.
 - **gatherer.wizards.com** — official but slow to update and missing newer fields.
-- **aetherhub.com** (auto-fetch) — Cloudflare 403s every WebFetch. Manual-only for Historic Brawl, see Bot-block reality above.
 
 ## Workflow
 
@@ -139,5 +147,5 @@ When picking a commander or evaluating a meta call:
 
 1. `mtg search 'legal:<fmt> game:arena t:legendary t:creature ...'` to enumerate candidates.
 2. WebFetch the primary meta source for the format above; if it 403s, retry once, then use the listed fallback.
-3. Cross-reference: a commander showing up on the untapped tier-list *and* in mtgaassistant/mtgazone deck articles is a real meta deck. For Historic Brawl specifically, ask the user to confirm aetherhub commander-share if a finer signal is needed.
+3. Cross-reference: a commander showing up on the untapped tier-list *and* aetherhub /Metagame *and* mtgaassistant/mtgazone deck articles is a real meta deck. aetherhub publishes per-archetype winrates so it's the cheapest finer-signal cross-check for Brawl.
 4. For decklists: untapped tier-list pages and mtgazone deck articles expose MTGA-export blocks. mtggoldfish has a "Copy to MTGA" button on each deck page.
