@@ -7663,22 +7663,11 @@ def _recommend_compute(
         1 for r in filtered if r["build_status"] == "BUILDABLE"
     )
     _HEADLINE_FLOOR = 0.90
-    if (
-        corpus_size >= 50
-        and median_owned_pct < _HEADLINE_FLOOR
-        and buildable_total < 10
-    ):
-        bottleneck = "collection"
-    elif corpus_size < 50 and buildable_total < 10:
-        bottleneck = "corpus"
-    else:
-        bottleneck = "none"
     corpus_health = {
         "median_owned_pct": median_owned_pct,
         "p25_owned_pct": p25_owned_pct,
         "p75_owned_pct": p75_owned_pct,
         "decks_at_min_or_above": decks_at_min_or_above,
-        "bottleneck": bottleneck,
     }
 
     # Top-level craft priority — computed off the full filtered set
@@ -7845,17 +7834,6 @@ def _print_recommend_text(
                 f"({entry['rarity']})"
             )
 
-    health = meta.get("corpus_health") or {}
-    if health.get("bottleneck") == "collection":
-        med = (health.get("median_owned_pct") or 0.0) * 100
-        print(
-            f"[note] median owned {med:.0f}% across "
-            f"{meta['corpus_size']}-deck corpus; bottleneck is collection, "
-            f"not corpus. Consider tools/mtg derive / invent for "
-            f"owned-card variants, or tools/mtg recommend --format all "
-            f"to see craft priorities across formats.",
-            file=sys.stderr,
-        )
 
 
 def _cmd_recommend_all(args: argparse.Namespace) -> int:
@@ -8085,11 +8063,9 @@ def _print_recommend_all_text(payload: dict) -> None:
     print()
     print("=== per-format summary ===")
     for fm in payload["formats"]:
-        health = fm.get("corpus_health") or {}
         print(
             f"  {fm['format']:<14} corpus={fm['corpus_size']:>4}  "
-            f"buildable={fm['buildable_count']:>3}  "
-            f"bottleneck={health.get('bottleneck', 'n/a')}"
+            f"buildable={fm['buildable_count']:>3}"
         )
     print()
     decks = payload["decks"]
@@ -8216,7 +8192,6 @@ def cmd_recommend(args: argparse.Namespace) -> int:
                     "p25_owned_pct": 0.0,
                     "p75_owned_pct": 0.0,
                     "decks_at_min_or_above": 0,
-                    "bottleneck": "corpus",
                 },
                 "craft_priority": [],
                 "format_winrate_prior": None,
@@ -9504,8 +9479,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     s.add_argument(
-        "--top", type=int, default=10, metavar="N",
-        help="cap ranked deck list at N (default: 10)",
+        "--top", type=int, default=50, metavar="N",
+        help="cap ranked deck list at N (default: 50)",
     )
     s.add_argument(
         "--max-sub-pct", type=float, default=None, metavar="N",
