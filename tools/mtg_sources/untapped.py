@@ -91,7 +91,7 @@ import urllib.error
 from pathlib import Path
 from typing import Callable
 
-from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
+from ._common import DeckEntry, ParsedDeck, http_get_text, pooled_get, slugify
 
 # --- format -> sitemap URL ----------------------------------------------
 
@@ -406,15 +406,17 @@ _API_BASE = "https://api.mtga.untapped.gg/api/v1"
 # untapped's analytics API uses an async-query pattern: the first call
 # returns HTTP 202 + an empty body while their backend runs the query;
 # subsequent calls hit the cached result and return 200 + the deck list.
-# Poll up to N times with linear backoff. 5 attempts × 2s = 10s max
-# wait per archetype, which is enough for warm queries (most return on
-# attempt 2) and keeps a `--limit 5` Standard fetch under a minute even
-# in the cold case where every archetype is being queried for the first
-# time. `http_get_text` only raises on 4xx/5xx, so 202 surfaces here as
-# a successful empty-body return; we have to detect it via
-# `urlopen.status` directly.
+# Poll up to N times with progressive backoff between attempts. 5 attempts
+# with sleeps `_API_POLL_DELAYS_SECS` between them = 7.5s total max wait
+# per archetype, enough for warm queries (most return on attempt 2) and
+# keeps a `--limit 5` Standard fetch under a minute even in the cold case
+# where every archetype is queried for the first time. The progressive
+# schedule (0.5/1.0/2.0/4.0) front-loads attempts so the common warm path
+# costs ~0.5s instead of the previous flat 2.0s — saves 1.5s per warm
+# archetype on brawl's ~1k-archetype walk. `pooled_get` returns the raw
+# status (no raise on 202) so the polling loop can branch on it directly.
 _API_POLL_ATTEMPTS = 5
-_API_POLL_DELAY_SECS = 2.0
+_API_POLL_DELAYS_SECS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 
 
 def _api_get_decks(api_url: str) -> list[dict] | None:
@@ -424,17 +426,19 @@ def _api_get_decks(api_url: str) -> list[dict] | None:
     returned 202 (untapped's backend never finalised the query).
     Network/HTTPError on the underlying GET propagates up to the
     caller so a single 5xx drops just the archetype, not the run.
+    Routes through the shared keep-alive pool (`pooled_get`) so
+    api.mtga.untapped.gg keeps one connection alive across the
+    ~1k-archetype walks brawl/historic produce — saves a TCP+TLS
+    handshake per archetype.
     """
-    import urllib.request
-    headers = {
-        "User-Agent": "mtg-toolkit/0.1 (github.com/Enriquefft/mtg)",
-        "Accept": "application/json",
-    }
+    extra = {"Accept": "application/json"}
     for attempt in range(_API_POLL_ATTEMPTS):
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as r:
-            status = r.status
-            body = r.read().decode("utf-8", errors="replace")
+        status, raw = pooled_get(
+            api_url,
+            accept="application/json",
+            extra_headers=extra,
+        )
+        body = raw.decode("utf-8", errors="replace")
         if status == 200 and body:
             try:
                 data = json.loads(body)
@@ -443,7 +447,7 @@ def _api_get_decks(api_url: str) -> list[dict] | None:
             return data if isinstance(data, list) else None
         # 202 or 200 with empty body -> poll again.
         if attempt < _API_POLL_ATTEMPTS - 1:
-            time.sleep(_API_POLL_DELAY_SECS)
+            time.sleep(_API_POLL_DELAYS_SECS[attempt])
     return None
 
 

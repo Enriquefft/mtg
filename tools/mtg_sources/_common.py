@@ -431,6 +431,39 @@ def _do_one_hop(
     return status, reason, resp_headers, raw
 
 
+def pooled_get(
+    url: str,
+    *,
+    accept: str = "application/json",
+    user_agent: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    """GET via the keep-alive pool. Return `(status, body)` on 2xx; raise on non-2xx.
+
+    Lower-level than `http_get_text`: no redirect-following, no retry, no
+    redirect-spanning cross-process lock. Use when the caller must
+    inspect non-200 success statuses (e.g. untapped's analytics API
+    pattern of 202 + empty body while a query runs server-side) and owns
+    the retry/poll loop itself. Non-2xx still raises `HTTPError` so
+    existing per-source `except urllib.error.HTTPError` blocks behave
+    identically. Inherits the per-host pool lock + connection-died
+    fallback from `_do_one_hop`.
+    """
+    status, reason, headers, raw = _do_one_hop(
+        url,
+        accept=accept,
+        referer=None,
+        user_agent=user_agent,
+        extra_headers=extra_headers,
+    )
+    if not (200 <= status < 300):
+        hdrs = http.client.HTTPMessage()
+        for k, v in headers:
+            hdrs[k] = v
+        raise urllib.error.HTTPError(url, status, reason, hdrs, None)
+    return status, raw
+
+
 def _do_http_get(
     url: str,
     *,
