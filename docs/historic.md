@@ -176,5 +176,8 @@ Same steps with constructed adjustments:
    tools/mtg fetch-meta historic --out decks/historic/ --limit 30
    tools/mtg coverage --batch --glob 'decks/historic/*.txt' --with-subs --json
    ```
-   `mtgazone` is the only auto-fetchable Arena tier source today; see
-   `docs/sources.md` for the bot-block reality table.
+   For Historic, `fetch-meta` covers `untapped`, `moxfield`, `archidekt`,
+   `aetherhub`, `mtgazone`, `mtgdecks`, `mtggoldfish` (all auto-fetchable
+   as of 2026-05-01). Use `scripts/expand-corpus.sh historic` to walk
+   every parser in priority order. See `docs/sources.md` for per-host
+   status and per-format wiring.

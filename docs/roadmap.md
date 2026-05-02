@@ -274,9 +274,10 @@ Land in this sequence. Each step is independently shippable.
 3. **`coverage --batch`.** Trivial once `suggest-subs` is callable —
    it's a glob loop with a JSON formatter.
 4. **`fetch-meta`.** Largest surface (one parser per source) but each
-   source can be added independently. Start with mtgazone — only
-   auto-fetchable Arena tier source after the 2026-04-30 untapped
-   block. untapped scrape deferred; aetherhub manual-only.
+   source can be added independently. Shipped: `mtgazone`, `mtggoldfish`,
+   `mtgdecks`, `untapped`, `aetherhub`, `archidekt`, `moxfield` — all
+   auto-fetchable as of 2026-05-01 (untapped + aetherhub blocks resolved;
+   see `docs/sources.md` bot-block table).
 5. **`shells`.** Cherry on top; novel-deck signal.
 6. **`docs/historic.md` + `CLAUDE.md` workflow split.** Documentation
    pass once the code is in place.
@@ -290,7 +291,10 @@ Land in this sequence. Each step is independently shippable.
 - **No deckbuilding-from-scratch agent.** `shells` surfaces clusters;
   Claude assembles.
 - **No paper-format support.** This toolkit is Arena-only by charter.
-- **No bot-block circumvention.** untapped/aetherhub stay manual per `docs/sources.md`.
+- **No bot-block circumvention.** No headless Chromium / TLS impersonation
+  / `curl-impersonate` / `curl_cffi`. If a host's vanilla-UA path 403s,
+  the parser hard-fails and the source is dropped from the per-format
+  wiring rather than worked around (see `docs/sources.md`).
 
 ## Invariants any contributor must preserve
 

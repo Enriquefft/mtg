@@ -109,11 +109,20 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
     ```
     Default `--out` is `data/corpus/<fmt>/` (machine-managed, gitignored;
     distinct from tracked human drafts under `decks/<name>/`). Sources:
-    `mtgazone`, `mtggoldfish`, `mtgdecks`, `untapped` (the only automated
-    Brawl source — `--source untapped brawl`; also covers
-    `historic`/`standard`/`pioneer`/`alchemy`/`timeless` with much larger
-    samples than mtgazone). See `docs/sources.md`.
-    Add `--no-cache` to bypass `data/meta-cache/`, `--json` for stdout output.
+    `mtgazone`, `mtggoldfish`, `mtgdecks`, `untapped`, `aetherhub`,
+    `archidekt`, `moxfield`. Brawl auto-sources: `untapped`, `moxfield`,
+    `archidekt`, `aetherhub` (untapped + moxfield carry the bulk; aetherhub
+    adds per-deck winrates). Per-format wiring in `scripts/expand-corpus.sh`;
+    full per-host status in `docs/sources.md`. Add `--no-cache` to bypass
+    `data/meta-cache/`, `--json` for stdout output.
+
+    Bulk corpus build (every parser for one format, then `corpus-clean` +
+    `freq --rebuild` + `recommend` smoke-check):
+    ```bash
+    scripts/expand-corpus.sh historic           # one format
+    scripts/expand-corpus.sh all                # walk every Arena format
+    scripts/expand-corpus.sh historic --fresh   # wipe meta-cache + corpus first
+    ```
 
 13. **For owned-card replacements** preserving role/CMC/CI/companion:
     ```bash
@@ -135,6 +144,58 @@ tools/mtg validate decks/nadu/v0.txt -f brawl   # offline validation
     tools/mtg shells --format historic --by type --min-cards 20
     tools/mtg shells --format historic --by theme
     ```
+
+15. **For ranking the corpus by what you can build right now** (the
+    headline collection-aware command):
+    ```bash
+    tools/mtg recommend --format historic --json
+    tools/mtg recommend --format all --quality strict --top 30
+    ```
+    Sorts every corpus deck by `owned_pct + with_subs_pct` with the
+    per-format F2 sub-fidelity floor applied (`--max-sub-pct` overrides).
+    `--quality strict` keeps only winrate-bearing sources (untapped,
+    aetherhub) plus user-derived/invented decks. `--format all`
+    additionally computes `cross_format_unlock` per deck (how many other
+    decks become buildable when this one's gaps are crafted).
+
+16. **For materializing a corpus deck against your collection**
+    (per-slot top `suggest-subs` candidate, validated):
+    ```bash
+    tools/mtg derive data/corpus/historic/izzet-phoenix.txt
+    tools/mtg derive data/corpus/historic/izzet-phoenix.txt --out /tmp/sub.txt
+    ```
+    Default output is `data/corpus/<fmt>/derived/<source-slug>.txt`.
+    `--max-sub-pct 0.5` enforces the suggest-subs fidelity ceiling;
+    `--force` writes even when the derived deck fails validation
+    (debug only).
+
+17. **For composing a deck from scratch around a shell**
+    (collection priors + role template, one-shot):
+    ```bash
+    tools/mtg invent --format brawl --shell Survival --by keyword
+    tools/mtg invent --format historic --shell Dragon --by type --commander "Korlessa, Scale Singer"
+    ```
+    Output lands in `data/corpus/<fmt>/derived/<shell>-<commander>.txt`.
+    Claude orchestrates retries with different shells when a single pass
+    misses.
+
+18. **For per-format card popularity priors** (used by `recommend` and
+    `invent` internally; also queryable):
+    ```bash
+    tools/mtg freq historic                       # top 30 by deck_pct
+    tools/mtg freq historic --card "Fatal Push"   # one card's row
+    tools/mtg freq historic --rebuild             # rebuild _freq.json
+    ```
+    `_freq.json` is auto-rebuilt when stale; `--no-rebuild` forces
+    read-only.
+
+19. **For pruning corpus decks that fail write-time validation**
+    (catches legacy entries pre-dating the validation gate):
+    ```bash
+    tools/mtg corpus-clean historic --dry-run
+    tools/mtg corpus-clean historic
+    ```
+    `expand-corpus.sh` runs this between fetch and `freq --rebuild`.
 
 ## Training-cutoff rule (read this BEFORE drafting any cardlist)
 
@@ -159,11 +220,16 @@ Other format edge cases live in `docs/gotchas.md`.
 
 ## Layout
 
-`tools/mtg{,.py}` (CLI), `data/` (gitignored bulk + index + collection;
-`data/corpus/<fmt>/` holds machine-managed meta scrapes, also gitignored),
-`docs/` (formats / gotchas / sources / historic / roadmap), `decks/`
-(tracked human drafts: `decks/<name>/v*.txt`), `flake.nix` + `.envrc`
-(Nix dev shell: python3 + uv + jq + curl + dotnet-sdk_8 + util-linux).
+`tools/mtg{,.py}` (CLI), `tools/mtg_sources/` (per-host meta parsers:
+`untapped`, `moxfield`, `aetherhub`, `archidekt`, `mtgazone`, `mtgdecks`,
+`mtggoldfish`), `tools/inject/` (.NET payload for `collection dump`),
+`scripts/expand-corpus.sh` (bulk corpus build: every parser → `corpus-clean`
+→ `freq --rebuild` → `recommend` smoke-check, per format or `all`),
+`data/` (gitignored bulk + index + collection; `data/corpus/<fmt>/`
+holds machine-managed meta scrapes, also gitignored), `docs/`
+(formats / gotchas / sources / historic / roadmap), `decks/` (tracked
+human drafts: `decks/<name>/v*.txt`), `flake.nix` + `.envrc` (Nix dev
+shell: python3 + uv + jq + curl + dotnet-sdk_8 + util-linux).
 
 ## Workflow for building a new deck
 
