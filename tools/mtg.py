@@ -10341,59 +10341,191 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="mtg", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("sync", help="refresh Scryfall bulk + rebuild index")
-    s.add_argument("--force", action="store_true")
+    s = sub.add_parser(
+        "sync",
+        help="refresh Scryfall bulk + rebuild index",
+        description=(
+            "Fetch Scryfall's default-cards bulk dump (~500 MB) into "
+            "data/scryfall-default-cards.json and rebuild the pickled "
+            "name/printing/arena_id index at data/index.pkl. Skips the "
+            "download when the remote updated_at matches the cached "
+            "data/meta.json (idempotent; safe to run every session). "
+            "Run once per session before any other subcommand; warns if "
+            "the cache is >36h old."
+        ),
+        epilog=(
+            "files written:\n"
+            "  data/scryfall-default-cards.json   raw bulk dump\n"
+            "  data/index.pkl                     by_name + by_printing + by_arena_id\n"
+            "  data/meta.json                     updated_at + fetched_at + counts\n"
+            "\n"
+            "exit 0 on success (including no-op when current)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download and rebuild even when meta.json matches the remote updated_at",
+    )
     s.set_defaults(func=cmd_sync)
 
-    s = sub.add_parser("card", help="show full info for a card by name")
-    s.add_argument("name")
+    s = sub.add_parser(
+        "card",
+        help="show full info for a card by name",
+        description=(
+            "Resolve a card by Arena-style name against the local Scryfall "
+            "index and print oracle text, mana cost, type line, color "
+            "identity, format legalities, set/collector number, and arena_id. "
+            "Multi-face cards accept either face name or the canonical "
+            "`Front // Back` form. Offline; no rate budget."
+        ),
+    )
+    s.add_argument(
+        "name",
+        help="card name (Arena-style; case-insensitive). Multi-face cards "
+        "accept either face or `Front // Back`.",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_card)
 
-    s = sub.add_parser("printing", help="lookup by MTGA-style set+collector")
-    s.add_argument("set")
-    s.add_argument("num")
+    s = sub.add_parser(
+        "printing",
+        help="lookup by MTGA-style set+collector",
+        description=(
+            "Resolve a specific printing by its MTGA set code and collector "
+            "number (the form Arena uses in deck-export pasted lines, e.g. "
+            "`MH3 193`). Useful when the same name has multiple printings "
+            "and you need the exact one a deck file references."
+        ),
+    )
+    s.add_argument("set", help="MTGA/Scryfall set code (e.g. MH3, DMU, A-OTJ)")
+    s.add_argument("num", help="collector number within the set (e.g. 193)")
     _add_json_flag(s)
     s.set_defaults(func=cmd_printing)
 
-    s = sub.add_parser("legal", help="check legality in an Arena format")
-    s.add_argument("name")
-    s.add_argument("format")
+    s = sub.add_parser(
+        "legal",
+        help="check legality in an Arena format",
+        description=(
+            "Report whether a card is legal in the given Arena format and "
+            "whether it is on Arena at all. Exit 0 = legal AND on Arena; "
+            "exit 1 = banned/not-legal/not-on-arena; exit 2 = bad format. "
+            "See docs/formats.md for the format-key table (Scryfall's "
+            "`brawl` = Historic Brawl)."
+        ),
+    )
+    s.add_argument("name", help="card name (Arena-style; case-insensitive)")
+    s.add_argument(
+        "format",
+        metavar="FORMAT",
+        help=(
+            "Scryfall legality key: "
+            + ", ".join(sorted(ARENA_FORMATS))
+            + " (case-insensitive)"
+        ),
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_legal)
 
-    s = sub.add_parser("validate", help="validate an MTGA-export deck file")
-    s.add_argument("deck")
-    s.add_argument("-f", "--format", required=True)
-    s.add_argument("-v", "--verbose", action="store_true", help="print per-card status")
+    s = sub.add_parser(
+        "validate",
+        help="validate an MTGA-export deck file",
+        description=(
+            "Run the full deck-file gate: arena availability, format "
+            "legality, deck size, singleton (where applicable), color "
+            "identity (brawl), and commander rules. Exit 0 = clean deck, "
+            "exit 1 = at least one violation. The canonical pre-`done` "
+            "check for any deck edit."
+        ),
+    )
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
+    s.add_argument(
+        "-f", "--format", required=True, metavar="FORMAT",
+        help="Arena format: " + ", ".join(sorted(ARENA_FORMATS)),
+    )
+    s.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="print per-card pass/fail status (default: only failures)",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_validate)
 
-    s = sub.add_parser("analyze", help="composition breakdown (curve, role mix, CA)")
-    s.add_argument("deck")
-    s.add_argument("--include-sideboard", action="store_true", default=False)
-    s.add_argument("--sideboard-only", action="store_true", default=False)
+    s = sub.add_parser(
+        "analyze",
+        help="composition breakdown (curve, role mix, CA)",
+        description=(
+            "Print mana-curve histogram, type mix (creature/instant/sorcery/"
+            "artifact/enchant/planeswalker/land), function-tag counts "
+            "(removal, sweeper, counter, hand attack, peek, card-advantage, "
+            "loot, tutor, ramp, recursion, threat), color identity, and "
+            "per-card role table. Mainboard only by default; see "
+            "--include-sideboard / --sideboard-only."
+        ),
+    )
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
+    s.add_argument(
+        "--include-sideboard", action="store_true", default=False,
+        help="include sideboard cards alongside mainboard in the breakdown",
+    )
+    s.add_argument(
+        "--sideboard-only", action="store_true", default=False,
+        help="analyze only the sideboard (mutually exclusive with --include-sideboard)",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_analyze)
 
-    s = sub.add_parser("related", help="cards sharing each keyword with the anchor card")
-    s.add_argument("name")
-    s.add_argument("-f", "--format", default=None, help="filter by Arena format")
-    s.add_argument("--limit", type=int, default=15)
+    s = sub.add_parser(
+        "related",
+        help="cards sharing each keyword with the anchor card",
+        description=(
+            "Enumerate every card that shares each of the anchor card's "
+            "keyword abilities (one bucket per keyword, rarer cards first). "
+            "Use BEFORE drafting around a card with a named mechanic to "
+            "find its sister-card pool."
+        ),
+    )
+    s.add_argument("name", help="anchor card name (Arena-style)")
+    s.add_argument(
+        "-f", "--format", default=None, metavar="FORMAT",
+        help="filter sister cards by Arena format legality (omit = all formats)",
+    )
+    s.add_argument(
+        "--limit", type=int, default=15, metavar="N",
+        help="cap the cards listed per keyword bucket (default: 15)",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_related)
 
-    s = sub.add_parser("manabase", help="pip demand, color sources, etb-tapped lands")
-    s.add_argument("deck")
+    s = sub.add_parser(
+        "manabase",
+        help="pip demand, color sources, etb-tapped lands",
+        description=(
+            "Audit a deck's manabase: pip demand by color across CMC, total "
+            "color sources per color, count of etb-tapped lands, and any "
+            "obvious holes (insufficient sources for a heavy pip, no "
+            "untapped sources for an aggressive curve, etc.). Run after "
+            "every deck edit that touches the land base."
+        ),
+    )
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
     _add_json_flag(s)
     s.set_defaults(func=cmd_manabase)
 
-    s = sub.add_parser("wildcards", help="rarity breakdown for MTGA wildcard estimates")
-    s.add_argument("deck")
+    s = sub.add_parser(
+        "wildcards",
+        help="rarity breakdown for MTGA wildcard estimates",
+        description=(
+            "Group every card in a deck by Arena rarity (common / uncommon "
+            "/ rare / mythic) so you can map shortages to wildcard cost. "
+            "Pair with `gaps` to filter to only cards you don't already own."
+        ),
+    )
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
     s.add_argument(
         "--list",
         action="store_true",
-        help="also list every card grouped by rarity",
+        help="also list every card grouped by rarity (default: counts only)",
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_wildcards)
@@ -10401,40 +10533,83 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "companion",
         help="check each MTGA companion's mechanical predicate against the deck",
+        description=(
+            "Test every Arena companion (Gyruda, Jegantha, Kaheera, Keruga, "
+            "Lurrus, Lutri, Obosh, Umori, Yorion, Zirda) against the deck "
+            "and report eligibility per companion (with the violating "
+            "card(s) when not eligible). Useful before slotting a "
+            "companion to confirm the build still satisfies the predicate."
+        ),
     )
-    s.add_argument("deck")
-    s.add_argument("-f", "--format", default="brawl", help="format (default: brawl)")
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
+    s.add_argument(
+        "-f", "--format", default="brawl", metavar="FORMAT",
+        help="Arena format predicate (default: brawl)",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_companion)
 
     s = sub.add_parser(
         "check",
         help="full battery: validate + analyze + manabase + wildcards + companion",
+        description=(
+            "One-shot deck audit: runs validate, analyze, manabase, "
+            "wildcards, and companion in one pass and prints all sections. "
+            "Add --collection to also run `gaps` (requires a populated "
+            "data/collection.json). The canonical end-of-edit smoke test."
+        ),
     )
-    s.add_argument("deck")
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
     s.add_argument(
         "-f",
         "--format",
         default="brawl",
+        metavar="FORMAT",
         help="format for the validate stage (default: brawl)",
     )
     s.add_argument(
         "--collection",
         action="store_true",
-        help="also run `gaps` if a collection snapshot exists",
+        help="also run `gaps` if data/collection.json exists",
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_check)
 
-    s = sub.add_parser("search", help="live Scryfall search (one HTTP request)")
-    s.add_argument("query")
-    s.add_argument("--limit", type=int, default=20)
+    s = sub.add_parser(
+        "search",
+        help="live Scryfall search (one HTTP request)",
+        description=(
+            "Issue a single live Scryfall search and print the matching "
+            "cards (name, mana cost, type line, set/collector). One HTTP "
+            "request — counts against the Scryfall rate budget; prefer "
+            "`card` / `printing` / `legal` for known cards. Full query "
+            "syntax: https://scryfall.com/docs/syntax."
+        ),
+    )
+    s.add_argument(
+        "query",
+        help="Scryfall query (https://scryfall.com/docs/syntax). Quote "
+        "queries containing spaces or shell metacharacters.",
+    )
+    s.add_argument(
+        "--limit", type=int, default=20, metavar="N",
+        help="max results to display (default: 20)",
+    )
     _add_json_flag(s)
     s.set_defaults(func=cmd_search)
 
     s = sub.add_parser(
         "collection",
         help="show summary of current collection snapshot or manage it",
+        description=(
+            "Without a subcommand: print a summary of data/collection.json "
+            "(card-name count, total quantity, per-rarity breakdown, "
+            "wildcard wallet). With a subcommand (dump / import / "
+            "from-decks / diagnose): manage the collection snapshot. "
+            "Populate data/collection.json once, then `own`, `owned`, "
+            "`gaps`, `coverage`, `wantlist`, and `recommend` become "
+            "collection-aware."
+        ),
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_collection)
@@ -10443,10 +10618,18 @@ def main(argv: list[str] | None = None) -> int:
     sd = csub.add_parser(
         "dump",
         help="full snapshot via DLL injection into the running MTGA process",
+        description=(
+            "Inject the .NET payload at tools/inject/ into the running "
+            "MTGA Mono runtime (Linux/Proton + Nix shell), read the "
+            "in-memory collection map, and write the canonical snapshot "
+            "to data/collection.json. Requires MTGA to be running and a "
+            "one-time `dotnet build -c Release` of tools/inject/."
+        ),
     )
     sd.add_argument(
         "--out",
         default=None,
+        metavar="PATH",
         help="raw dump path (default: data/collection.dump.json). The "
         "canonical snapshot is always written to data/collection.json.",
     )
@@ -10455,6 +10638,12 @@ def main(argv: list[str] | None = None) -> int:
     si = csub.add_parser(
         "import",
         help="import a tracker export (CSV/JSON) into data/collection.json",
+        description=(
+            "Convert a third-party tracker's collection export (CSV with "
+            "name+qty columns, or JSON keyed by name or arena_id) into "
+            "the canonical data/collection.json shape. Resolves names "
+            "against the local Scryfall index."
+        ),
     )
     si.add_argument("file", help="path to CSV or JSON exported by a tracker")
     si.set_defaults(func=cmd_collection_import)
@@ -10462,10 +10651,18 @@ def main(argv: list[str] | None = None) -> int:
     sf = csub.add_parser(
         "from-decks",
         help="lower-bound snapshot reconstructed from MTGA decks in Player.log",
+        description=(
+            "Parse MTGA's Player.log for saved-deck payloads and emit a "
+            "lower-bound collection snapshot (you must own at least the "
+            "cards in any deck you saved). Strictly a fallback when "
+            "`dump` isn't viable; numbers undercount cards never put in "
+            "a saved deck."
+        ),
     )
     sf.add_argument(
         "--log",
         default=None,
+        metavar="PATH",
         help="explicit Player.log path (default: auto-detect Linux/Proton, macOS, WSL)",
     )
     sf.set_defaults(func=cmd_collection_from_decks)
@@ -10473,17 +10670,32 @@ def main(argv: list[str] | None = None) -> int:
     sdg = csub.add_parser(
         "diagnose",
         help="report dump arena_ids that don't resolve in the Scryfall index",
+        description=(
+            "List arena_ids present in data/collection.dump.json (raw "
+            "dump) that fail to resolve against the local Scryfall index. "
+            "Useful for catching new-set drift between the dump and "
+            "stale bulk data — re-run `sync` if many ids are unresolved."
+        ),
     )
     sdg.add_argument(
         "--limit",
         type=int,
         default=20,
+        metavar="N",
         help="max unresolved ids to print (default 20; 0 = all)",
     )
     _add_json_flag(sdg)
     sdg.set_defaults(func=cmd_collection_diagnose)
 
-    s = sub.add_parser("own", help="show owned count for a card")
+    s = sub.add_parser(
+        "own",
+        help="show owned count for a card",
+        description=(
+            "Print the number of copies of a single card in "
+            "data/collection.json. Returns 0 cleanly for unowned cards "
+            "(exit 0 either way; check `qty` in --json output)."
+        ),
+    )
     s.add_argument("name", help="card name (Arena-style)")
     _add_json_flag(s)
     s.set_defaults(func=cmd_own)
@@ -10491,6 +10703,12 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "owned",
         help="list owned cards matching a Scryfall query (live, paginated)",
+        description=(
+            "Run a live Scryfall query, intersect the result set with "
+            "data/collection.json, and list every match with its owned "
+            "quantity. Paginates against Scryfall — costs HTTP requests "
+            "proportional to result-set size."
+        ),
     )
     s.add_argument("query", help="Scryfall query (https://scryfall.com/docs/syntax)")
     s.add_argument(
@@ -10507,8 +10725,20 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "suggest-subs",
         help="propose owned replacements for missing cards in a deck",
+        description=(
+            "For each card in the deck you don't own, propose owned "
+            "replacements that preserve role, CMC, color identity, and "
+            "(in brawl) commander/companion compatibility. Consults "
+            "strictlybetter.eu for functional reprints + community-"
+            "validated downgrades; owned matches outrank heuristic "
+            "candidates and are tagged `[strictlybetter]`. First run "
+            "with strictlybetter enabled performs a one-time ~10-min "
+            "bulk fetch into data/strictlybetter-cache.json (7d TTL). "
+            "Pass --apply to write a substituted deck file that "
+            "validates clean for -f."
+        ),
     )
-    s.add_argument("deck", help="path to MTGA-export deck file")
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
     s.add_argument(
         "-f", "--format", default="brawl",
         help="format predicate (default: brawl)",
@@ -10554,14 +10784,30 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "gaps",
         help="cards you are short for a deck + wildcard cost",
+        description=(
+            "List every card in the deck where owned-qty < deck-qty, "
+            "with the shortfall and rarity (so you can map the list to "
+            "wildcard cost). Requires data/collection.json. Pair with "
+            "`wildcards` for a rarity-only summary or `coverage` for the "
+            "headline percentage."
+        ),
     )
-    s.add_argument("deck", help="path to MTGA-export deck file")
+    s.add_argument("deck", help="path to MTGA-export deck file (.txt)")
     _add_json_flag(s)
     s.set_defaults(func=cmd_gaps)
 
     s = sub.add_parser(
         "coverage",
         help="%% of a deck buildable from your current collection",
+        description=(
+            "Compute the fraction of a deck buildable from "
+            "data/collection.json (owned_pct), and optionally the "
+            "fraction with substitutions (with_subs_pct via "
+            "`suggest-subs`). Use --batch + --glob to rank a directory "
+            "of decks. The F2 sub-fidelity floor (--max-sub-pct) clamps "
+            "with_subs_pct to owned_pct when a deck would be too heavily "
+            "substituted to remain faithful to the original."
+        ),
     )
     s.add_argument(
         "deck", nargs="?", default=None,
@@ -10609,6 +10855,14 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "freq",
         help="card-frequency index over data/corpus/<fmt>/*.txt (popularity prior)",
+        description=(
+            "Build (or query) the per-format card-frequency index "
+            "(data/corpus/<fmt>/_freq.json): for every card, deck_count, "
+            "deck_pct (popularity), and the archetypes it appears in. "
+            "Used as a popularity prior by `recommend` / `invent`; also "
+            "handy to ask 'how mainstream is this card in this format?'. "
+            "Auto-rebuilds when stale; --no-rebuild forces read-only."
+        ),
     )
     s.add_argument(
         "format",
@@ -10639,6 +10893,13 @@ def main(argv: list[str] | None = None) -> int:
             "drop corpus decks failing _validate_for_corpus, then rebuild "
             "_freq.json (use --dry-run to preview)"
         ),
+        description=(
+            "Delete every deck under data/corpus/<fmt>/ that fails the "
+            "write-time validation gate (catches legacy entries that "
+            "predate stricter validation), then rebuild _freq.json. "
+            "Run by scripts/expand-corpus.sh between fetch and "
+            "`freq --rebuild`. Use --dry-run to preview deletions."
+        ),
     )
     s.add_argument(
         "format",
@@ -10653,6 +10914,15 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "shells",
         help="cluster owned cards by keyword/type/theme for novel-deck discovery",
+        description=(
+            "Cluster cards in your collection by shared keyword (e.g. "
+            "Survival, Landfall), creature type (e.g. Dragon, Goblin), "
+            "or theme (e.g. ramp, lifegain), and report each cluster's "
+            "size + top anchors. Surfaces decks you can build from "
+            "what you already own without copying a published list. "
+            "Use --match-corpus to bridge each shell to overlapping "
+            "corpus archetypes."
+        ),
     )
     s.add_argument(
         "--format", required=True,
@@ -10696,6 +10966,15 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "wantlist",
         help="aggregate wildcard needs across every locally-saved deck",
+        description=(
+            "Walk every saved deck under decks/<name>/v*.txt (or a custom "
+            "--decks glob), compute the per-card shortfall against "
+            "data/collection.json, and aggregate the maximum shortfall "
+            "across decks. The result is your global wantlist: how many "
+            "of each card you'd need to satisfy every saved deck "
+            "simultaneously. Use --latest-only when you only care about "
+            "the highest-numbered version of each deck dir."
+        ),
     )
     s.add_argument(
         "--decks",
@@ -10713,6 +10992,13 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "diff",
         help="per-card delta between two MTGA-export deck files",
+        description=(
+            "Per-card added / removed / quantity-delta between two "
+            "MTGA-export deck files. Use to summarise what changed "
+            "between two versions of the same deck (e.g. v0.txt vs "
+            "v1.txt) — much cleaner than a raw text diff because it "
+            "ignores section ordering and groups by card name."
+        ),
     )
     s.add_argument("a", help="path to the older / left-hand deck file")
     s.add_argument("b", help="path to the newer / right-hand deck file")
@@ -10722,6 +11008,15 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "fetch-meta",
         help="scrape a meta source into <out>/<archetype>.txt + meta.json",
+        description=(
+            "Scrape a single meta source (mtgazone, mtggoldfish, mtgdecks, "
+            "untapped, aetherhub, archidekt, moxfield) for a given Arena "
+            "format, parse each deck into MTGA-export form, and write the "
+            "result into data/corpus/<fmt>/ as one .txt per archetype "
+            "plus an aggregate meta.json. The corpus is consumed by "
+            "`freq`, `recommend`, `coverage --batch`, etc. See "
+            "docs/sources.md for per-host status and edge cases."
+        ),
     )
     s.add_argument(
         "format",
@@ -10818,6 +11113,14 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser(
         "fetch-meta-all",
         help="run every parser supporting fmt in one process; merge + dedup + write once",
+        description=(
+            "Run every meta source whose url_for_format(fmt) returns "
+            "non-None in a single process, merge the results, deduplicate "
+            "(Jaccard >= 0.85), and write to data/corpus/<fmt>/ once. "
+            "Faster than calling `fetch-meta --source` per source because "
+            "it shares the index, validation, and dedup pass; --workers N "
+            "fans out across distinct sources for I/O parallelism."
+        ),
     )
     s.add_argument(
         "format",
@@ -10912,6 +11215,16 @@ def main(argv: list[str] | None = None) -> int:
         "recommend",
         help="rank corpus decks you can build (composite-sorted) + "
              "shell->archetype bridge for novel-deck discovery",
+        description=(
+            "Rank every deck in data/corpus/<fmt>/ by what you can build "
+            "right now: sorted on owned_pct + with_subs_pct with the "
+            "per-format F2 sub-fidelity floor applied. The headline "
+            "collection-aware command — answers 'what should I build "
+            "next?' Use --quality strict to keep only winrate-bearing "
+            "sources (untapped, aetherhub) plus user-derived/invented "
+            "decks; --format all additionally computes "
+            "cross_format_unlock per deck."
+        ),
     )
     s.add_argument(
         "--format", required=True,
@@ -10964,6 +11277,15 @@ def main(argv: list[str] | None = None) -> int:
         help="rewrite a corpus deck with owned substitutions "
              "(per-slot top suggest-subs candidate); writes to "
              "data/corpus/<fmt>/derived/<slug>.txt by default",
+        description=(
+            "Materialize a corpus deck against your collection: for each "
+            "missing card, pick the top `suggest-subs` candidate and "
+            "write a substituted, validated deck file. Use to take a "
+            "ranked-high archetype from `recommend` and turn it into a "
+            "playable list with cards you actually own. Output lands in "
+            "data/corpus/<fmt>/derived/ by default; `recommend --quality "
+            "strict` re-ingests these as user decks."
+        ),
     )
     s.add_argument("deck", help="source MTGA-export .txt (typically under data/corpus/<fmt>/)")
     s.add_argument(
@@ -11008,6 +11330,15 @@ def main(argv: list[str] | None = None) -> int:
         "invent",
         help="compose a deck from a shell + collection priors + role template "
              "(one-shot; Claude orchestrates retries with different shells)",
+        description=(
+            "Compose a deck from scratch around a shell key from "
+            "`tools/mtg shells` (e.g. 'Survival', 'Dragon'): seed with "
+            "shell anchors, fill role slots (removal/sweeper/CA/ramp/"
+            "threat/etc.) using collection-prior + format-frequency "
+            "ranking, and write a validated deck file. One-shot — "
+            "Claude orchestrates retries across different shells when "
+            "a single pass fails to produce a buildable list."
+        ),
     )
     s.add_argument(
         "--format", required=True,
