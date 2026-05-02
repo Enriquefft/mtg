@@ -86,7 +86,6 @@ import base64
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 from pathlib import Path
@@ -702,6 +701,7 @@ def parse_untapped(
     url: str,
     resolve_name: Callable[[str], dict | None],
     limit: int | None = None,
+    progress_cb: Callable[[int], None] | None = None,
     **_: object,
 ) -> list[ParsedDeck]:
     """Parse untapped's per-format sitemap into `ParsedDeck` list.
@@ -742,6 +742,7 @@ def parse_untapped(
                 resolve_name=resolve_name,
                 limit=limit,
                 titleid_to_name=titleid_to_name,
+                progress_cb=progress_cb,
             )
         return []
 
@@ -749,23 +750,12 @@ def parse_untapped(
     seen_archetypes: dict[str, int] = {}  # Track archetype slug collisions
     total_archetypes = len(archetypes)
     target = limit if (limit is not None and limit > 0) else total_archetypes
-    # Progress tick: a brawl walk at limit=250 is ~250 HTTP fetches and
-    # can stall up to 10s/archetype on a Cloudflare 202 chain. Without
-    # output the operator can't tell `fetch-meta` from a hung process;
-    # one-line stderr ticker every 10 archetypes (or every archetype
-    # when target is small) keeps the script visible.
-    tick_every = max(1, target // 25)
 
-    for i, (aid, slug, archetype_url) in enumerate(archetypes, start=1):
+    for aid, slug, archetype_url in archetypes:
         if limit is not None and limit > 0 and len(decks) >= limit:
             break
-        if i == 1 or i % tick_every == 0:
-            print(
-                f"[untapped] {i}/{total_archetypes} probed, "
-                f"{len(decks)}/{target} decks",
-                file=sys.stderr,
-                flush=True,
-            )
+        if progress_cb is not None:
+            progress_cb(len(decks))
         try:
             api_decks, archetype_name, sample = _fetch_archetype_decks(
                 archetype_url, aid, fmt,
@@ -848,6 +838,7 @@ def _decks_via_format_wide_api(
     resolve_name: Callable[[str], dict | None],
     limit: int | None,
     titleid_to_name: dict[int, str],
+    progress_cb: Callable[[int], None] | None = None,
 ) -> list[ParsedDeck]:
     """Format-wide-API fallback for formats with empty sitemaps.
 
@@ -882,23 +873,13 @@ def _decks_via_format_wide_api(
 
     # Largest group first = highest-frequency archetype first.
     ordered_ptgs = sorted(by_ptg.keys(), key=lambda k: -len(by_ptg[k]))
-    total_groups = len(ordered_ptgs)
-    target = limit if (limit is not None and limit > 0) else sum(
-        min(len(g), 8) for g in by_ptg.values()
-    )
-    tick_every = max(1, total_groups // 25)
 
     decks: list[ParsedDeck] = []
-    for i, ptg in enumerate(ordered_ptgs, start=1):
+    for ptg in ordered_ptgs:
         if limit is not None and limit > 0 and len(decks) >= limit:
             break
-        if i == 1 or i % tick_every == 0:
-            print(
-                f"[untapped] {i}/{total_groups} ptg-groups, "
-                f"{len(decks)}/{target} decks (format-wide fallback)",
-                file=sys.stderr,
-                flush=True,
-            )
+        if progress_cb is not None:
+            progress_cb(len(decks))
 
         group = by_ptg[ptg]
         slug_base = f"{fmt}-ptg-{ptg}"

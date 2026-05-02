@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 import time
 import urllib.error
 from typing import Callable
@@ -237,6 +236,7 @@ def parse_moxfield(
     url: str,
     resolve_name: Callable[[str], dict | None],
     limit: int | None = None,
+    progress_cb: Callable[[int], None] | None = None,
     **_: object,
 ) -> list[ParsedDeck]:
     """Parse a moxfield search response + walk per-deck endpoints.
@@ -319,16 +319,10 @@ def parse_moxfield(
 
     decks: list[ParsedDeck] = []
     seen_slugs: dict[str, int] = {}
-    total_pids = len(public_ids)
-    tick_every = max(1, total_pids // 25)
 
-    for i, (pid, _name_hint) in enumerate(public_ids, start=1):
-        if i == 1 or i % tick_every == 0:
-            print(
-                f"[moxfield] {i}/{total_pids} probed, {len(decks)} decks",
-                file=sys.stderr,
-                flush=True,
-            )
+    for pid, _name_hint in public_ids:
+        if progress_cb is not None:
+            progress_cb(len(decks))
         try:
             deck_json = _http_get_json(f"{_API_HOST}/v3/decks/all/{pid}")
         except urllib.error.HTTPError:

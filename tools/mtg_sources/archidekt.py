@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 import time
 import urllib.error
 from typing import Callable
@@ -189,6 +188,7 @@ def parse_archidekt(
     url: str,
     resolve_name: Callable[[str], dict | None],
     limit: int | None = None,
+    progress_cb: Callable[[int], None] | None = None,
     **_: object,
 ) -> list[ParsedDeck]:
     archidekt_fmt = _FORMAT_MAP.get(fmt)
@@ -217,16 +217,10 @@ def parse_archidekt(
 
     decks: list[ParsedDeck] = []
     seen_slugs: dict[str, int] = {}
-    total_ids = len(deck_ids)
-    tick_every = max(1, total_ids // 25)
 
-    for i, (deck_id, _name_hint) in enumerate(deck_ids, start=1):
-        if i == 1 or i % tick_every == 0:
-            print(
-                f"[archidekt] {i}/{total_ids} probed, {len(decks)} decks",
-                file=sys.stderr,
-                flush=True,
-            )
+    for deck_id, _name_hint in deck_ids:
+        if progress_cb is not None:
+            progress_cb(len(decks))
         try:
             deck_json = _http_get_json(f"{_API_HOST}/decks/{deck_id}/")
         except urllib.error.HTTPError:

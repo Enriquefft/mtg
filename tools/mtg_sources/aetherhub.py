@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import html as html_mod
 import re
-import sys
 import time
 import urllib.error
 from typing import Callable
@@ -215,6 +214,7 @@ def parse_aetherhub(
     url: str,
     resolve_name: Callable[[str], dict | None],
     limit: int | None = None,
+    progress_cb: Callable[[int], None] | None = None,
     **_: object,
 ) -> list[ParsedDeck]:
     """Parse the Metagame index + walk per-archetype deck pages.
@@ -254,16 +254,10 @@ def parse_aetherhub(
 
     decks: list[ParsedDeck] = []
     seen_slugs: dict[str, int] = {}
-    total_archetypes = len(archetype_ids)
-    tick_every = max(1, total_archetypes // 25)
 
-    for i, token in enumerate(archetype_ids, start=1):
-        if i == 1 or i % tick_every == 0:
-            print(
-                f"[aetherhub] {i}/{total_archetypes} probed, {len(decks)} decks",
-                file=sys.stderr,
-                flush=True,
-            )
+    for token in archetype_ids:
+        if progress_cb is not None:
+            progress_cb(len(decks))
         deck_url = f"{_HOST}/Deck/{token}"
         try:
             page_html = _http_get_html(deck_url)

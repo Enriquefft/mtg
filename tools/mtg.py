@@ -53,13 +53,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # Per-source meta parsers live alongside this file in `tools/mtg_sources/`.
 # The package isn't on sys.path by default (tools/ is a script dir, not a
@@ -7244,6 +7245,8 @@ def _fetch_one_source(
     args: argparse.Namespace,
     *,
     log_file_path: "Path | None" = None,
+    progress_cb: "Callable[[int], None] | None" = None,
+    quiet_stderr: bool = False,
 ) -> "list[_common.ParsedDeck]":
     """Fetch + parse one source; return raw ``ParsedDeck`` list.
 
@@ -7264,6 +7267,18 @@ def _fetch_one_source(
         When provided, progress lines are flushed to this file
         (overwrite mode) so ``tail -f`` works during long fetches.
         Matches the semantics the old bash ``tee`` pattern provided.
+    progress_cb:
+        Optional callback invoked from inside the parser's per-deck
+        loop with the current decks-so-far count. Used by
+        ``cmd_fetch_meta_all``'s heartbeat thread to render an
+        aggregate progress line; single-source CLI runs leave this
+        ``None``.
+    quiet_stderr:
+        When True, the routine `[src] fetching url` / `[src] parsed N
+        decks` log lines go to the per-source log file only, not
+        stderr. ``cmd_fetch_meta_all`` sets this to keep the live
+        console at heartbeat-only volume; ``cmd_fetch_meta`` (single
+        source, verbose) leaves it False.
 
     Raises
     ------
@@ -7290,7 +7305,8 @@ def _fetch_one_source(
         log_fh = log_file_path.open("w", encoding="utf-8", buffering=1)
 
     def _log(msg: str) -> None:
-        print(msg, file=sys.stderr)
+        if not quiet_stderr:
+            print(msg, file=sys.stderr)
         if log_fh is not None:
             print(msg, file=log_fh, flush=True)
 
@@ -7316,6 +7332,7 @@ def _fetch_one_source(
             html_text, fmt,
             fetched=fetched, url=url, resolve_name=_resolve_card,
             limit=effective_limit,
+            progress_cb=progress_cb,
         )
     except ValueError:
         if log_fh is not None:
@@ -7727,13 +7744,6 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     out_dir = Path(args.out) if getattr(args, "out", None) else CORPUS / fmt
 
-    print(
-        f"fetch-meta-all fmt={fmt} sources={','.join(enabled_sources)} "
-        f"out={out_dir}",
-        file=sys.stderr,
-    )
-    sys.stderr.flush()
-
     # SIGINT (Ctrl+C) fast-path: ThreadPoolExecutor.__exit__ blocks on
     # in-flight futures during shutdown, and Python can't kill worker
     # threads — they run until their HTTP I/O returns.  With WORKERS=7
@@ -7756,6 +7766,63 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
 
     workers = max(1, getattr(args, "workers", 1))
 
+    # Shared progress state for the heartbeat thread.  Each per-source
+    # parser invokes `progress[src]["count"] = N` via its `progress_cb`
+    # kwarg as it walks decks; the heartbeat thread reads under the lock
+    # every 20s and emits one consolidated `[fmt] tick @Ns: ...` line.
+    # Routine per-deck stderr ticks live in the per-source log file only;
+    # the live console stays at heartbeat-only volume so 8-format runs
+    # under PARALLEL_FORMATS stay readable.
+    progress_state: dict[str, dict] = {
+        src: {"status": "pending", "count": 0} for src in enabled_sources
+    }
+    progress_lock = threading.Lock()
+
+    def _set_status(source: str, status: str) -> None:
+        with progress_lock:
+            progress_state[source]["status"] = status
+
+    def _set_count(source: str, count: int) -> None:
+        with progress_lock:
+            progress_state[source]["count"] = count
+
+    # No `[fmt]` prefix here — when this runs under expand-corpus.sh
+    # with PARALLEL_FORMATS>1 the parent shell prefixes every child line
+    # via `sed -u "s/^/[$f] /"`, so embedding `[fmt]` here would
+    # double-tag.  Single-format CLI runs (`tools/mtg fetch-meta-all
+    # standard`) drop the prefix entirely; operator knows the format
+    # from the command line.
+    print(
+        f"starting (workers={workers}, sources: "
+        f"{' '.join(enabled_sources)})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    heartbeat_done = threading.Event()
+    start_t = time.monotonic()
+
+    def _heartbeat() -> None:
+        # Daemon thread: emits one consolidated status line every 20s.
+        # Stops when `heartbeat_done` is set (after Phase 1 completes).
+        while not heartbeat_done.wait(20.0):
+            with progress_lock:
+                elapsed = int(time.monotonic() - start_t)
+                parts = [
+                    f"{s}({d['status']} {d['count']})"
+                    for s, d in progress_state.items()
+                ]
+            print(
+                f"tick @{elapsed}s: {' '.join(parts)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat, daemon=True, name="heartbeat"
+    )
+    heartbeat_thread.start()
+
     def _collect_result(source: str, raw_or_exc: "list[_common.ParsedDeck] | Exception") -> None:
         """Apply one completed future's outcome to shared accumulators.
 
@@ -7763,95 +7830,94 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
         or inside the `as_completed` loop (both single-threaded at call site).
         """
         if isinstance(raw_or_exc, _SourceUnsupportedError):
-            print(f"[{source}] unsupported (skipped): {raw_or_exc}", file=sys.stderr)
+            _set_status(source, "unsupported")
+            print(f"{source} ∅ unsupported", file=sys.stderr, flush=True)
             per_source_stats[source] = {"status": "unsupported", "fetched": 0, "error": str(raw_or_exc)}
         elif isinstance(raw_or_exc, (urllib.error.HTTPError, urllib.error.URLError, ValueError, Exception)):
             # Catches every non-list value that isn't a ParsedDeck list.
-            print(f"[{source}] FAILED: {raw_or_exc}", file=sys.stderr)
+            _set_status(source, "fail")
+            print(f"{source} ✗ {raw_or_exc}", file=sys.stderr, flush=True)
             per_source_stats[source] = {"status": "failed", "fetched": 0, "error": str(raw_or_exc)}
         else:
             raw: list[_common.ParsedDeck] = raw_or_exc  # type: ignore[assignment]
+            with progress_lock:
+                progress_state[source]["status"] = "ok"
+                progress_state[source]["count"] = len(raw)
             per_source_stats[source] = {"status": "ok", "fetched": len(raw), "error": None}
             all_raw.extend(raw)
-            print(f"    [{source}] ok — {len(raw)} raw decks", file=sys.stderr)
-            sys.stderr.flush()
+            print(f"{source} ✓ {len(raw)}", file=sys.stderr, flush=True)
 
-    if workers == 1:
-        # Sequential path: identical semantics to Phase B.  Preserved as a
-        # fallback for debugging and single-host-flake reproduction; also
-        # produces cleaner stack traces than the threaded path.
-        for source in enabled_sources:
-            log_file = log_dir / f"{source}-{fmt}.log"
-            print(f"\n--- [{source}] {time.strftime('%Y-%m-%dT%H:%M:%S')} ---", file=sys.stderr)
-            sys.stderr.flush()
-            try:
-                raw = _fetch_one_source(source, fmt, args, log_file_path=log_file)
-            except Exception as e:
-                # Covers _SourceUnsupportedError, HTTPError, URLError,
-                # ValueError, and any other parser-level exception.
-                _collect_result(source, e)
-                continue
-            _collect_result(source, raw)
-    else:
-        # Concurrent path: one thread per source (I/O-bound HTTP).
-        #
-        # Print order changes vs. the sequential path: `as_completed` fires
-        # in wall-clock completion order (fastest source first) rather than
-        # the enabled_sources registry order.  The per-source summary table
-        # printed at the end is order-independent so this is acceptable.
-        #
-        # Thread-safety notes:
-        # - _collect_result is only called from the main thread inside the
-        #   `as_completed` loop — all_raw.extend and per_source_stats writes
-        #   are sequential.
-        # - _common._POOL_LOCK serialises the HTTP keep-alive pool at the
-        #   request/getresponse/read level.  Threads targeting DIFFERENT
-        #   hosts (moxfield, archidekt, untapped, aetherhub, …) each acquire
-        #   their own pool slot; the lock is held only for the brief dict
-        #   access + socket hand-off, not for I/O wait — so concurrency is
-        #   fully exploited across distinct hosts.
-        # - Per-source log files go to disjoint paths
-        #   (data/corpus/.fetch-logs/<source>-<fmt>.log) — no contention.
-        # - Per-source _PER_DECK_THROTTLE_SECS sleeps run per-thread; each
-        #   source observes its own independent politeness budget, which is
-        #   correct because different hosts have independent rate limits.
-        # - KeyboardInterrupt / SystemExit: ThreadPoolExecutor.__exit__
-        #   waits for in-flight futures (no dangling threads left behind).
-        # - If one source raises, its future propagates the exception here
-        #   and is recorded as "failed"; sibling futures are NOT cancelled —
-        #   each source is independent and partial success is useful.
-        print(
-            f"[fetch-meta-all] workers={workers} — sources run concurrently "
-            f"(print order = completion order, not registry order)",
-            file=sys.stderr,
+    def _run_source(source: str) -> "list[_common.ParsedDeck]":
+        """Wrap `_fetch_one_source` with progress-state plumbing."""
+        _set_status(source, "running")
+        return _fetch_one_source(
+            source,
+            fmt,
+            args,
+            log_file_path=log_dir / f"{source}-{fmt}.log",
+            progress_cb=lambda n, s=source: _set_count(s, n),
+            quiet_stderr=True,
         )
-        sys.stderr.flush()
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="fetch"
-        ) as pool:
-            futures: dict[concurrent.futures.Future, str] = {
-                pool.submit(
-                    _fetch_one_source,
-                    source,
-                    fmt,
-                    args,
-                    log_file_path=log_dir / f"{source}-{fmt}.log",
-                ): source
-                for source in enabled_sources
-            }
-            for fut in concurrent.futures.as_completed(futures):
-                source = futures[fut]
-                print(
-                    f"\n--- [{source}] completed {time.strftime('%Y-%m-%dT%H:%M:%S')} ---",
-                    file=sys.stderr,
-                )
-                sys.stderr.flush()
+
+    try:
+        if workers == 1:
+            # Sequential path: identical semantics to Phase B.  Preserved as a
+            # fallback for debugging and single-host-flake reproduction; also
+            # produces cleaner stack traces than the threaded path.
+            for source in enabled_sources:
                 try:
-                    raw = fut.result()
+                    raw = _run_source(source)
                 except Exception as e:
+                    # Covers _SourceUnsupportedError, HTTPError, URLError,
+                    # ValueError, and any other parser-level exception.
                     _collect_result(source, e)
                     continue
                 _collect_result(source, raw)
+        else:
+            # Concurrent path: one thread per source (I/O-bound HTTP).
+            #
+            # Print order changes vs. the sequential path: `as_completed` fires
+            # in wall-clock completion order (fastest source first) rather than
+            # the enabled_sources registry order.  The per-source summary table
+            # printed at the end is order-independent so this is acceptable.
+            #
+            # Thread-safety notes:
+            # - _collect_result is only called from the main thread inside the
+            #   `as_completed` loop — all_raw.extend and per_source_stats writes
+            #   are sequential.
+            # - _common._POOL_LOCK serialises the HTTP keep-alive pool at the
+            #   request/getresponse/read level.  Threads targeting DIFFERENT
+            #   hosts (moxfield, archidekt, untapped, aetherhub, …) each acquire
+            #   their own pool slot; the lock is held only for the brief dict
+            #   access + socket hand-off, not for I/O wait — so concurrency is
+            #   fully exploited across distinct hosts.
+            # - Per-source log files go to disjoint paths
+            #   (data/corpus/.fetch-logs/<source>-<fmt>.log) — no contention.
+            # - Per-source _PER_DECK_THROTTLE_SECS sleeps run per-thread; each
+            #   source observes its own independent politeness budget, which is
+            #   correct because different hosts have independent rate limits.
+            # - KeyboardInterrupt / SystemExit: ThreadPoolExecutor.__exit__
+            #   waits for in-flight futures (no dangling threads left behind).
+            # - If one source raises, its future propagates the exception here
+            #   and is recorded as "failed"; sibling futures are NOT cancelled —
+            #   each source is independent and partial success is useful.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="fetch"
+            ) as pool:
+                futures: dict[concurrent.futures.Future, str] = {
+                    pool.submit(_run_source, source): source
+                    for source in enabled_sources
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    source = futures[fut]
+                    try:
+                        raw = fut.result()
+                    except Exception as e:
+                        _collect_result(source, e)
+                        continue
+                    _collect_result(source, raw)
+    finally:
+        heartbeat_done.set()
 
     # Determine aggregate outcome before post-processing.
     statuses = {s["status"] for s in per_source_stats.values()}

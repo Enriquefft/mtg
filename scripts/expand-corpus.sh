@@ -130,9 +130,9 @@ if [ "$FMT" = "all" ]; then
 
   if [ "$PARALLEL_FORMATS" -gt 1 ]; then
     echo "==> PARALLEL_FORMATS=$PARALLEL_FORMATS — fanning out concurrently"
-    echo "    NOTE: stdout from concurrent children interleaves; the per-format"
-    echo "    '######### <fmt> #########' banner brackets segments, and the"
-    echo "    canonical record stays in $ROOT/data/corpus/.fetch-logs/<src>-<fmt>.log."
+    echo "    Each child line is prefixed with [<fmt>] so concurrent output"
+    echo "    is disambiguable; full per-source log at"
+    echo "    $ROOT/data/corpus/.fetch-logs/<src>-<fmt>.log."
     # FAILED_FMTS can't be appended from a subshell, so each child
     # writes its exit status to /tmp/expand-corpus-rc.<pid>/<fmt>.rc and
     # the parent collects them after `wait`.
@@ -149,11 +149,12 @@ if [ "$FMT" = "all" ]; then
       while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_FORMATS" ]; do
         wait -n
       done
+      # `sed -u` runs unbuffered (line-by-line) so the prefixed output
+      # streams in real time. `${PIPESTATUS[0]}` preserves the script's
+      # exit code through the sed pipe (without it we'd capture sed's).
       (
-        echo
-        echo "######### $f #########"
-        "${BASH_SOURCE[0]}" "$f"
-        echo $? > "$rcdir/$f.rc"
+        "${BASH_SOURCE[0]}" "$f" 2>&1 | sed -u "s/^/[$f] /"
+        echo "${PIPESTATUS[0]}" > "$rcdir/$f.rc"
       ) &
     done
     wait
