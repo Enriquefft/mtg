@@ -50,6 +50,7 @@ import os
 import pickle
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -7732,6 +7733,19 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     sys.stderr.flush()
+
+    # SIGINT (Ctrl+C) fast-path: ThreadPoolExecutor.__exit__ blocks on
+    # in-flight futures during shutdown, and Python can't kill worker
+    # threads — they run until their HTTP I/O returns.  With WORKERS=7
+    # inside one process and PARALLEL_FORMATS=N spawning N python procs,
+    # this can keep a "cancelled" run alive for tens of seconds per
+    # process.  Replace the default SIGINT handler with `os._exit(130)`
+    # for immediate process termination — bypasses KeyboardInterrupt
+    # unwinding, kills all threads, frees the bash parent's `wait`/`tee`
+    # pipeline so the operator's Ctrl+C feels immediate.  Installed
+    # only here (not at module import) so library use of mtg.py never
+    # steals SIGINT.
+    signal.signal(signal.SIGINT, lambda _sig, _frm: os._exit(130))
 
     # --- Phase 1: fetch + parse ---
     # per_source_stats tracks per-source outcome for the summary table.

@@ -26,6 +26,46 @@ from urllib.parse import urljoin, urlsplit
 USER_AGENT = "mtg-toolkit/0.1 (github.com/Enriquefft/mtg)"
 
 
+# Transient HTTP codes that justify a single retry-with-backoff. Codes
+# chosen because every observation in `data/corpus/.fetch-logs/` for
+# these has been a one-shot blip — the same URL re-fetched 2-10 seconds
+# later returns 200.  Specifically:
+#   429 — rate limit (archidekt's `/search/decks/` under PARALLEL_FORMATS
+#         load).  Honors `Retry-After` if present, capped to avoid
+#         pathological multi-minute sleeps blocking the worker pool.
+#   502 — Cloudflare-fronted host's origin returned 5xx briefly.
+#   503 — origin overloaded / maintenance window.
+#   504 — Cloudflare timed out talking to origin.
+#   526 — Cloudflare can't validate origin SSL (aetherhub flapped 526s
+#         in a recent run).  Always transient on the origin side.
+# 403 stays opt-in (`retry_403_once`) because some sources legitimately
+# 403 the toolkit's UA and only succeed via per-source workarounds.
+_TRANSIENT_RETRY_CODES: frozenset[int] = frozenset({429, 502, 503, 504, 526})
+
+# Cap on `Retry-After` honoring so a hostile or buggy origin can't park
+# our worker for minutes.  30s = 60x our default sleep cadence (0.5s);
+# beyond that, give up and let the parser hard-fail so the operator sees
+# the source is genuinely down.
+_RETRY_AFTER_CAP_SECS: float = 30.0
+
+
+def _retry_sleep_for(exc: urllib.error.HTTPError, default: float) -> float:
+    """Sleep duration for a transient retry. Honors `Retry-After` header.
+
+    `Retry-After` per RFC 7231 may be either delta-seconds (an int) or
+    an HTTP-date.  We support delta-seconds (the common form on 429s);
+    HTTP-date variants fall through to `default` rather than parse a
+    full RFC date format inline.  Cap at `_RETRY_AFTER_CAP_SECS`.
+    """
+    hdr = exc.headers.get("Retry-After") if exc.headers else None
+    if hdr:
+        try:
+            return min(float(hdr), _RETRY_AFTER_CAP_SECS)
+        except (ValueError, TypeError):
+            pass
+    return default
+
+
 def http_get_text(
     url: str,
     *,
@@ -43,11 +83,15 @@ def http_get_text(
     back into `tools/mtg.py` (circular) and don't grow a parallel HTTP
     stack with a different UA / timeout policy.
 
+    Transient-error retry: any response whose status is in
+    `_TRANSIENT_RETRY_CODES` (429/502/503/504/526) gets one retry after
+    a backoff.  429 honors `Retry-After`; others use `retry_sleep_secs`.
+    A second failure on the same code re-raises — sustained 5xx / 429
+    across two attempts is a real outage, not a blip.
+
     `retry_403_once`: per `docs/sources.md` mtggoldfish "occasionally
     403s; retry once". When True, a single retry with `retry_sleep_secs`
-    delay is attempted on the first 403; any second 403 (or any other
-    non-200) re-raises so the caller hard-fails per the production-
-    ready floor.
+    delay is attempted on the first 403; any second 403 re-raises.
 
     `referer`: optional `Referer` header. Required by mtgdecks.net deck
     pages per the source's spec (probe shows they 200 without it today,
@@ -70,13 +114,22 @@ def http_get_text(
             user_agent=user_agent, extra_headers=extra_headers,
         )
     except urllib.error.HTTPError as e:
-        if retry_403_once and e.code == 403:
-            time.sleep(retry_sleep_secs)
-            return _do_http_get(
-                url, accept=accept, referer=referer,
-                user_agent=user_agent, extra_headers=extra_headers,
-            )
-        raise
+        retry_this = (
+            e.code in _TRANSIENT_RETRY_CODES
+            or (retry_403_once and e.code == 403)
+        )
+        if not retry_this:
+            raise
+        sleep_for = (
+            _retry_sleep_for(e, retry_sleep_secs)
+            if e.code in _TRANSIENT_RETRY_CODES
+            else retry_sleep_secs
+        )
+        time.sleep(sleep_for)
+        return _do_http_get(
+            url, accept=accept, referer=referer,
+            user_agent=user_agent, extra_headers=extra_headers,
+        )
 
 
 # Per-host HTTP connection pool. `urllib.request.urlopen` builds a

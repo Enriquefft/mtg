@@ -33,6 +33,51 @@
 # the operator knows their box.
 set -uo pipefail
 
+# --- signal handling ----------------------------------------------------
+# Ctrl+C / SIGTERM during a long PARALLEL_FORMATS run used to leave
+# python ThreadPoolExecutor children stuck in shutdown for tens of
+# seconds (Python can't kill threads, so workers run until I/O returns;
+# the parent's `wait` blocks until python exits).  cmd_fetch_meta_all
+# now installs a SIGINT handler that calls os._exit(130) for immediate
+# python termination — but the bash parent still needs to:
+#   1. forward the signal to backgrounded children + their descendants
+#      (the `tee | python` pipeline inside each subshell);
+#   2. NOT loop into the next format after wait returns 130;
+#   3. clean up the rcdir tempfile from the PARALLEL_FORMATS branch.
+# Single trap covers both code paths (PARALLEL_FORMATS=1 single-pipeline
+# and PARALLEL_FORMATS>1 fan-out) and absorbs the rcdir cleanup that
+# previously lived in a separate `trap ... EXIT` inside the if-branch.
+RCDIR=""
+
+_expand_corpus_cleanup() {
+  # Block re-entry — second Ctrl+C should not race the first.
+  trap '' INT TERM
+  # `jobs -rp` lists running backgrounded job PIDs (direct children of
+  # this shell only).  pkill -P <pid> cascades to grandchildren so the
+  # `tee | python` pipeline inside each subshell dies along with its
+  # parent subshell.
+  local pids
+  pids=$(jobs -rp 2>/dev/null || true)
+  if [ -n "$pids" ]; then
+    echo "==> caught signal, terminating $(echo "$pids" | wc -w) child(ren)..." >&2
+    for p in $pids; do
+      pkill -TERM -P "$p" 2>/dev/null || true
+      kill -TERM "$p" 2>/dev/null || true
+    done
+    sleep 0.3
+    for p in $pids; do
+      pkill -KILL -P "$p" 2>/dev/null || true
+      kill -KILL "$p" 2>/dev/null || true
+    done
+  fi
+  if [ -n "$RCDIR" ] && [ -d "$RCDIR" ]; then
+    rm -rf "$RCDIR"
+  fi
+}
+
+trap '_expand_corpus_cleanup; exit 130' INT TERM
+trap '_expand_corpus_cleanup' EXIT
+
 # --- argv parse ---------------------------------------------------------
 FRESH=0
 FMT=""
@@ -91,11 +136,13 @@ if [ "$FMT" = "all" ]; then
     # FAILED_FMTS can't be appended from a subshell, so each child
     # writes its exit status to /tmp/expand-corpus-rc.<pid>/<fmt>.rc and
     # the parent collects them after `wait`.
-    rcdir=$(mktemp -d -t expand-corpus-rc.XXXXXX) || {
+    RCDIR=$(mktemp -d -t expand-corpus-rc.XXXXXX) || {
       echo "==> mktemp -d failed; cannot collect child exit codes" >&2
       exit 1
     }
-    trap 'rm -rf "$rcdir"' EXIT
+    rcdir="$RCDIR"
+    # Cleanup of $RCDIR is handled by the script-level EXIT trap
+    # (see top of file) so signal-driven exits also purge the tempdir.
     for f in "${ALL_FORMATS[@]}"; do
       # Cap concurrent jobs at PARALLEL_FORMATS. `wait -n` blocks until
       # any child exits, freeing a slot.
