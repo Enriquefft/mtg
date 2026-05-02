@@ -7105,10 +7105,14 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
         # Heavy schedule (5/15/45s + jitter, 3 retries) escapes the
         # >30s block window when the cross-process flock alone isn't
         # enough (e.g. residual counter from a prior burst). Per-deck
-        # calls in parsers leave this default-False — they run under
-        # the same flock so concurrent 429 risk is already low, and
-        # the heavy schedule × 50 decks would compound to hours.
+        # calls in parsers leave this default-False — the heavy
+        # schedule × 50 decks would compound to hours.
         heavy_429_retry=True,
+        # Cross-process flock for hosts in _CROSS_PROCESS_LOCK_HOSTS.
+        # Search-page only (this site); per-deck calls in parsers leave
+        # default-False so the 1s cooldown × 50 decks × N procs doesn't
+        # serialise the entire archidekt loop.
+        cross_process_lock=True,
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7894,12 +7898,17 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
             # - _collect_result is only called from the main thread inside the
             #   `as_completed` loop — all_raw.extend and per_source_stats writes
             #   are sequential.
-            # - _common._POOL_LOCK serialises the HTTP keep-alive pool at the
-            #   request/getresponse/read level.  Threads targeting DIFFERENT
-            #   hosts (moxfield, archidekt, untapped, aetherhub, …) each acquire
-            #   their own pool slot; the lock is held only for the brief dict
-            #   access + socket hand-off, not for I/O wait — so concurrency is
-            #   fully exploited across distinct hosts.
+            # - _common._POOL_LOCKS keys a `threading.Lock` per
+            #   `(scheme, host, port)`. Each per-host lock spans the
+            #   request/getresponse/read cycle for THAT host (http.client
+            #   isn't thread-safe per-connection, so the cycle has to be
+            #   atomic). Threads targeting DIFFERENT hosts (moxfield,
+            #   archidekt, untapped, aetherhub, …) hold DIFFERENT locks
+            #   and run truly concurrently — Phase C parallelism scales
+            #   with source count, not bottlenecked on a single global
+            #   lock. The dict that maps host → lock is itself protected
+            #   by `_POOL_REGISTRY_LOCK`, held only for microseconds
+            #   during dict access (lookup + create-if-missing).
             # - Per-source log files go to disjoint paths
             #   (data/corpus/.fetch-logs/<source>-<fmt>.log) — no contention.
             # - Per-source _PER_DECK_THROTTLE_SECS sleeps run per-thread; each

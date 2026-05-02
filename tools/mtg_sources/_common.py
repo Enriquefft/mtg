@@ -93,20 +93,37 @@ _HEAVY_429_JITTER_FRAC: float = 0.20
 
 
 @contextlib.contextmanager
-def _host_cross_process_lock(hostname: str | None) -> "Iterator[None]":
+def _host_cross_process_lock(
+    hostname: str | None, *, enabled: bool,
+) -> "Iterator[None]":
     """fcntl.flock-based cross-process serialization for fragile hosts.
 
-    No-op for hosts not in `_CROSS_PROCESS_LOCK_HOSTS`. For registered
-    hosts: acquires `LOCK_EX` on `_LOCK_DIR/.host-<hostname>.lock`,
-    yields, then sleeps `_CROSS_PROCESS_COOLDOWN_SECS` BEFORE releasing
-    so the next process inherits a quiet host. Concurrent-curl probe
-    against archidekt confirmed 200ms cooldown is too tight (next proc
+    No-op when `enabled` is False OR the hostname isn't in
+    `_CROSS_PROCESS_LOCK_HOSTS`. For registered hosts with the flag on:
+    acquires `LOCK_EX` on `_LOCK_DIR/.host-<hostname>.lock`, yields,
+    then sleeps `_CROSS_PROCESS_COOLDOWN_SECS` BEFORE releasing so the
+    next process inherits a quiet host. Concurrent-curl probe against
+    archidekt confirmed 200ms cooldown is too tight (next proc
     re-trips); 1s spaces 8-proc fan-out cleanly.
+
+    The `enabled` flag is the call-site opt-in. Search-page callers
+    (`tools/mtg.py:_fetch_meta_page`) set it True because PARALLEL_FORMATS
+    fan-out hammers `/search/decks/`. Per-archetype callers leave it
+    False because (a) those endpoints have not exhibited 429 burst
+    behavior, and (b) flock-per-deck × 50 decks × 1s cooldown × 8 procs
+    would compound into minutes of pure cooldown wait per `--fresh all`
+    build. Belt-and-suspenders: the registry filter still applies, so
+    flagging True for an unregistered host is also a no-op — keeps
+    serialization narrowly scoped to evidence-supported cases.
 
     Linux-only (fcntl). The dev shell and CI are Linux per
     flake.nix / CLAUDE.md.
     """
-    if hostname is None or hostname not in _CROSS_PROCESS_LOCK_HOSTS:
+    if (
+        not enabled
+        or hostname is None
+        or hostname not in _CROSS_PROCESS_LOCK_HOSTS
+    ):
         yield
         return
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -150,6 +167,7 @@ def http_get_text(
     user_agent: str | None = None,
     extra_headers: dict[str, str] | None = None,
     heavy_429_retry: bool = False,
+    cross_process_lock: bool = False,
 ) -> str:
     """Fetch `url` as text using the shared User-Agent.
 
@@ -193,6 +211,15 @@ def http_get_text(
     that 429 per-deck (would compound 50× per format); enable only at
     search-page call sites where one slow retry is worth a successful
     fetch.
+
+    `cross_process_lock`: opt-in `fcntl.flock`-based cross-process
+    serialization for hosts in `_CROSS_PROCESS_LOCK_HOSTS`. Off by
+    default. Enable only at search-page call sites — per-archetype
+    fetches don't 429 in concurrent observation and N×50 lock cycles
+    with cooldown would dominate wall-clock. Sleep-during-retry
+    happens OUTSIDE the lock window (the lock scope is one
+    `_do_http_get` call) so sibling processes can attempt during a
+    retry sleep. Unregistered hosts no-op even with the flag set.
     """
     legacy_retried = False
     heavy_429_attempts = 0
@@ -201,6 +228,7 @@ def http_get_text(
             return _do_http_get(
                 url, accept=accept, referer=referer,
                 user_agent=user_agent, extra_headers=extra_headers,
+                cross_process_lock=cross_process_lock,
             )
         except urllib.error.HTTPError as e:
             has_retry_after = bool(
@@ -247,16 +275,41 @@ def http_get_text(
 #
 # Stdlib only. urllib3 / requests are not importable in the dev shell.
 #
-# Thread safety: `_POOL_LOCK` guards both pool mutation AND the in-
-# flight HTTP I/O on a connection. http.client.HTTPSConnection is NOT
-# thread-safe (request/getresponse must run as one transaction), so the
-# lock has to span the entire request/response cycle. Today the parsers
-# are sequential within a process so this lock is uncontended; the lock
-# exists for Phase C cross-source parallelism safety.
+# Thread safety: PER-HOST locks. `http.client.HTTPSConnection` is not
+# thread-safe (request/getresponse/read must run as one transaction),
+# so a lock has to span the entire cycle. A SINGLE global lock would
+# also serialise threads on DIFFERENT hosts, defeating Phase C
+# parallelism — moxfield's slow page-walk would block aetherhub from
+# making any progress. We key locks by `(scheme, host, port)` so each
+# host serialises independently; threads targeting distinct hosts run
+# concurrently. The dict that maps key → lock is itself protected by
+# `_POOL_REGISTRY_LOCK`, held only briefly during dict access (lock
+# lookup + create-if-missing); the slow HTTP I/O happens under the
+# per-host lock alone.
 #
 # Pool growth is bounded by host count (~7 sources). No eviction.
 _POOL: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
-_POOL_LOCK = threading.Lock()
+_POOL_LOCKS: dict[tuple[str, str, int], threading.Lock] = {}
+_POOL_REGISTRY_LOCK = threading.Lock()
+
+
+def _get_host_lock(
+    scheme: str, host: str, port: int,
+) -> threading.Lock:
+    """Return the per-host `(scheme, host, port)` lock, creating if missing.
+
+    Held briefly under `_POOL_REGISTRY_LOCK` for the dict access only;
+    the returned lock is then used by the caller to serialise the actual
+    HTTP cycle for THAT host. New hosts add ~1 lock to `_POOL_LOCKS` —
+    no eviction; bounded by source count.
+    """
+    key = (scheme, host, port)
+    with _POOL_REGISTRY_LOCK:
+        lock = _POOL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _POOL_LOCKS[key] = lock
+    return lock
 
 
 def _get_conn(
@@ -264,13 +317,12 @@ def _get_conn(
 ) -> http.client.HTTPConnection:
     """Return a pooled HTTP(S)Connection for `(scheme, host, port)`.
 
-    Caller must hold `_POOL_LOCK`. The `_POOL` dict is mutated only
-    under that lock — every read, insert, and `pop()` on `_POOL` happens
-    inside `with _POOL_LOCK:` blocks in `_do_http_get`. Creates a fresh
-    connection on first use; otherwise returns the cached one.
-    http.client lazily opens the socket on the first `request()` call,
-    so the cost of cache-miss on `_get_conn` itself is just object
-    allocation.
+    Caller must hold the per-host lock from `_get_host_lock`. `_POOL`
+    is read/mutated only under that lock for THAT key; distinct hosts
+    have distinct locks so cross-host concurrent access is safe (each
+    operates on a different dict slot). Creates a fresh connection on
+    first use; http.client lazily opens the socket on `request()`, so
+    cache-miss cost here is just object allocation.
     """
     key = (scheme, host, port)
     conn = _POOL.get(key)
@@ -321,6 +373,7 @@ def _do_one_hop(
         headers.update(extra_headers)
 
     key = (scheme, host, port)
+    host_lock = _get_host_lock(scheme, host, port)
 
     # Connection-died fallback: HTTP keep-alive idle-times-out after
     # the server's keep-alive window (typically 5-30s), and a previously-
@@ -330,7 +383,7 @@ def _do_one_hop(
     # with a freshly-allocated connection — anything beyond that is a
     # real network problem and re-raises so callers' retry logic
     # (http_get_text retry-403-once) sees a normal HTTPError shape.
-    with _POOL_LOCK:
+    with host_lock:
         conn = _get_conn(scheme, host, port)
         try:
             conn.request("GET", path, headers=headers)
@@ -385,6 +438,7 @@ def _do_http_get(
     referer: str | None = None,
     user_agent: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    cross_process_lock: bool = False,
 ) -> str:
     """GET `url`, following HTTP redirects up to `_MAX_REDIRECTS` hops.
 
@@ -397,23 +451,25 @@ def _do_http_get(
     (the original referer becomes meaningless once we've left the origin
     site, and some hosts treat a stale referer as anti-CSRF noise).
 
-    Cross-process serialization: the entire redirect-following request
-    runs under `_host_cross_process_lock(initial_hostname)`. Hosts not
-    in `_CROSS_PROCESS_LOCK_HOSTS` get a no-op context. Locking the
-    redirect loop (vs. each hop) keeps the 308-then-200 sequence atomic
-    so sibling processes can't interleave between the redirect and the
-    actual fetch. Cross-host redirects (none currently observed in the
-    registered hosts) proceed under the initial host's lock — the
-    registry stays single-host until evidence demands otherwise to
-    avoid lock-ordering deadlock risk if two registered hosts ever
-    redirected to each other.
+    Cross-process serialization: when `cross_process_lock=True` AND the
+    initial hostname is in `_CROSS_PROCESS_LOCK_HOSTS`, the entire
+    redirect-following request runs under a per-host `fcntl.flock`.
+    Otherwise no-op. Locking the redirect loop (vs. each hop) keeps the
+    308-then-200 sequence atomic so sibling processes can't interleave
+    between the redirect and the actual fetch. Cross-host redirects
+    (none currently observed in the registered hosts) proceed under the
+    initial host's lock — the registry stays single-host until evidence
+    demands otherwise to avoid lock-ordering deadlock risk if two
+    registered hosts ever redirected to each other.
     """
     seen: set[str] = set()
     current_url = url
     current_referer = referer
     initial_hostname = urlsplit(url).hostname
 
-    with _host_cross_process_lock(initial_hostname):
+    with _host_cross_process_lock(
+        initial_hostname, enabled=cross_process_lock,
+    ):
         for _hop in range(_MAX_REDIRECTS + 1):
             if current_url in seen:
                 raise urllib.error.URLError(
