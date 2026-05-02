@@ -104,19 +104,25 @@ from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
 # treats Pioneer/Explorer as one ladder); the sitemap URL still has
 # `pioneer` in it so the per-format mapping stays simple.
 #
-# `explorer` and `standardbrawl` deliberately omitted: untapped's
-# sitemaps for these slugs return a 219-byte empty `<urlset>` stub
-# (re-verified 2026-05-02), meaning untapped doesn't publish a tier
-# list for them.  Returning None here drops the source for those
-# formats at registry level, surfacing as exit-2 'unsupported' rather
-# than exit-1 'drift'.  If untapped ever starts publishing either
-# format, re-add the mapping line.
+# `explorer` is wired even though its sitemap is a 219-byte empty
+# `<urlset>` (verified 2026-05-02). The empty sitemap routes
+# `parse_untapped` into a format-wide-API fallback that hits
+# `decks_by_event_scope_and_rank_v2/free` with `MetaPeriodId=703`
+# (Explorer_Ladder) and synthesises archetypes by grouping decks on
+# their `ptg` field. ~270 decks across ~20 ptg buckets recovered.
+#
+# `standardbrawl` deliberately omitted — sitemap empty AND
+# `meta-periods/active` lists no `Play_Brawl_Standard` entry, so the
+# format-wide API has nothing to fall back to. Genuine upstream
+# absence; do not re-open. Returning None here drops it at registry
+# level, surfacing as exit-2 'unsupported' rather than exit-1 'drift'.
 _FMT_TO_SITEMAP_SLUG: dict[str, str] = {
     "standard":      "standard",
     "historic":      "historic",
     "pioneer":       "pioneer",
     "alchemy":       "alchemy",
     "timeless":      "timeless",
+    "explorer":      "explorer",  # empty sitemap; fallback handles it
     "brawl":         "historic-brawl",  # our `brawl` = Historic Brawl
 }
 
@@ -128,8 +134,10 @@ def url_for_format(fmt: str) -> str | None:
     archetype sitemaps are sub-resources at
     `/sitemap/constructed-archetypes.xml?format=<slug>`.  Re-verified
     2026-05-02: standard / historic / pioneer / alchemy / timeless /
-    historic-brawl all populate; explorer + standard-brawl return an
-    empty `<urlset>` stub and are omitted from `_FMT_TO_SITEMAP_SLUG`.
+    historic-brawl all populate; explorer returns an empty `<urlset>`
+    stub but stays wired so `parse_untapped` can route into the
+    format-wide-API fallback (see comment above `_FMT_TO_SITEMAP_SLUG`).
+    standard-brawl has no upstream meta-period at all and is dropped.
     """
     slug = _FMT_TO_SITEMAP_SLUG.get(fmt)
     if slug is None:
@@ -720,7 +728,21 @@ def parse_untapped(
 
     archetypes = _enumerate_archetypes(raw_xml)
     if not archetypes:
-        # Sitemap parsed but no archetype URLs — bubble up as drift.
+        # No-sitemap fallback: explorer's per-format sitemap is a
+        # 219-byte empty stub upstream, but `decks_by_event_scope_
+        # and_rank_v2/free` returns the full deck list keyed by ptg.
+        # When the format has a configured event_name, group decks by
+        # ptg to synthesise archetypes — same shape as path 2/3 in
+        # `_fetch_archetype_decks`. Genuine no-data formats (no event
+        # mapping) still bubble up as drift via the empty return.
+        if _FMT_TO_EVENT_NAME.get(fmt):
+            return _decks_via_format_wide_api(
+                fmt,
+                fetched=fetched,
+                resolve_name=resolve_name,
+                limit=limit,
+                titleid_to_name=titleid_to_name,
+            )
         return []
 
     decks: list[ParsedDeck] = []
@@ -817,3 +839,101 @@ def _slug_to_archetype(slug: str) -> str:
     with sources that always carry an archetype string.
     """
     return slugify(slug).replace("-", " ").title()
+
+
+def _decks_via_format_wide_api(
+    fmt: str,
+    *,
+    fetched: str,
+    resolve_name: Callable[[str], dict | None],
+    limit: int | None,
+    titleid_to_name: dict[int, str],
+) -> list[ParsedDeck]:
+    """Format-wide-API fallback for formats with empty sitemaps.
+
+    Hits `_format_wide_decks(fmt)` (the cached path-3 endpoint), groups
+    decks by `ptg`, and emits up to 8 per ptg group — same per-archetype
+    cap as the sitemap-driven path. ptg groups are walked
+    largest-first so corpus-recommend signal lands on the most popular
+    archetypes when `--limit` truncates. Designed for `explorer` (no
+    archetype pages exist on untapped's site UI) but works for any
+    future format whose sitemap goes empty.
+
+    `archetype_id` for the synthetic url is the ptg integer; the URL
+    deep-links to untapped's canonical archetype path even though
+    that page may 404 — `ParsedDeck.url` is purely traceability and
+    cross-source dedup hashes are name-based via `cards_hash`.
+    """
+    api_decks = _format_wide_decks(fmt)
+    if not api_decks:
+        return []
+
+    by_ptg: dict[int, list[dict]] = {}
+    for d in api_decks:
+        if not isinstance(d, dict):
+            continue
+        ptg = d.get("ptg")
+        if not isinstance(ptg, int):
+            continue
+        by_ptg.setdefault(ptg, []).append(d)
+
+    if not by_ptg:
+        return []
+
+    # Largest group first = highest-frequency archetype first.
+    ordered_ptgs = sorted(by_ptg.keys(), key=lambda k: -len(by_ptg[k]))
+    total_groups = len(ordered_ptgs)
+    target = limit if (limit is not None and limit > 0) else sum(
+        min(len(g), 8) for g in by_ptg.values()
+    )
+    tick_every = max(1, total_groups // 25)
+
+    decks: list[ParsedDeck] = []
+    for i, ptg in enumerate(ordered_ptgs, start=1):
+        if limit is not None and limit > 0 and len(decks) >= limit:
+            break
+        if i == 1 or i % tick_every == 0:
+            print(
+                f"[untapped] {i}/{total_groups} ptg-groups, "
+                f"{len(decks)}/{target} decks (format-wide fallback)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        group = by_ptg[ptg]
+        slug_base = f"{fmt}-ptg-{ptg}"
+        archetype_display = f"{fmt.title()} Archetype {ptg}"
+        archetype_url = (
+            f"https://mtga.untapped.gg/constructed/{fmt}/archetypes/{ptg}/"
+        )
+
+        for deck_idx, deck in enumerate(group[:8], start=1):
+            deckstring = deck.get("ds")
+            if not isinstance(deckstring, str) or not deckstring:
+                continue
+            try:
+                entries, unresolved = _entries_from_deckstring(
+                    deckstring, titleid_to_name, resolve_name,
+                )
+            except ValueError:
+                continue
+            if not entries:
+                continue
+            out_slug = (
+                slug_base if deck_idx == 1
+                else f"{slug_base}-variant{deck_idx}"
+            )
+            decks.append(ParsedDeck(
+                slug=out_slug,
+                archetype=archetype_display,
+                source="untapped",
+                url=archetype_url,
+                tier="",
+                winrate=None,
+                sample=None,  # no per-archetype sample on the format-wide endpoint
+                fetched=fetched,
+                entries=entries,
+                unresolved=unresolved,
+            ))
+
+    return decks
