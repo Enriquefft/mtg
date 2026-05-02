@@ -123,7 +123,6 @@ Listed primary → fallback per format.
 
 - **edhrec.com** — paper Commander only; many "good" recommendations are not on Arena, are banned in Brawl, or use the wrong color-identity rules.
 - **mtgtop8.com** — paper-only competitive results.
-- **moxfield.com** — scraping prohibited; use only via web UI.
 - **gatherer.wizards.com** — official but slow to update and missing newer fields.
 - **aetherhub.com** (auto-fetch) — Cloudflare 403s every WebFetch. Manual-only for Historic Brawl, see Bot-block reality above.
 
