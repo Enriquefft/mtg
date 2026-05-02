@@ -49,7 +49,12 @@ _BROWSER_UA = (
 )
 
 _SEARCH_PAGE_SIZE = 50
-_PER_DECK_THROTTLE_SECS = 0.3
+# Per-deck fetch throttle. Previously 0.3s — halved to 0.15s because
+# data/corpus/.fetch-logs/archidekt-*.log shows zero 429/403s at the
+# previous cadence and archidekt's API has no published rate limit nor
+# Cloudflare challenge surface (vanilla nginx). Bump back up if a
+# future corpus build logs throttle errors.
+_PER_DECK_THROTTLE_SECS = 0.15
 _MAX_SEARCH_PAGES = 200
 
 # Cap for `--deep` mode (cmd_fetch_meta consults this when the user

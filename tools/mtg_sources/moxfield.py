@@ -61,9 +61,13 @@ _BROWSER_REFERER = "https://www.moxfield.com/"
 _SEARCH_PAGE_SIZE = 50
 
 # Per-deck fetch throttle. Lower than 0.5s starts triggering 403
-# bursts; higher slows large fetches (a 500-deck brawl pull is already
-# ~5 minutes at this cadence, fine for a one-time corpus build).
-_PER_DECK_THROTTLE_SECS = 0.6
+# bursts; higher slows large fetches. Previously 0.6s — lowered to the
+# documented 0.5s floor since data/corpus/.fetch-logs/moxfield-*.log
+# shows zero 403s at the previous cadence, so the extra 0.1s margin
+# wasn't earning anything. Floor is hard: do NOT lower past 0.5s
+# without first observing 0 403s with a smaller value across a full
+# corpus build.
+_PER_DECK_THROTTLE_SECS = 0.5
 
 # Maximum pages to walk during search, so a runaway --limit doesn't
 # accidentally walk the whole 10k-deck index. 200 pages * 50 decks =
