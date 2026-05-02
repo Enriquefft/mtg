@@ -366,6 +366,8 @@ def _load_index() -> dict:
     return _INDEX
 
 
+# Main-thread-only latch.  cmd_fetch_meta_all calls _warn_if_stale ONCE
+# before spawning the ThreadPoolExecutor, so workers never touch this.
 _STALE_WARNED: bool = False
 
 
@@ -414,6 +416,11 @@ def _printings_for_name(name: str) -> list[dict]:
     return idx["by_name"].get(_normalize_name(name), [])
 
 
+# Read+write from worker threads under cmd_fetch_meta_all --workers>1.
+# Safe under CPython: dict.__setitem__ is atomic on the GIL, and writes
+# are value-idempotent (same key -> same printing dict every time), so
+# the worst-case race is a redundant lookup, not corruption.  Do NOT
+# port to a free-threaded interpreter without adding a lock.
 _RESOLVE_CARD_MEMO: dict[str, dict | None] = {}
 
 
@@ -979,6 +986,7 @@ def _all_text(c: dict) -> str:
     return "\n".join(parts).lower()
 
 
+# Same threading contract as _RESOLVE_CARD_MEMO above.
 _CLASSIFY_CARD_MEMO: dict[str, set[str]] = {}
 
 
@@ -7064,6 +7072,10 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # Concurrent fetches from --workers>1 may target the same cache_path
+    # if two sources share an index endpoint.  os.replace is atomic and
+    # the response is deterministic for a given URL, so the final file
+    # is always coherent — the only cost is one wasted write.
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, cache_path)
@@ -7626,13 +7638,15 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
 
     Exit codes
     ----------
-    0 : at least one source succeeded and decks were written (or zero
-        decks survived post-processing, which is logged but not an error).
-    1 : at least one source failed at runtime (HTTP error, parser drift)
-        AND at least one other source succeeded.  Partial success.
+    0 : every enabled source succeeded.  Decks may still be zero post-
+        processing (logged, not treated as error) — the gate is "no source
+        raised", not "decks > 0".
+    1 : one or more sources failed at runtime (HTTP error, parser drift).
+        Covers both partial-success (some ok, some failed) and total-fail
+        (all failed) — `expand-corpus.sh` treats both equivalently and
+        appends to the `FAILED` array.
     2 : every source returned 'unsupported' for this format (--list-sources
         would return an empty list), OR fmt is unknown.
-    1 : all sources failed (no successful fetch at all).
 
     --limit applies per source (same semantics as fetch-meta --limit).
     Cross-source dedup runs ONCE on the merged list, catching duplicates
