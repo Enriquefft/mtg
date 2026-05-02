@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 # Single source of truth for the toolkit's outbound User-Agent. Used by
 # `tools/mtg.py` (Scryfall JSON) and by per-source parsers fetching
@@ -124,14 +124,27 @@ def _get_conn(
     return conn
 
 
-def _do_http_get(
+# Cap on `_do_http_get` redirect chain length. urllib.request defaults to
+# 10; we pick 5 because every legitimate redirect we've seen on these
+# hosts terminates in <=2 (archidekt: trailing-slash strip 308; aetherhub
+# / mtggoldfish: occasional Cloudflare 302 → /__cf_chl_jschl_tk__).  A
+# tighter cap surfaces routing bugs faster.
+_MAX_REDIRECTS = 5
+
+
+def _do_one_hop(
     url: str,
     *,
     accept: str,
-    referer: str | None = None,
-    user_agent: str | None = None,
-    extra_headers: dict[str, str] | None = None,
-) -> str:
+    referer: str | None,
+    user_agent: str | None,
+    extra_headers: dict[str, str] | None,
+) -> tuple[int, str, list[tuple[str, str]], bytes]:
+    """Execute one HTTP GET via the pool. Returns `(status, reason, headers, raw)`.
+
+    Does not raise on non-200 — the caller (`_do_http_get`) inspects status
+    and either follows a redirect or wraps the response in `HTTPError`.
+    """
     parts = urlsplit(url)
     scheme = parts.scheme
     host = parts.hostname
@@ -203,18 +216,83 @@ def _do_http_get(
                 pass
             _POOL.pop(key, None)
 
-    if status != 200:
-        # Mimic urllib.error.HTTPError exactly: callers
-        # (http_get_text retry-403-once, parsers' urllib.error.HTTPError
-        # except-clauses) check `.code` and that contract is the public
-        # surface of this function. Headers wrapped via http.client's
-        # HTTPMessage so `.headers.get(...)` works downstream.
-        hdrs = http.client.HTTPMessage()
-        for k, v in resp_headers:
-            hdrs[k] = v
-        raise urllib.error.HTTPError(url, status, reason, hdrs, None)
+    return status, reason, resp_headers, raw
 
-    return raw.decode("utf-8", errors="replace")
+
+def _do_http_get(
+    url: str,
+    *,
+    accept: str,
+    referer: str | None = None,
+    user_agent: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> str:
+    """GET `url`, following HTTP redirects up to `_MAX_REDIRECTS` hops.
+
+    `urllib.request.urlopen` followed 3xx automatically; raw `http.client`
+    does not.  archidekt 308s `/search/decks/` -> `/search/decks` and
+    Cloudflare-fronted hosts occasionally 302; without this loop the
+    parser sees a spurious HTTPError on the redirect status code.
+
+    `Referer` is dropped on cross-host hops to mirror urllib's behaviour
+    (the original referer becomes meaningless once we've left the origin
+    site, and some hosts treat a stale referer as anti-CSRF noise).
+    """
+    seen: set[str] = set()
+    current_url = url
+    current_referer = referer
+
+    for _hop in range(_MAX_REDIRECTS + 1):
+        if current_url in seen:
+            raise urllib.error.URLError(
+                f"redirect loop detected at {current_url!r}"
+            )
+        seen.add(current_url)
+
+        status, reason, resp_headers, raw = _do_one_hop(
+            current_url,
+            accept=accept,
+            referer=current_referer,
+            user_agent=user_agent,
+            extra_headers=extra_headers,
+        )
+
+        if status in (301, 302, 303, 307, 308):
+            location = None
+            for k, v in resp_headers:
+                if k.lower() == "location":
+                    location = v
+                    break
+            if not location:
+                # 3xx without Location is a server bug; fall through to
+                # HTTPError so the caller sees the real status code.
+                break
+            next_url = urljoin(current_url, location)
+            # Drop Referer on cross-origin hops (urllib parity).
+            prev_host = urlsplit(current_url).hostname
+            next_host = urlsplit(next_url).hostname
+            if prev_host != next_host:
+                current_referer = None
+            current_url = next_url
+            continue
+
+        if status != 200:
+            # Mimic urllib.error.HTTPError exactly: callers
+            # (http_get_text retry-403-once, parsers' urllib.error.HTTPError
+            # except-clauses) check `.code` and that contract is the public
+            # surface of this function. Headers wrapped via http.client's
+            # HTTPMessage so `.headers.get(...)` works downstream.
+            hdrs = http.client.HTTPMessage()
+            for k, v in resp_headers:
+                hdrs[k] = v
+            raise urllib.error.HTTPError(current_url, status, reason, hdrs, None)
+
+        return raw.decode("utf-8", errors="replace")
+
+    # Loop exhausted without a terminal response.
+    raise urllib.error.URLError(
+        f"too many redirects (>{_MAX_REDIRECTS}) starting at {url!r}"
+    )
 
 # MTGA export deck-line: `<count> <Name> (<SET>) <NUM>`. The set code is
 # alphanumeric (Scryfall codes like `MH3`, `Y25`, `LTC`); collector
