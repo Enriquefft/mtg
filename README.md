@@ -40,14 +40,25 @@ Historic Brawl in milliseconds, offline, against the same data Scryfall serves.
 ## Layout
 
 ```
-tools/mtg            # CLI shim → tools/mtg.py
-tools/mtg.py         # the toolkit (sync, card, printing, legal, validate, search)
-data/                # Scryfall bulk + pickled name/printing index (gitignored)
-decks/<slug>/vN.txt  # MTGA-export deck files, versioned
-docs/formats.md      # Arena format quick-reference (sizes, singleton, identity)
-docs/gotchas.md      # the non-obvious stuff (A- prefix, brawl key, etc.)
-docs/sources.md      # curated meta sources, last-verified dated
-flake.nix            # dev shell (python3 + uv + jq + curl + dotnet-sdk_8 + util-linux)
+tools/mtg                  # CLI shim → tools/mtg.py
+tools/mtg.py               # CLI dispatch + core deck/index logic
+tools/mtg_sources/         # per-host meta parsers (untapped, moxfield,
+                           #   aetherhub, archidekt, mtgazone, mtgdecks,
+                           #   mtggoldfish)
+tools/inject/              # .NET payload for `mtg collection dump`
+                           #   (one-time `dotnet build -c Release`)
+scripts/expand-corpus.sh   # bulk corpus build: every parser → corpus-clean
+                           #   → freq --rebuild → recommend smoke-check
+data/                      # Scryfall bulk + pickled index + collection
+                           #   + meta-cache + corpus (gitignored)
+decks/<slug>/vN.txt        # tracked human-drafted MTGA-export deck files
+docs/formats.md            # Arena format quick-reference
+docs/gotchas.md            # non-obvious stuff (A- prefix, brawl key, etc.)
+docs/historic.md           # Historic + Historic Brawl deep dive
+docs/sources.md            # curated meta sources, last-verified dated
+CLAUDE.md                  # agent-facing reference (full workflow)
+flake.nix                  # dev shell (python3 + uv + jq + curl +
+                           #   dotnet-sdk_8 + util-linux)
 ```
 
 ## Setup
@@ -67,27 +78,37 @@ the local copy. Re-run it daily (or on demand after a banlist announcement).
 
 ## Commands
 
-| command                                | what it does                                            |
-|----------------------------------------|---------------------------------------------------------|
-| `mtg sync [--force]`                   | refresh bulk + rebuild name/printing index              |
-| `mtg card <name>`                      | full card info, including per-Arena-format legality     |
-| `mtg printing <SET> <NUM>`             | look up by MTGA-style set code + collector number       |
-| `mtg legal <name> <format>`            | yes/no legality with reason; exit 0 iff legal *and* on Arena |
-| `mtg validate <deck.txt> -f <format>`  | parse + validate a full MTGA-export deck file           |
-| `mtg analyze <deck.txt>`               | composition breakdown (curve, role mix, CA)             |
-| `mtg related <name> [-f <format>]`     | cards sharing each keyword with the anchor              |
-| `mtg manabase <deck.txt>`              | pip demand + color sources + etb-tapped lands           |
-| `mtg wildcards <deck.txt>`             | rarity breakdown for MTGA wildcard cost                 |
-| `mtg companion <deck.txt>`             | per-companion eligibility check                         |
-| `mtg search '<scryfall-query>'`        | live Scryfall search (one HTTP request)                 |
-| `mtg collection`                       | summary of current `data/collection.json`               |
-| `mtg collection dump`                  | full snapshot via DLL injection into MTGA               |
-| `mtg collection import <file>`         | import a tracker export (CSV/JSON)                      |
-| `mtg collection from-decks`            | lower-bound snapshot from Player.log decks              |
-| `mtg own <name>`                       | show owned count for a card                             |
-| `mtg owned '<scryfall-query>'`         | list owned cards matching a Scryfall query              |
-| `mtg gaps <deck.txt>`                  | cards short for a deck + wildcard cost                  |
-| `mtg coverage <deck.txt>`              | % of deck buildable from current collection             |
+Generated from `mtg --help`; re-run after adding a subcommand.
+
+| command                                | what it does                                                            |
+|----------------------------------------|-------------------------------------------------------------------------|
+| `mtg sync [--force]`                   | refresh Scryfall bulk + rebuild name/printing index                     |
+| `mtg card <name>`                      | full card info, including per-Arena-format legality                     |
+| `mtg printing <SET> <NUM>`             | look up by MTGA-style set code + collector number                       |
+| `mtg legal <name> <format>`            | yes/no legality with reason; exit 0 iff legal *and* on Arena            |
+| `mtg validate <deck.txt> -f <format>`  | parse + validate a full MTGA-export deck file                           |
+| `mtg analyze <deck.txt>`               | composition breakdown (curve, role mix, CA)                             |
+| `mtg related <name> [-f <format>]`     | cards sharing each keyword with the anchor                              |
+| `mtg manabase <deck.txt>`              | pip demand + color sources + etb-tapped lands                           |
+| `mtg wildcards <deck.txt>`             | rarity breakdown for MTGA wildcard cost                                 |
+| `mtg companion <deck.txt>`             | per-companion mechanical-predicate check                                |
+| `mtg check <deck.txt> -f <format>`     | full battery: validate + analyze + manabase + wildcards + companion     |
+| `mtg search '<scryfall-query>'`        | live Scryfall search (one HTTP request)                                 |
+| `mtg collection`                       | summary of current `data/collection.json` (also `dump`/`import`/`from-decks`) |
+| `mtg own <name>`                       | show owned count for a card                                             |
+| `mtg owned '<scryfall-query>'`         | list owned cards matching a Scryfall query (live, paginated)            |
+| `mtg suggest-subs <deck.txt> -f <fmt>` | propose owned replacements for missing cards                            |
+| `mtg gaps <deck.txt>`                  | cards short for a deck + wildcard cost                                  |
+| `mtg coverage <deck.txt>`              | % of deck buildable from current collection (`--batch` for a glob)      |
+| `mtg freq <format>`                    | card-frequency index over `data/corpus/<fmt>/*.txt` (popularity prior)  |
+| `mtg corpus-clean <format>`            | drop corpus decks failing write-time validation, rebuild `_freq.json`   |
+| `mtg shells --format <fmt>`            | cluster owned cards by keyword/type/theme for novel-deck discovery      |
+| `mtg wantlist`                         | aggregate wildcard needs across every locally-saved deck                |
+| `mtg diff <a.txt> <b.txt>`             | per-card delta between two MTGA-export deck files                       |
+| `mtg fetch-meta <format>`              | scrape a meta source into `<out>/<archetype>.txt` + `meta.json`         |
+| `mtg recommend --format <fmt>`         | rank corpus decks you can build (composite-sorted) + shell→archetype bridge |
+| `mtg derive <deck.txt>`                | rewrite a corpus deck with owned substitutions (per-slot top candidate) |
+| `mtg invent --format <fmt> --shell <S>`| compose a deck from a shell + collection priors + role template         |
 
 Supported format keys: `standard`, `standardbrawl`, `historic`, `brawl`
 (= Historic Brawl on Arena), `alchemy`, `timeless`, `pioneer`, `explorer`.
@@ -129,18 +150,8 @@ MTGA exports rebalanced cards, and it's how Scryfall stores them.
 
 ## Working with this repo as an AI agent
 
-If you are an LLM agent reading this in a Claude Code session:
-
-1. Run `mtg sync` once at the start of a session if `data/bulk-meta.json` is
-   missing or > 36h old.
-2. To answer "is X legal in Y", call `mtg legal "X" Y` — never guess from
-   training data.
-3. Before reporting a deck as ready, run `mtg validate <path> -f <format>`
-   and surface every message it prints. Exit code 0 = clean.
-4. For meta context (what's actually winning right now), use `docs/sources.md`
-   — the listed sites are dated and known to be current.
-5. For format-rule questions, read `docs/formats.md`. For the surprise-you
-   stuff (rebalanced cards, brawl-key naming), read `docs/gotchas.md`.
+See `CLAUDE.md` — full agent-facing reference (operating modes, workflow,
+per-subcommand usage, training-cutoff rules, format gotchas).
 
 The validator is intentionally strict and verbose; that's the contract — if
 it stays quiet, the deck imports cleanly into Arena and is legal in the

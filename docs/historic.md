@@ -15,25 +15,10 @@ Both share the Historic ban list; Brawl adds commander-only bans.
 
 ## Format-name gotcha
 
-Scryfall's legality keys do not map 1:1 to the names players use:
-
-| user says            | scryfall key      | `mtg` flag          |
-|----------------------|-------------------|---------------------|
-| "Historic Brawl"     | `brawl`           | `-f brawl`          |
-| "Standard Brawl"     | `standardbrawl`   | `-f standardbrawl`  |
-| "Historic" (60-card) | `historic`        | `-f historic`       |
-
-There is **no** `historicbrawl` key on Scryfall. Passing `-f historicbrawl`
-to `mtg validate` fails — `-f brawl` is correct for the 100-card format.
-
-```bash
-tools/mtg validate decks/nadu/v1.txt -f brawl       # Historic Brawl
-tools/mtg validate decks/historic/<deck>.txt -f historic  # Historic constructed
-tools/mtg legal "A-Nadu, Winged Wisdom" brawl       # check Historic Brawl legality
-```
-
-Full table of Arena formats and their Scryfall keys lives in
-`docs/formats.md`.
+`-f brawl` = Historic Brawl (100-card singleton); `-f historic` = the
+60-card constructed format; there is no `historicbrawl` key. Full
+per-format table in `formats.md`; user-name → CLI-flag mapping in
+`CLAUDE.md` §"Format-name gotcha".
 
 ## The card pool
 
@@ -62,14 +47,6 @@ tools/mtg wantlist --decks 'decks/historic/*.txt' --latest-only
 
 `wantlist` aggregates max-shortfall across every matching deck — you
 only ever craft each card once.
-
-### Draft economy
-
-WCs drop from packs (rarity-track progress per pack) and quest
-rewards. Drafting is the best gold/gem efficiency for rare/mythic WCs
-at scale; constructed event rewards are smaller but steady. For a
-single deck: `tools/mtg gaps decks/<name>/<version>.txt` short-lists
-the missing cards and WC cost.
 
 ## Singleton & 100-card rule (Brawl)
 
@@ -105,25 +82,6 @@ a higher casual-matchmaking bracket. Informational only — Wizards
 enforces this on the matchmaking side, not via legality.
 `tools/mtg card "<name>"` surfaces the flag; `tools/mtg suggest-subs`
 refuses to silently promote a non-GC deck by substituting a GC card.
-
-## Common deck-building shells
-
-**Historic Brawl:** 5C goodstuff (every staple, land base does the
-work), mono-color value (small CI, deeper lands, redundant card-draw),
-tribal (Faerie / Sliver / Demon / Dragon), combo-tutor (commander
-tutors a two-card kill).
-
-**Historic constructed:** Izzet Phoenix, Affinity, Auras, Sacrifice /
-Cat-Oven, Combo-Vannifar, Jund Food. Meta rotates; see `docs/sources.md`
-for current tier-list URLs.
-
-Discover novel shells from your collection rather than copying the meta:
-
-```bash
-tools/mtg shells --format brawl    --by keyword
-tools/mtg shells --format historic --by type --min-cards 20
-tools/mtg shells --format historic --by theme
-```
 
 ## Common pitfalls
 

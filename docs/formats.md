@@ -16,7 +16,12 @@ Format keys here match Scryfall's `legalities.<key>` field, which is what
 
 ## Naming gotcha
 
-Format-name gotcha: see `docs/historic.md` §"Format-name gotcha".
+Scryfall's legality keys do not match player-facing names. The most
+load-bearing case: "Historic Brawl" is `brawl` on Scryfall (and the
+`mtg` CLI), **not** `historicbrawl` (no such key). "Standard Brawl"
+is `standardbrawl`. The full mapping is in the table above; treat
+the `scryfall key` column as the canonical name for any CLI flag,
+Scryfall query, or `legalities.<key>` lookup.
 
 ## Banned-as-commander
 

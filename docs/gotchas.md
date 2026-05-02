@@ -4,7 +4,17 @@ These are non-obvious behaviors you'll trip over if you don't know them.
 
 ## 1. `legalities.brawl` = Historic Brawl on Arena
 
-Format-name gotcha: see `docs/historic.md` §"Format-name gotcha".
+Scryfall's legality keys do not match player-facing names:
+
+| user says            | scryfall key      | `mtg` flag          |
+|----------------------|-------------------|---------------------|
+| "Historic Brawl"     | `brawl`           | `-f brawl`          |
+| "Standard Brawl"     | `standardbrawl`   | `-f standardbrawl`  |
+| "Historic" (60-card) | `historic`        | `-f historic`       |
+
+There is **no** `historicbrawl` key on Scryfall — passing
+`-f historicbrawl` to `mtg validate` fails. `-f brawl` is the
+100-card Historic Brawl format. Full per-format table in `formats.md`.
 
 ## 2. A- prefix for Alchemy rebalanced cards
 

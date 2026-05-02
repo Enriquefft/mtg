@@ -5,6 +5,30 @@ Groundwork for building MTG Arena decks. Lets a Claude session answer
 "validate my deck list" without hitting rate limits or trusting
 outdated internet info.
 
+## Operating mode (read first)
+
+This repo has two Claude modes. They do not overlap in a single session:
+
+- **User mode (default).** Driving `tools/mtg` to build, validate, and
+  tune decks. **Don't touch the CLI source code.** If a query isn't
+  covered by an existing subcommand, surface the gap and stop — do
+  not patch `tools/mtg.py` mid-build to make it answer. Code edits in
+  user mode are out-of-scope and risk shipping a workaround for a
+  one-off question.
+- **Contributor mode.** Extending the CLI itself. Only when the user
+  explicitly asks for a CLI/parser/doc change. Contributor invariants:
+  no workarounds, no `# TODO fix later`, no half-wired flags; every new
+  subcommand emits both human text and `--json`; `data/` access stays
+  via the existing index helpers (never re-open bulk JSON); Scryfall
+  is the single source of truth (no new card DBs, no per-card API
+  caching); proposals of cards the user did not type (`suggest-subs`,
+  `shells`, `derive`, `invent`) filter `A-` printings by format and
+  emit multi-face cards as `Front // Back`.
+
+The CLI does enumeration, scoring, parsing, IO. Claude does taste,
+judgment, narrative. Every subcommand exists to move work *out* of
+Claude's context into deterministic code.
+
 ## Hard rule: `data/` bulk files are CLI-only
 
 `data/` holds the ~500 MB Scryfall bulk dump, an 80 MB pickled index,
@@ -215,8 +239,17 @@ oracle text. Not optional — "built from memory" is a quality bug.
 
 ## Format-name gotcha
 
-See `docs/historic.md` §"Format-name gotcha". TL;DR: `-f brawl` = Historic Brawl, not `-f historicbrawl`.
-Other format edge cases live in `docs/gotchas.md`.
+Scryfall's legality keys do not map 1:1 to player-facing names:
+
+| user says            | scryfall key      | `mtg` flag          |
+|----------------------|-------------------|---------------------|
+| "Historic Brawl"     | `brawl`           | `-f brawl`          |
+| "Standard Brawl"     | `standardbrawl`   | `-f standardbrawl`  |
+| "Historic" (60-card) | `historic`        | `-f historic`       |
+
+There is **no** `historicbrawl` key. `-f brawl` is the 100-card
+Historic Brawl format. Full per-format table in `docs/formats.md`;
+other format edge cases in `docs/gotchas.md`.
 
 ## Layout
 
@@ -227,7 +260,7 @@ Other format edge cases live in `docs/gotchas.md`.
 → `freq --rebuild` → `recommend` smoke-check, per format or `all`),
 `data/` (gitignored bulk + index + collection; `data/corpus/<fmt>/`
 holds machine-managed meta scrapes, also gitignored), `docs/`
-(formats / gotchas / sources / historic / roadmap), `decks/` (tracked
+(formats / gotchas / sources / historic), `decks/` (tracked
 human drafts: `decks/<name>/v*.txt`), `flake.nix` + `.envrc` (Nix dev
 shell: python3 + uv + jq + curl + dotnet-sdk_8 + util-linux).
 
@@ -251,4 +284,3 @@ mechanic sweep apply across all formats — see those docs for the full per-form
 - `docs/formats.md`  — All Arena formats, Scryfall legality keys
 - `docs/gotchas.md`  — A- prefix, multi-face ` // `, color identity, game_changer, bulk freshness
 - `docs/sources.md`  — Curated meta URLs, bot-block reality table
-- `docs/roadmap.md`  — CLI roadmap & invariants
