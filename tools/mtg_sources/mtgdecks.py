@@ -180,6 +180,7 @@ def parse_mtgdecks(
     fetched: str,
     url: str,
     resolve_name: Callable[[str], dict | None],
+    limit: int | None = None,
     **_: object,
 ) -> list[ParsedDeck]:
     """Parse the mtgdecks `/Historic` page into a list of `ParsedDeck`.
@@ -210,6 +211,8 @@ def parse_mtgdecks(
     seen_archetypes: dict[str, int] = {}  # Track archetype slug collisions
 
     for i, m in enumerate(tile_matches):
+        if limit is not None and limit > 0 and len(decks) >= limit:
+            break
         body = raw_html[m.start():bounds[i + 1]]
 
         title_m = _TILE_TITLE_RE.search(body)

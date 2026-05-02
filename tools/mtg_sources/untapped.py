@@ -61,12 +61,14 @@ returns binary deckstrings + tag arrays only, no per-deck win
 counts on the /free tier). `winrate=None`, `sample` populated from
 the archetype's deck-list response when available.
 
-We take the TOP 3 DECKS per archetype (the API returns them in
-descending-frequency order) to multiply corpus breadth by ~3x without
-per-deck API bloat. Duplicates with identical lists are dropped
-downstream by `_write_meta_corpus`'s near-dup deduplication. When an
-archetype appears multiple times in the sitemap (rare), we suffix deck
-names with variant markers.
+We take the TOP 8 DECKS per archetype (the API returns them in
+descending-frequency order; max observed ~61 decks/ptg in Standard,
+so 8 captures the high-traffic decks without per-deck API bloat).
+Per-archetype multiplier is up to 8/3 ≈ 2.7x; corpus-wide gain is
+smaller because tail archetypes carry <8 decks and many duplicates
+collapse downstream via `_write_meta_corpus`'s near-dup
+deduplication. When an archetype appears multiple times in the
+sitemap (rare), we suffix deck names with variant markers.
 
 Probe verified 2026-05-01 against:
   * sitemap.xml endpoints for all 9 formats
@@ -756,14 +758,15 @@ def parse_untapped(
         if not api_decks:
             continue
 
-        # Top 3 decks = highest-frequency for this archetype (untapped
-        # API returns descending order) to multiply corpus breadth ~3x.
+        # Top 8 decks = highest-frequency for this archetype (untapped
+        # API returns descending order); per-archetype multiplier up
+        # to 8/3 ≈ 2.7x, corpus-wide smaller after near-dup collapse.
         # Track archetype slug collisions separately from per-deck variants.
         arch_count = seen_archetypes.get(slug, 0) + 1
         seen_archetypes[slug] = arch_count
         arch_suffix = "" if arch_count == 1 else f"-{arch_count}"
 
-        for deck_idx, deck in enumerate(api_decks[:3], start=1):
+        for deck_idx, deck in enumerate(api_decks[:8], start=1):
             deckstring = deck.get("ds")
             if not isinstance(deckstring, str) or not deckstring:
                 continue
