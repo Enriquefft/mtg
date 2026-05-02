@@ -6225,8 +6225,12 @@ def cmd_corpus_clean(args: argparse.Namespace) -> int:
 
     files = _corpus_deck_files(fmt)
     if not files:
+        # Empty corpus = nothing to clean = success. Programmatic
+        # callers (scripts/expand-corpus.sh) shouldn't see a failure
+        # exit when all parsers in the same run skipped/failed; the
+        # parser-side failures are already surfaced separately.
         print(f"no corpus for {fmt}", file=sys.stderr)
-        return 1
+        return 0
 
     drop_reasons: dict[str, int] = collections.Counter()
     to_drop: list[tuple[str, list[str]]] = []  # (slug, reasons)

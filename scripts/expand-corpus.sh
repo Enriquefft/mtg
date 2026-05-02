@@ -8,24 +8,13 @@
 #         scripts/expand-corpus.sh all              # walk every Arena format
 #         scripts/expand-corpus.sh historic --fresh # wipe meta-cache + corpus first
 #
-# Concurrency:
-#   PARALLEL=N (env, default 1) — fan out the per-source loop across N
-#     workers via xargs -P. Default 1 = current sequential behaviour.
-#   CRITICAL: each worker invocation of `tools/mtg` loads the ~500MB
-#     Scryfall index pickle into memory. PARALLEL=N peaks at roughly
-#     N × 500MB resident; the default of 1 is intentional for low-RAM
-#     operators. Bump PARALLEL only on machines with the headroom (a
-#     PARALLEL=4 run on 8 enabled sources for a single format peaks
-#     around 2GB before tapering as workers finish).
-#   The `all` mode keeps cross-format serialization (each format
-#   re-execs this script once); only intra-format gets the parallel
-#   fan-out so meta.json writes stay isolated per format.
+# Sources run sequentially per format. A parallel mode existed briefly
+# but was removed: meta.json + _freq.json + _existing_corpus_hashes are
+# read-modify-write under a single per-format lock that doesn't exist,
+# so concurrent workers silently corrupted the sidecar. Wall-clock cost
+# of serial mode is dominated by network I/O per source, not CPU, so
+# the gain from parallelism wasn't worth the corruption risk.
 set -uo pipefail
-PARALLEL="${PARALLEL:-1}"
-if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || [ "$PARALLEL" -lt 1 ]; then
-  echo "PARALLEL must be a positive integer (got: $PARALLEL)" >&2
-  exit 2
-fi
 
 # --- argv parse ---------------------------------------------------------
 FRESH=0
@@ -161,19 +150,23 @@ if registry_sources=$("$MTG" fetch-meta "$FMT" --list-sources 2>/dev/null); then
   done
 fi
 
-echo "==> expand-corpus fmt=$FMT sources=${ENABLED[*]} (PARALLEL=$PARALLEL)"
+echo "==> expand-corpus fmt=$FMT sources=${ENABLED[*]}"
 echo "==> logs: $LOG_DIR/<source>-$FMT.log"
+
+# Truncate the gate's validate log at the start of every run so it
+# accumulates within ONE run (across all parsers) but doesn't grow
+# unbounded across runs. Matches the per-source-log semantics: each
+# `<src>-<fmt>.log` is overwritten by `tee` at the start of that
+# source's fetch. Without this, the gate log opens in append mode
+# (tools/mtg.py:7344) and a weekly cron grows it forever.
+: > "$LOG_DIR/validate-$FMT.log"
 
 START_TS=$(date +%s)
 FAILED=()
 
-# Per-source argv overrides table. Kept here (vs. inside the worker so
-# both PARALLEL=1 and PARALLEL>1 paths read the same source-of-truth).
-# moxfield's CLI default is 300 (single-shot ergonomics); a max-corpus
-# build pass benefits from going ~6x deeper, well under the 10000-deck
-# API cap (50/page * 200 pages). Add per-source overrides here, NOT
-# inside the worker function — keeps the extra-args layer trivially
-# greppable.
+# Per-source argv overrides. moxfield's CLI default is 300 (single-shot
+# ergonomics); a max-corpus build pass benefits from going ~6x deeper,
+# well under the 10000-deck API cap (50/page * 200 pages).
 extra_args_for() {
   case "$1" in
     moxfield) printf -- '--limit 2000' ;;
@@ -181,106 +174,42 @@ extra_args_for() {
   esac
 }
 
-# Worker that fetches one source for the current format. Used by both
-# the serial and the parallel paths (so the two can't drift apart).
-# Returns the fetch-meta exit code so the caller can aggregate failures.
-# stdbuf forces line-buffering so progress shows live in the log; tee
-# also writes to stdout in the serial case for live visibility.
-fetch_one_source() {
-  local src="$1"
-  local log="$LOG_DIR/${src}-${FMT}.log"
+for src in "${ENABLED[@]}"; do
+  log="$LOG_DIR/${src}-${FMT}.log"
   # shellcheck disable=SC2046  # we want word splitting on the override
-  local extras=($(extra_args_for "$src"))
-  if [ "$PARALLEL" -eq 1 ]; then
-    # Serial path: tee to stdout for live progress visibility.
-    stdbuf -oL -eL "$MTG" fetch-meta "$FMT" --source "$src" "${extras[@]}" 2>&1 | tee "$log"
-    return "${PIPESTATUS[0]}"
-  fi
-  # Parallel path: redirect entirely to the per-source log so concurrent
-  # workers don't interleave on stdout. The aggregator below reads the
-  # exit code from a sentinel line written to the log.
-  stdbuf -oL -eL "$MTG" fetch-meta "$FMT" --source "$src" "${extras[@]}" >"$log" 2>&1
-  return $?
-}
-
-if [ "$PARALLEL" -eq 1 ]; then
-  # Original serial loop. Preserved exactly so PARALLEL=1 = old behaviour.
-  for src in "${ENABLED[@]}"; do
-    echo
-    echo "--- [$src] $(date -Iseconds) ---"
-    fetch_one_source "$src"
-    rc=$?
-    case "$rc" in
-      0) echo "    [$src] ok" ;;
-      # Exit 2 = source provably doesn't serve this format (per
-      # tools/mtg.py:7062-7071). Treated as "skipped, expected" rather
-      # than failure so the per-format ENABLED matrix stays robust
-      # against url_for_format drift without operator action.
-      2) echo "    [$src] skipped (unsupported for $FMT)" ;;
-      *)
-        echo "    [$src] FAILED (exit $rc) — see $LOG_DIR/${src}-${FMT}.log"
-        FAILED+=("$src")
-        ;;
-    esac
-  done
-else
-  # Parallel fan-out via xargs -P. Each worker writes its own log and
-  # returns its exit code through a sentinel file in /tmp; we drain
-  # the sentinels after xargs joins. Subshells inherit the script's
-  # functions only when xargs invokes bash with `-c '...'` and we
-  # re-export the worker; export-fn keeps the worker's body in one
-  # place (single source of truth shared with the serial path).
-  export -f fetch_one_source extra_args_for
-  export FMT MTG LOG_DIR PARALLEL
-  rc_dir="$(mktemp -d -t expand-corpus-rc-XXXXXX)"
-  trap 'rm -rf "$rc_dir"' EXIT
+  extras=($(extra_args_for "$src"))
   echo
-  echo "--- parallel fan-out (workers=$PARALLEL) $(date -Iseconds) ---"
-  # Note: -I implies -n 1 already, so omitting -n 1 silences the
-  # "mutually exclusive" warning xargs emits when both are set.
-  printf '%s\n' "${ENABLED[@]}" | xargs -P "$PARALLEL" -I {} bash -c '
-    src="$1"
-    rc_dir="$2"
-    fetch_one_source "$src"
-    echo $? > "$rc_dir/${src}.rc"
-  ' _ {} "$rc_dir"
-  # Drain results in the order ENABLED was declared so log output
-  # matches the priority ordering the user expects.
-  for src in "${ENABLED[@]}"; do
-    rc=$(cat "$rc_dir/${src}.rc" 2>/dev/null || echo "127")
-    case "$rc" in
-      0) echo "    [$src] ok" ;;
-      2) echo "    [$src] skipped (unsupported for $FMT)" ;;
-      *)
-        echo "    [$src] FAILED (exit $rc) — see $LOG_DIR/${src}-${FMT}.log"
-        FAILED+=("$src")
-        ;;
-    esac
-  done
-fi
+  echo "--- [$src] $(date -Iseconds) ---"
+  # stdbuf forces line-buffering so progress shows live; tee writes the
+  # log AND streams to stdout so a hung fetch is visible.
+  stdbuf -oL -eL "$MTG" fetch-meta "$FMT" --source "$src" "${extras[@]}" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  case "$rc" in
+    0) echo "    [$src] ok" ;;
+    # Exit 2 = source provably doesn't serve this format (per
+    # tools/mtg.py:7062-7071). Treated as "skipped, expected" rather
+    # than failure so the per-format ENABLED matrix stays robust
+    # against url_for_format drift without operator action.
+    2) echo "    [$src] skipped (unsupported for $FMT)" ;;
+    *)
+      echo "    [$src] FAILED (exit $rc) — see $log"
+      FAILED+=("$src")
+      ;;
+  esac
+done
 
 echo
 echo "==> corpus-clean $FMT"
 clean_log="$LOG_DIR/corpus-clean-$FMT.log"
-# Drops decks that fail _validate_for_corpus (catches both legacy
-# entries pre-dating the fetch-time gate and anything that slipped
-# past it). Runs BEFORE freq --rebuild so the index is built from
-# the pruned corpus. corpus-clean rebuilds _freq.json itself after
-# deletions; the explicit `freq --rebuild` below is kept as a belt-
-# and-braces guarantee that the index reflects current on-disk state.
+# Drops decks that fail _validate_for_corpus (catches both legacy entries
+# pre-dating the fetch-time gate and anything that slipped past it).
+# corpus-clean rebuilds _freq.json itself after deletions, so no separate
+# freq --rebuild step is needed.
 "$MTG" corpus-clean "$FMT" 2>&1 | tee "$clean_log"
-
-echo
-echo "==> rebuilding freq index for $FMT"
-freq_log="$LOG_DIR/freq-$FMT.log"
-# Stream full output to the log AND echo last 2 lines (the success
-# summary) to stdout so an OK run stays terse. On failure, the log
-# preserves the full traceback for diagnosis.
-"$MTG" freq "$FMT" --rebuild 2>&1 | tee "$freq_log" | tail -2
-freq_rc=${PIPESTATUS[0]}
-if [ "$freq_rc" -ne 0 ]; then
-  echo "==> freq --rebuild FAILED (exit $freq_rc) — see $freq_log"
-  FAILED+=("freq")
+clean_rc=${PIPESTATUS[0]}
+if [ "$clean_rc" -ne 0 ]; then
+  echo "==> corpus-clean FAILED (exit $clean_rc) — see $clean_log"
+  FAILED+=("corpus-clean")
 fi
 
 ELAPSED=$(( $(date +%s) - START_TS ))
