@@ -127,6 +127,23 @@ case "$FMT" in
   *)                ENABLED=("${SOURCES[@]}") ;;
 esac
 
+# Drift detector: warn if the registry knows of sources for this format
+# that the case-block above excludes. Prevents the script from silently
+# missing a parser added in Python without a corresponding script edit.
+# Failure in --list-sources is non-fatal — we don't want a transient mtg
+# CLI bug to block the whole expand run.
+if registry_sources=$("$MTG" fetch-meta "$FMT" --list-sources 2>/dev/null); then
+  for src in $registry_sources; do
+    found=0
+    for enabled in "${ENABLED[@]}"; do
+      if [ "$src" = "$enabled" ]; then found=1; break; fi
+    done
+    if [ "$found" -eq 0 ]; then
+      echo "==> WARNING: registry parser '$src' supports $FMT but is not in ENABLED list" >&2
+    fi
+  done
+fi
+
 echo "==> expand-corpus fmt=$FMT sources=${ENABLED[*]}"
 echo "==> logs: $LOG_DIR/<source>-$FMT.log"
 

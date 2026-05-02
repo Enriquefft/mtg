@@ -7037,6 +7037,25 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         * parser returns zero decks from a 200 page (= schema drift);
         * resolution failures that would leave `--out` empty.
     """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # `--list-sources`: enumerate registry parsers that publish for this
+    # format (i.e. url_for_format(fmt) is not None). Used by
+    # scripts/expand-corpus.sh as a drift detector against its hardcoded
+    # ENABLED case-block. Output: one source name per line, registry
+    # insertion order.
+    if args.list_sources:
+        for name, (_parse_fn, url_fn) in _FETCH_META_PARSERS.items():
+            if url_fn(fmt) is not None:
+                print(name)
+        return 0
+
     source = args.source
     if source in _FETCH_META_DEFERRED_SOURCES:
         supported = ", ".join(sorted(_FETCH_META_PARSERS))
@@ -7051,13 +7070,6 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         return 2
 
     parse_fn, url_fn = _FETCH_META_PARSERS[source]
-    fmt = args.format.lower()
-    if fmt not in ARENA_FORMATS:
-        print(
-            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
-            file=sys.stderr,
-        )
-        return 2
     url = url_fn(fmt)
     if url is None:
         print(
@@ -7122,18 +7134,28 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     decks = [d for d in decks if not _common.is_stub_deck(d, _resolve_card)]
     stub_dropped = pre_stub - len(decks)
 
-    # Quality gate: source-published winrate floor. Only filters decks
-    # that carry a winrate (untapped, aetherhub); decks without a
-    # winrate signal are kept (the gate is opt-in per fetch — caller
-    # should not switch to a winrate-less source and expect this to
-    # do anything).
+    # Quality gate: source-published winrate / sample-size floors. Only
+    # filters decks that carry the relevant signal; decks without it are
+    # kept (the gate is opt-in per fetch — caller should not switch to
+    # a signal-less source and expect this to do anything).
     winrate_dropped = 0
-    if args.min_winrate is not None:
-        floor = args.min_winrate
+    sample_dropped = 0
+    if args.min_winrate is not None or args.min_sample is not None:
         kept: list[_common.ParsedDeck] = []
         for d in decks:
-            if d.winrate is not None and d.winrate < floor:
+            if (
+                args.min_winrate is not None
+                and d.winrate is not None
+                and d.winrate < args.min_winrate
+            ):
                 winrate_dropped += 1
+                continue
+            if (
+                args.min_sample is not None
+                and d.sample is not None
+                and d.sample < args.min_sample
+            ):
+                sample_dropped += 1
                 continue
             kept.append(d)
         decks = kept
@@ -7192,6 +7214,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "unresolved_total": total_dropped,
             "stub_dropped": stub_dropped,
             "winrate_dropped": winrate_dropped,
+            "sample_dropped": sample_dropped,
             "dedup_dropped": exact_dedup_dropped,
             "near_dup_dropped": near_dup_dropped,
             "evicted_existing": len(evicted),
@@ -7227,6 +7250,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
     if winrate_dropped:
         print(f"winrate: {winrate_dropped} dropped (< {args.min_winrate:.2%})")
+    if sample_dropped:
+        print(f"sample : {sample_dropped} dropped (< {args.min_sample})")
     if exact_dedup_dropped:
         print(f"dedup  : {exact_dedup_dropped} fresh decks collapsed (exact cross-source)")
     if near_dup_dropped:
@@ -9463,6 +9488,25 @@ def main(argv: list[str] | None = None) -> int:
             "(0.0-1.0). Only applies to sources that publish winrates "
             "(untapped, aetherhub); decks without winrate metadata are "
             "kept regardless. Recommended floor: 0.50."
+        ),
+    )
+    s.add_argument(
+        "--min-sample", type=int, default=None, metavar="N",
+        help=(
+            "drop decks whose source-published match-sample is below N. "
+            "Only applies to sources that publish a sample size "
+            "(untapped, mtgdecks); decks without a sample are kept "
+            "regardless. Useful pair with --min-winrate so a 49%% deck "
+            "across 5 matches can't outrank a 55%% deck across 5000."
+        ),
+    )
+    s.add_argument(
+        "--list-sources", action="store_true",
+        help=(
+            "print the parser names that publish for the given format "
+            "(one per line, registry order) and exit. Used by "
+            "scripts/expand-corpus.sh as a drift detector against its "
+            "hardcoded per-format ENABLED list."
         ),
     )
     s.add_argument(
