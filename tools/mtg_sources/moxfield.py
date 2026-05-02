@@ -70,6 +70,13 @@ _PER_DECK_THROTTLE_SECS = 0.6
 # 10000-deck cap, matching the API's totalResults ceiling.
 _MAX_SEARCH_PAGES = 200
 
+# Cap for `--deep` mode (cmd_fetch_meta consults this when the user
+# passes `--deep` without an explicit `--limit`). Set to the API's
+# totalResults ceiling so a deep build pass walks the whole search
+# universe; the per-page walk in parse_moxfield already early-exits
+# when `len(decks) >= limit`, so an over-large cap is safe.
+_DEEP_LIMIT = _SEARCH_PAGE_SIZE * _MAX_SEARCH_PAGES  # 10000
+
 _FORMAT_MAP = {
     "standard": "standard",
     "alchemy": "alchemy",

@@ -76,30 +76,37 @@ from mtg_sources._common import (  # noqa: E402
     ParsedDeck,
     slugify,
 )
+from mtg_sources import aetherhub as aetherhub_mod  # noqa: E402
 from mtg_sources.aetherhub import (  # noqa: E402
     parse_aetherhub,
     url_for_format as aetherhub_url_for_format,
 )
+from mtg_sources import moxfield as moxfield_mod  # noqa: E402
 from mtg_sources.moxfield import (  # noqa: E402
     parse_moxfield,
     url_for_format as moxfield_url_for_format,
 )
+from mtg_sources import mtgazone as mtgazone_mod  # noqa: E402
 from mtg_sources.mtgazone import (  # noqa: E402
     parse_mtgazone,
     url_for_format as mtgazone_url_for_format,
 )
+from mtg_sources import mtggoldfish as mtggoldfish_mod  # noqa: E402
 from mtg_sources.mtggoldfish import (  # noqa: E402
     parse_mtggoldfish,
     url_for_format as mtggoldfish_url_for_format,
 )
+from mtg_sources import mtgdecks as mtgdecks_mod  # noqa: E402
 from mtg_sources.mtgdecks import (  # noqa: E402
     parse_mtgdecks,
     url_for_format as mtgdecks_url_for_format,
 )
+from mtg_sources import untapped as untapped_mod  # noqa: E402
 from mtg_sources.untapped import (  # noqa: E402
     parse_untapped,
     url_for_format as untapped_url_for_format,
 )
+from mtg_sources import archidekt as archidekt_mod  # noqa: E402
 from mtg_sources.archidekt import (  # noqa: E402
     parse_archidekt,
     url_for_format as archidekt_url_for_format,
@@ -6914,14 +6921,22 @@ def cmd_diff(args: argparse.Namespace) -> int:
 # `url_for_format(fmt) -> str | None` so `cmd_fetch_meta` can resolve
 # the URL without hardcoding it. Keep these two-tuple to avoid a third
 # config layer.
+#
+# Each entry is a 3-tuple `(parse_fn, url_fn, module)`. The module
+# reference is the parser's import target — kept here so plumbing like
+# `--deep` (which reads `module._DEEP_LIMIT`) doesn't need a parallel
+# registry. Keeps the source-of-truth in the parser module itself: a new
+# parser opting into deep mode just defines `_DEEP_LIMIT` at module
+# scope; `cmd_fetch_meta` picks it up via `getattr(module, '_DEEP_LIMIT',
+# None)`. Modules that don't define it fall back to per-source default.
 _FETCH_META_PARSERS = {
-    "aetherhub": (parse_aetherhub, aetherhub_url_for_format),
-    "moxfield": (parse_moxfield, moxfield_url_for_format),
-    "mtgazone": (parse_mtgazone, mtgazone_url_for_format),
-    "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format),
-    "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format),
-    "untapped": (parse_untapped, untapped_url_for_format),
-    "archidekt": (parse_archidekt, archidekt_url_for_format),
+    "aetherhub": (parse_aetherhub, aetherhub_url_for_format, aetherhub_mod),
+    "moxfield": (parse_moxfield, moxfield_url_for_format, moxfield_mod),
+    "mtgazone": (parse_mtgazone, mtgazone_url_for_format, mtgazone_mod),
+    "mtggoldfish": (parse_mtggoldfish, mtggoldfish_url_for_format, mtggoldfish_mod),
+    "mtgdecks": (parse_mtgdecks, mtgdecks_url_for_format, mtgdecks_mod),
+    "untapped": (parse_untapped, untapped_url_for_format, untapped_mod),
+    "archidekt": (parse_archidekt, archidekt_url_for_format, archidekt_mod),
 }
 
 # Sources the spec lists in the `--source` choices but that we have not
@@ -7198,7 +7213,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     # ENABLED case-block. Output: one source name per line, registry
     # insertion order.
     if args.list_sources:
-        for name, (_parse_fn, url_fn) in _FETCH_META_PARSERS.items():
+        for name, (_parse_fn, url_fn, _module) in _FETCH_META_PARSERS.items():
             if url_fn(fmt) is not None:
                 print(name)
         return 0
@@ -7216,7 +7231,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         print(f"unknown source: {source}", file=sys.stderr)
         return 2
 
-    parse_fn, url_fn = _FETCH_META_PARSERS[source]
+    parse_fn, url_fn, parser_module = _FETCH_META_PARSERS[source]
     url = url_fn(fmt)
     if url is None:
         print(
@@ -7249,11 +7264,21 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     # if not useful) `limit` via `**_` — see mtg_sources/*.py.
     #
     # Default-limit resolution: explicit user input wins (incl. 0 =
-    # no cap). Otherwise fall back to per-source defaults so a fresh
-    # `fetch-meta` produces a deep-enough corpus without the user
-    # knowing each source's natural ceiling.
+    # no cap). Otherwise, if `--deep` is set, consult the parser
+    # module's `_DEEP_LIMIT` (the per-source API ceiling for monthly
+    # meta-shift refreshes). Otherwise fall back to per-source defaults
+    # so a fresh `fetch-meta` produces a deep-enough corpus without the
+    # user knowing each source's natural ceiling. Modules without
+    # `_DEEP_LIMIT` defined (most non-paginated sources) fall through
+    # to their per-source default — `--deep` is a no-op there.
     if args.limit is not None:
         effective_limit = args.limit
+    elif args.deep:
+        deep_cap = getattr(parser_module, "_DEEP_LIMIT", None)
+        if deep_cap is not None:
+            effective_limit = deep_cap
+        else:
+            effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
     else:
         effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
     try:
@@ -9691,7 +9716,20 @@ def main(argv: list[str] | None = None) -> int:
             "cap deck count after parsing. If omitted, uses the "
             "per-source default (aetherhub=50, moxfield=300, "
             "untapped=1000; mtgazone/mtggoldfish/mtgdecks/archidekt=all). "
-            "Pass --limit 0 to disable the cap entirely."
+            "Pass --limit 0 to disable the cap entirely. "
+            "For a one-shot deep build pass that ignores per-source "
+            "defaults in favour of the API ceiling, use --deep instead."
+        ),
+    )
+    s.add_argument(
+        "--deep", action="store_true",
+        help=(
+            "raise the per-source deck cap to its API ceiling for a "
+            "deep build pass (10x+ fetch volume; intended for monthly "
+            "meta-shift refreshes). Currently affects moxfield + "
+            "archidekt (each pulls up to 10000 decks); other sources "
+            "are unaffected (they have no exposed pagination ceiling). "
+            "An explicit --limit always wins over --deep."
         ),
     )
     s.add_argument(
