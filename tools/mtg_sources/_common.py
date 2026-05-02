@@ -164,6 +164,7 @@ def _do_http_get(
             status = resp.status
             reason = resp.reason
             resp_headers = resp.getheaders()
+            will_close = resp.will_close
         except (
             http.client.RemoteDisconnected,
             http.client.BadStatusLine,
@@ -182,6 +183,22 @@ def _do_http_get(
             status = resp.status
             reason = resp.reason
             resp_headers = resp.getheaders()
+            will_close = resp.will_close
+
+        # `Connection: close` (HTTP/1.0 default, or sent by Cloudflare-
+        # fronted hosts on some responses) means the server has already
+        # closed the socket after this read. Returning it to the pool
+        # would force the next call to discover the FIN via
+        # RemoteDisconnected and pay the retry-with-fresh-conn cost.
+        # Evict proactively instead. http.client sets `will_close` based
+        # on the `Connection` header AND HTTP version, so this is the
+        # canonical signal — no header parsing needed.
+        if will_close:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _POOL.pop(key, None)
 
     if status != 200:
         # Mimic urllib.error.HTTPError exactly: callers
