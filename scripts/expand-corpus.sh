@@ -14,6 +14,17 @@
 # so concurrent workers silently corrupted the sidecar. Wall-clock cost
 # of serial mode is dominated by network I/O per source, not CPU, so
 # the gain from parallelism wasn't worth the corruption risk.
+#
+# Cross-FORMAT parallelism IS safe (and is exposed via PARALLEL_FORMATS
+# in `all` mode below): each format owns its own data/corpus/<fmt>/
+# directory with its own meta.json + _freq.json sidecar, so two formats
+# fetched concurrently never touch the same sidecar. This is the only
+# parallelism layer in the pipeline.
+#
+# RAM ceiling: each child process loads the ~80MB Scryfall index pickle.
+# PARALLEL_FORMATS=4 is a sane default for ≥8GB-RAM machines (~320MB
+# for indexes + Python overhead, comfortably under). Do not auto-detect:
+# the operator knows their box.
 set -uo pipefail
 
 # --- argv parse ---------------------------------------------------------
@@ -40,10 +51,11 @@ FMT="${FMT:-brawl}"
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# `all` mode: re-invoke this script once per Arena format. Sequential
-# across formats AND sources because the Scryfall index pickle is
-# ~500MB per process; parallelism would balloon RAM and any meta.json
-# cross-write isn't a concern (each format has its own sidecar).
+# `all` mode: re-invoke this script once per Arena format. Default is
+# sequential across formats (PARALLEL_FORMATS=1); set PARALLEL_FORMATS=N
+# to fan out N formats concurrently. Cross-format is race-free (each
+# format owns its sidecars), but cross-source within a format is NOT —
+# see the header comment for why. RAM ceiling: ~80MB pickle per child.
 if [ "$FMT" = "all" ]; then
   ALL_FORMATS=(standard alchemy historic timeless pioneer brawl explorer standardbrawl)
 
@@ -63,12 +75,47 @@ if [ "$FMT" = "all" ]; then
     done
   fi
 
+  PARALLEL_FORMATS="${PARALLEL_FORMATS:-1}"
   FAILED_FMTS=()
-  for f in "${ALL_FORMATS[@]}"; do
-    echo
-    echo "######### $f #########"
-    "${BASH_SOURCE[0]}" "$f" || FAILED_FMTS+=("$f")
-  done
+
+  if [ "$PARALLEL_FORMATS" -gt 1 ]; then
+    echo "==> PARALLEL_FORMATS=$PARALLEL_FORMATS — fanning out concurrently"
+    echo "    NOTE: stdout from concurrent children interleaves; the per-format"
+    echo "    '######### <fmt> #########' banner brackets segments, and the"
+    echo "    canonical record stays in $ROOT/data/corpus/.fetch-logs/<src>-<fmt>.log."
+    # FAILED_FMTS can't be appended from a subshell, so each child
+    # writes its exit status to /tmp/expand-corpus-rc.<pid>/<fmt>.rc and
+    # the parent collects them after `wait`.
+    rcdir=$(mktemp -d -t expand-corpus-rc.XXXXXX)
+    trap 'rm -rf "$rcdir"' EXIT
+    for f in "${ALL_FORMATS[@]}"; do
+      # Cap concurrent jobs at PARALLEL_FORMATS. `wait -n` blocks until
+      # any child exits, freeing a slot.
+      while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_FORMATS" ]; do
+        wait -n
+      done
+      (
+        echo
+        echo "######### $f #########"
+        "${BASH_SOURCE[0]}" "$f"
+        echo $? > "$rcdir/$f.rc"
+      ) &
+    done
+    wait
+    for f in "${ALL_FORMATS[@]}"; do
+      rc=$(cat "$rcdir/$f.rc" 2>/dev/null || echo 1)
+      if [ "$rc" -ne 0 ]; then
+        FAILED_FMTS+=("$f")
+      fi
+    done
+  else
+    for f in "${ALL_FORMATS[@]}"; do
+      echo
+      echo "######### $f #########"
+      "${BASH_SOURCE[0]}" "$f" || FAILED_FMTS+=("$f")
+    done
+  fi
+
   if [ "${#FAILED_FMTS[@]}" -gt 0 ]; then
     echo "==> failed formats: ${FAILED_FMTS[*]}"
     exit 1
