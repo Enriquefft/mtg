@@ -7186,6 +7186,119 @@ def _existing_corpus_hashes(out_dir: Path) -> dict[str, tuple[str, str]]:
     return out
 
 
+class _SourceUnsupportedError(ValueError):
+    """Raised by `_fetch_one_source` when url_fn(fmt) returns None.
+
+    Distinguishes "this source can't do this format" (caller should
+    skip or mark 'unsupported') from "the source failed at runtime"
+    (HTTPError, parse ValueError, zero-deck response).
+    """
+
+
+def _fetch_one_source(
+    source: str,
+    fmt: str,
+    args: argparse.Namespace,
+    *,
+    log_file_path: "Path | None" = None,
+) -> "list[_common.ParsedDeck]":
+    """Fetch + parse one source; return raw ``ParsedDeck`` list.
+
+    No filtering, no dedup, no writes — pure 'network + parse'. The
+    caller is responsible for all post-processing (stub filter, validate
+    gate, quality gate, dedup, eviction, write).
+
+    Parameters
+    ----------
+    source:
+        Key in ``_FETCH_META_PARSERS``.
+    fmt:
+        Arena format string (already lowercased + validated by caller).
+    args:
+        Parsed ``argparse.Namespace``; consumed fields:
+        ``no_cache``, ``limit``, ``deep``.
+    log_file_path:
+        When provided, progress lines are flushed to this file
+        (overwrite mode) so ``tail -f`` works during long fetches.
+        Matches the semantics the old bash ``tee`` pattern provided.
+
+    Raises
+    ------
+    _SourceUnsupportedError
+        ``url_fn(fmt)`` returned ``None`` — source provably can't
+        serve this format.  Caller decides skip vs. fail.
+    urllib.error.HTTPError / urllib.error.URLError
+        Network failure.  Caller decides continue vs. abort.
+    ValueError
+        Parser drift (schema changed on live page).
+    """
+    parse_fn, url_fn, parser_module = _FETCH_META_PARSERS[source]
+    url = url_fn(fmt)
+    if url is None:
+        raise _SourceUnsupportedError(
+            f"source {source!r} doesn't support format {fmt!r}"
+        )
+
+    fetched = time.strftime("%Y-%m-%d", time.gmtime())
+
+    log_fh: "io.TextIOWrapper | None" = None
+    if log_file_path is not None:
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = log_file_path.open("w", encoding="utf-8", buffering=1)
+
+    def _log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+        if log_fh is not None:
+            print(msg, file=log_fh, flush=True)
+
+    try:
+        _log(f"[{source}] fetching {url}")
+        html_text = _fetch_meta_page(url, source=source, no_cache=args.no_cache)
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        if log_fh is not None:
+            log_fh.close()
+        raise
+
+    # Limit resolution mirrors cmd_fetch_meta exactly.
+    if args.limit is not None:
+        effective_limit = args.limit
+    elif getattr(args, "deep", False):
+        deep_cap = getattr(parser_module, "_DEEP_LIMIT", None)
+        effective_limit = deep_cap if deep_cap is not None else _FETCH_META_DEFAULT_LIMIT.get(source)
+    else:
+        effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
+
+    try:
+        decks = parse_fn(
+            html_text, fmt,
+            fetched=fetched, url=url, resolve_name=_resolve_card,
+            limit=effective_limit,
+        )
+    except ValueError:
+        if log_fh is not None:
+            log_fh.close()
+        raise
+
+    if not decks:
+        if log_fh is not None:
+            log_fh.close()
+        raise ValueError(
+            f"0 decks extracted from a 200 response at {url} "
+            f"(source page likely changed structure)"
+        )
+
+    _log(
+        f"[{source}] parsed {len(decks)} raw deck"
+        f"{'s' if len(decks) != 1 else ''} (limit={effective_limit!r})"
+    )
+
+    if log_fh is not None:
+        log_fh.flush()
+        log_fh.close()
+
+    return decks
+
+
 def cmd_fetch_meta(args: argparse.Namespace) -> int:
     """Scrape a meta source into a directory of MTGA-export deck files.
 
@@ -7235,7 +7348,7 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         print(f"unknown source: {source}", file=sys.stderr)
         return 2
 
-    parse_fn, url_fn, parser_module = _FETCH_META_PARSERS[source]
+    _, url_fn, _ = _FETCH_META_PARSERS[source]
     url = url_fn(fmt)
     if url is None:
         print(
@@ -7249,59 +7362,43 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
         return 2
 
     _warn_if_stale()
-    fetched = time.strftime("%Y-%m-%d", time.gmtime())
 
+    # Delegate fetch + parse to the shared worker so cmd_fetch_meta_all
+    # can call the same logic. Per-source log path mirrors the bash tee
+    # pattern used in expand-corpus.sh (now owned by Python).
+    log_dir = CORPUS / ".fetch-logs"
+    log_file = log_dir / f"{source}-{fmt}.log"
     try:
-        html_text = _fetch_meta_page(url, source=source, no_cache=args.no_cache)
+        decks = _fetch_one_source(source, fmt, args, log_file_path=log_file)
+    except _SourceUnsupportedError as e:
+        # Shouldn't be reachable (we checked url_fn above), but guard.
+        print(str(e), file=sys.stderr)
+        return 2
     except urllib.error.HTTPError as e:
         print(f"fetch failed: {url} -> HTTP {e.code}", file=sys.stderr)
         return 1
     except urllib.error.URLError as e:
         print(f"fetch failed: {url} -> {e.reason}", file=sys.stderr)
         return 1
-
-    # `limit` is a soft hint to the parser: sources with large per-
-    # archetype HTTP fan-out (untapped's historic-brawl walk is 1470
-    # archetype pages × 2 sub-fetches each) can short-circuit instead
-    # of fetching everything just to have `decks[:limit]` slice it
-    # down post-parse. Every parser's signature accepts (and ignores
-    # if not useful) `limit` via `**_` — see mtg_sources/*.py.
-    #
-    # Default-limit resolution: explicit user input wins (incl. 0 =
-    # no cap). Otherwise, if `--deep` is set, consult the parser
-    # module's `_DEEP_LIMIT` (the per-source API ceiling for monthly
-    # meta-shift refreshes). Otherwise fall back to per-source defaults
-    # so a fresh `fetch-meta` produces a deep-enough corpus without the
-    # user knowing each source's natural ceiling. Modules without
-    # `_DEEP_LIMIT` defined (most non-paginated sources) fall through
-    # to their per-source default — `--deep` is a no-op there.
-    if args.limit is not None:
-        effective_limit = args.limit
-    elif args.deep:
-        deep_cap = getattr(parser_module, "_DEEP_LIMIT", None)
-        if deep_cap is not None:
-            effective_limit = deep_cap
-        else:
-            effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
-    else:
-        effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
-    try:
-        decks = parse_fn(
-            html_text, fmt,
-            fetched=fetched, url=url, resolve_name=_resolve_card,
-            limit=effective_limit,
-        )
     except ValueError as e:
         print(f"parser drift on {url}: {e}", file=sys.stderr)
         return 1
 
-    if not decks:
-        print(
-            f"parser drift on {url}: 0 decks extracted from a 200 response. "
-            f"Source page likely changed structure; do not write to --out.",
-            file=sys.stderr,
-        )
-        return 1
+    # Date stamp for gate-log entries: pick it up from the first deck
+    # (set by _fetch_one_source) so it's consistent with what was written
+    # into the deck files, falling back to now() in the unlikely edge case
+    # of an empty list that somehow passed the length check.
+    fetched = decks[0].fetched if decks else time.strftime("%Y-%m-%d", time.gmtime())
+
+    # Resolve effective_limit for the post-fetch truncation below.
+    _, _, parser_module = _FETCH_META_PARSERS[source]
+    if args.limit is not None:
+        effective_limit = args.limit
+    elif args.deep:
+        deep_cap = getattr(parser_module, "_DEEP_LIMIT", None)
+        effective_limit = deep_cap if deep_cap is not None else _FETCH_META_DEFAULT_LIMIT.get(source)
+    else:
+        effective_limit = _FETCH_META_DEFAULT_LIMIT.get(source)
 
     # Stub filter applied centrally so every parser benefits — used to
     # be inlined in untapped.py for the brawl `laelia-the-blade-reforged`
@@ -7521,6 +7618,323 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
+    """Run every parser supporting fmt in one process; merge + dedup + write once.
+
+    Exit codes
+    ----------
+    0 : at least one source succeeded and decks were written (or zero
+        decks survived post-processing, which is logged but not an error).
+    1 : at least one source failed at runtime (HTTP error, parser drift)
+        AND at least one other source succeeded.  Partial success.
+    2 : every source returned 'unsupported' for this format (--list-sources
+        would return an empty list), OR fmt is unknown.
+    1 : all sources failed (no successful fetch at all).
+
+    --limit applies per source (same semantics as fetch-meta --limit).
+    Cross-source dedup runs ONCE on the merged list, catching duplicates
+    that the per-source pipeline misses (e.g. same deck on moxfield +
+    archidekt).
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --list-sources: enumerate supported sources for this format and exit.
+    if getattr(args, "list_sources", False):
+        for name, (_parse_fn, url_fn, _module) in _FETCH_META_PARSERS.items():
+            if url_fn(fmt) is not None:
+                print(name)
+        return 0
+
+    # Discover enabled sources.  --exclude allows ad-hoc debugging when
+    # one source is timing out without re-running the full suite.
+    excluded: set[str] = set()
+    if getattr(args, "exclude", None):
+        for item in args.exclude.split(","):
+            s = item.strip()
+            if s:
+                excluded.add(s)
+
+    enabled_sources = [
+        name for name, (_parse_fn, url_fn, _module) in _FETCH_META_PARSERS.items()
+        if url_fn(fmt) is not None and name not in excluded
+    ]
+
+    if not enabled_sources:
+        print(
+            f"no sources support format {fmt!r} "
+            f"(excluded: {', '.join(sorted(excluded)) or 'none'})",
+            file=sys.stderr,
+        )
+        return 2
+
+    _warn_if_stale()
+    fetched = time.strftime("%Y-%m-%d", time.gmtime())
+
+    log_dir = CORPUS / ".fetch-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out) if getattr(args, "out", None) else CORPUS / fmt
+
+    print(
+        f"fetch-meta-all fmt={fmt} sources={','.join(enabled_sources)} "
+        f"out={out_dir}",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+
+    # --- Phase 1: fetch + parse (sequential; Phase C grafts ThreadPool) ---
+    # per_source_stats tracks per-source outcome for the summary table.
+    per_source_stats: dict[str, dict] = {}
+    all_raw: list[_common.ParsedDeck] = []
+
+    for source in enabled_sources:
+        log_file = log_dir / f"{source}-{fmt}.log"
+        print(f"\n--- [{source}] {time.strftime('%Y-%m-%dT%H:%M:%S')} ---", file=sys.stderr)
+        sys.stderr.flush()
+        try:
+            raw = _fetch_one_source(source, fmt, args, log_file_path=log_file)
+        except _SourceUnsupportedError as e:
+            # url_fn was not None at discovery time; a race is possible
+            # if the source module was updated mid-run, but guard anyway.
+            print(f"[{source}] unsupported (skipped): {e}", file=sys.stderr)
+            per_source_stats[source] = {"status": "unsupported", "fetched": 0, "error": str(e)}
+            continue
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+            print(f"[{source}] FAILED: {e}", file=sys.stderr)
+            per_source_stats[source] = {"status": "failed", "fetched": 0, "error": str(e)}
+            continue
+
+        per_source_stats[source] = {"status": "ok", "fetched": len(raw), "error": None}
+        all_raw.extend(raw)
+        print(f"    [{source}] ok — {len(raw)} raw decks", file=sys.stderr)
+        sys.stderr.flush()
+
+    # Determine aggregate outcome before post-processing.
+    statuses = {s["status"] for s in per_source_stats.values()}
+    n_ok = sum(1 for s in per_source_stats.values() if s["status"] == "ok")
+    n_failed = sum(1 for s in per_source_stats.values() if s["status"] == "failed")
+    n_unsupported = sum(1 for s in per_source_stats.values() if s["status"] == "unsupported")
+
+    if statuses == {"unsupported"}:
+        print(f"no sources support format {fmt!r}", file=sys.stderr)
+        return 2
+    if n_ok == 0:
+        # All non-unsupported sources failed.
+        print(f"all sources failed for format {fmt!r}", file=sys.stderr)
+        return 1
+
+    # --- Phase 2: shared post-processing (runs ONCE on the merged list) ---
+
+    # Stub filter.
+    pre_stub = len(all_raw)
+    decks = [d for d in all_raw if not _common.is_stub_deck(d, _resolve_card)]
+    stub_dropped = pre_stub - len(decks)
+
+    # Update per-source stats with post-stub count.
+    source_counts: dict[str, int] = collections.Counter(d.source for d in decks)
+    for src, stats in per_source_stats.items():
+        stats["kept_after_stub"] = source_counts.get(src, 0)
+
+    # Validate gate — one log file, one write.
+    gate_dropped: dict[str, int] = collections.Counter()
+    gate_dropped_total = 0
+    pre_gate = len(decks)
+    gate_kept: list[_common.ParsedDeck] = []
+    gate_log_path = CORPUS / ".fetch-logs" / f"validate-{fmt}.log"
+    gate_log_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_log_lines: list[str] = []
+    for d in decks:
+        ok_corpus, reasons = _validate_for_corpus(d.entries, fmt)
+        if ok_corpus:
+            gate_kept.append(d)
+            continue
+        gate_dropped_total += 1
+        for r in reasons:
+            cat = r.split(":", 1)[0] if ":" in r else r
+            gate_dropped[cat] += 1
+            gate_log_lines.append(
+                f"[{fetched}] {d.source} {fmt} slug={d.slug} reason={r}"
+            )
+    if gate_log_lines:
+        with gate_log_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(gate_log_lines) + "\n")
+    decks = gate_kept
+    if gate_dropped_total:
+        breakdown = " ".join(f"{k}={v}" for k, v in sorted(gate_dropped.items()))
+        print(
+            f"[fetch-meta-all] gate: kept {len(decks)}/{pre_gate}, "
+            f"dropped {gate_dropped_total} ({breakdown})",
+            file=sys.stderr,
+        )
+
+    # Update per-source stats with post-validate count.
+    source_counts_v: dict[str, int] = collections.Counter(d.source for d in decks)
+    for src, stats in per_source_stats.items():
+        stats["kept_after_validate"] = source_counts_v.get(src, 0)
+
+    # Quality gate (--min-winrate / --min-sample).
+    winrate_dropped = 0
+    sample_dropped = 0
+    if getattr(args, "min_winrate", None) is not None or getattr(args, "min_sample", None) is not None:
+        quality_kept: list[_common.ParsedDeck] = []
+        for d in decks:
+            if (
+                args.min_winrate is not None
+                and d.winrate is not None
+                and d.winrate < args.min_winrate
+            ):
+                winrate_dropped += 1
+                continue
+            if (
+                args.min_sample is not None
+                and d.sample is not None
+                and d.sample < args.min_sample
+            ):
+                sample_dropped += 1
+                continue
+            quality_kept.append(d)
+        decks = quality_kept
+
+    # Cross-source dedup — ONCE on the merged list.  This is the key win
+    # over the per-source pipeline: a deck on both moxfield and archidekt
+    # now collapses into one canonical entry.
+    existing_hashes = _existing_corpus_hashes(out_dir)
+    no_dedup = getattr(args, "no_dedup", False)
+    if no_dedup:
+        _, dedup_dropped_decks, eviction_map = _common.dedup_decks(
+            decks, existing_hashes=existing_hashes,
+        )
+    else:
+        decks, dedup_dropped_decks, eviction_map = _common.dedup_decks(
+            decks, existing_hashes=existing_hashes,
+        )
+    near_dup_dropped = sum(max(0, d.variant_count - 1) for d in decks)
+    exact_dedup_dropped = len(dedup_dropped_decks) - near_dup_dropped
+
+    # No per-source limit truncation here: --limit is a per-source hint
+    # passed into _fetch_one_source; post-merge we keep everything that
+    # survived dedup (the caller asked for a full corpus build).
+    survived_hashes = {_common.cards_hash(d) for d in decks}
+    evicted = [slug for h, slug in eviction_map.items() if h in survived_hashes]
+
+    _evict_corpus_slugs(out_dir, evicted)
+    sidecar = _write_meta_corpus(decks, out_dir)
+    sys.stdout.flush()
+
+    # Update per-source stats with post-dedup count.
+    source_counts_d: dict[str, int] = collections.Counter(d.source for d in decks)
+    for src, stats in per_source_stats.items():
+        stats["kept_after_dedup"] = source_counts_d.get(src, 0)
+
+    total_unresolved = sum(d.unresolved for d in decks)
+
+    # --- Output ---
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "format": fmt,
+            "fetched": fetched,
+            "out": str(out_dir),
+            "sources_attempted": len(enabled_sources),
+            "sources_ok": n_ok,
+            "sources_failed": n_failed,
+            "sources_unsupported": n_unsupported,
+            "deck_count": len(decks),
+            "unresolved_total": total_unresolved,
+            "stub_dropped": stub_dropped,
+            "gate_dropped": gate_dropped_total,
+            "gate_dropped_by_reason": dict(gate_dropped),
+            "winrate_dropped": winrate_dropped,
+            "sample_dropped": sample_dropped,
+            "dedup_dropped": exact_dedup_dropped,
+            "near_dup_dropped": near_dup_dropped,
+            "evicted_existing": len(evicted),
+            "per_source": {
+                src: {
+                    "fetched": s["fetched"],
+                    "kept_after_stub": s.get("kept_after_stub", 0),
+                    "kept_after_validate": s.get("kept_after_validate", 0),
+                    "kept_after_dedup": s.get("kept_after_dedup", 0),
+                    "status": s["status"],
+                    "error": s["error"],
+                }
+                for src, s in per_source_stats.items()
+            },
+            "decks": [
+                {
+                    "slug": d.slug,
+                    "source": d.source,
+                    "archetype": d.archetype,
+                    "tier": d.tier,
+                    "url": d.url,
+                    "main": sum(e.count for e in d.entries if e.section == "deck"),
+                    "sideboard": sum(e.count for e in d.entries if e.section == "sideboard"),
+                    "unresolved": d.unresolved,
+                    "also_seen_at": list(d.also_seen_at),
+                    "variant_count": d.variant_count,
+                    "variants": list(d.variants),
+                }
+                for d in decks
+            ],
+        }, indent=2))
+        return 0 if n_failed == 0 else 1
+
+    # Human-readable summary table.
+    print(f"\nformat : {fmt}")
+    print(f"out    : {out_dir}")
+    print(f"decks  : {len(decks)}  (across {n_ok}/{len(enabled_sources)} sources)")
+    if stub_dropped:
+        print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
+    if gate_dropped_total:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(gate_dropped.items()))
+        print(f"gate   : {gate_dropped_total} dropped (validate fail: {breakdown})")
+    if winrate_dropped:
+        print(f"winrate: {winrate_dropped} dropped (< {args.min_winrate:.2%})")
+    if sample_dropped:
+        print(f"sample : {sample_dropped} dropped (< {args.min_sample})")
+    if exact_dedup_dropped:
+        print(f"dedup  : {exact_dedup_dropped} collapsed (exact cross-source)")
+    if near_dup_dropped:
+        print(f"near-d : {near_dup_dropped} collapsed (near-dup Jaccard≥0.85)")
+    if evicted:
+        print(f"evict  : {len(evicted)} on-disk decks beaten by higher-priority source")
+    print(f"sidecar: {len(sidecar)} total entries")
+    print()
+
+    # Per-source summary table.
+    col_w = max(len(s) for s in per_source_stats) + 2
+    print(
+        f"{'source':<{col_w}}  {'status':<11}  {'fetched':>7}  "
+        f"{'post-stub':>9}  {'post-gate':>9}  {'post-dedup':>10}  errors"
+    )
+    print("-" * (col_w + 60))
+    for src, s in per_source_stats.items():
+        err_str = (s["error"] or "")[:40]
+        print(
+            f"{src:<{col_w}}  {s['status']:<11}  {s['fetched']:>7}  "
+            f"{s.get('kept_after_stub', 0):>9}  "
+            f"{s.get('kept_after_validate', 0):>9}  "
+            f"{s.get('kept_after_dedup', 0):>10}  "
+            f"{err_str}"
+        )
+
+    if total_unresolved:
+        print(
+            f"\n[warn] {total_unresolved} card cop"
+            f"{'y' if total_unresolved == 1 else 'ies'} unresolved across "
+            f"{sum(1 for d in decks if d.unresolved)} deck"
+            f"{'' if sum(1 for d in decks if d.unresolved) == 1 else 's'}; "
+            f"deck files are short by that much.",
+            file=sys.stderr,
+        )
+
+    return 0 if n_failed == 0 else 1
 
 
 # ---------- recommend (collection-aware archetype + shell roll-up) -------
@@ -9781,6 +10195,86 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     s.set_defaults(func=cmd_fetch_meta)
+
+    s = sub.add_parser(
+        "fetch-meta-all",
+        help="run every parser supporting fmt in one process; merge + dedup + write once",
+    )
+    s.add_argument(
+        "format",
+        help=(
+            "Arena format (standard/alchemy/historic/timeless/explorer/pioneer/brawl/standardbrawl). "
+            "Runs every source whose url_for_format(fmt) returns non-None."
+        ),
+    )
+    s.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="output dir (default: data/corpus/<format>/)",
+    )
+    s.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help=(
+            "per-source deck cap (same semantics as fetch-meta --limit). "
+            "Omitted = per-source defaults. Pass --limit 0 to disable."
+        ),
+    )
+    s.add_argument(
+        "--deep", action="store_true",
+        help=(
+            "raise the per-source deck cap to its API ceiling for a deep "
+            "build pass (same semantics as fetch-meta --deep). An explicit "
+            "--limit always wins over --deep."
+        ),
+    )
+    s.add_argument(
+        "--json", action="store_true",
+        help=(
+            "emit JSON manifest instead of human-readable table. "
+            "Shape is the same as fetch-meta --json with an added "
+            "'per_source' map keyed by source name."
+        ),
+    )
+    s.add_argument(
+        "--no-cache", action="store_true",
+        help="bypass the 24h on-disk HTML cache and re-fetch",
+    )
+    s.add_argument(
+        "--min-winrate", type=float, default=None, metavar="P",
+        help=(
+            "drop decks whose source-published winrate is below P (0.0-1.0). "
+            "Only applies to sources that publish winrates (untapped, aetherhub)."
+        ),
+    )
+    s.add_argument(
+        "--min-sample", type=int, default=None, metavar="N",
+        help=(
+            "drop decks whose source-published match-sample is below N. "
+            "Only applies to sources that publish a sample size."
+        ),
+    )
+    s.add_argument(
+        "--exclude", default=None, metavar="SRC[,SRC...]",
+        help=(
+            "comma-separated source names to skip (e.g. 'mtgdecks,aetherhub'). "
+            "Useful when one source is timing out and you don't want to block "
+            "the whole run."
+        ),
+    )
+    s.add_argument(
+        "--list-sources", action="store_true",
+        help=(
+            "print the parser names that publish for the given format "
+            "(one per line, registry order) and exit."
+        ),
+    )
+    s.add_argument(
+        "--no-dedup", action="store_true",
+        help=(
+            "skip near-dup deduplication (Jaccard >= 0.85 collapse). "
+            "Useful for measuring raw dedup impact; default is to deduplicate."
+        ),
+    )
+    s.set_defaults(func=cmd_fetch_meta_all)
 
     s = sub.add_parser(
         "recommend",
