@@ -381,8 +381,12 @@ def _do_one_hop(
     # request raises RemoteDisconnected / BadStatusLine / ConnectionError
     # depending on which point of the cycle the FIN arrives. Retry once
     # with a freshly-allocated connection — anything beyond that is a
-    # real network problem and re-raises so callers' retry logic
-    # (http_get_text retry-403-once) sees a normal HTTPError shape.
+    # real network problem. We then re-raise wrapped in `URLError` to
+    # mirror `urllib.request.urlopen`'s contract: callers across the
+    # toolkit catch `(HTTPError, URLError)` to treat transport failure
+    # as "drop this archetype/deck, continue the run" — bare `OSError`
+    # / `ConnectionRefusedError` would leak past those handlers and
+    # crash the per-format process.
     with host_lock:
         conn = _get_conn(scheme, host, port)
         try:
@@ -404,14 +408,29 @@ def _do_one_hop(
             except Exception:
                 pass
             _POOL.pop(key, None)
-            conn = _get_conn(scheme, host, port)
-            conn.request("GET", path, headers=headers)
-            resp = conn.getresponse()
-            raw = resp.read()
-            status = resp.status
-            reason = resp.reason
-            resp_headers = resp.getheaders()
-            will_close = resp.will_close
+            try:
+                conn = _get_conn(scheme, host, port)
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                status = resp.status
+                reason = resp.reason
+                resp_headers = resp.getheaders()
+                will_close = resp.will_close
+            except (
+                http.client.RemoteDisconnected,
+                http.client.BadStatusLine,
+                ConnectionError,
+                OSError,
+            ) as e:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _POOL.pop(key, None)
+                raise urllib.error.URLError(
+                    f"transport failure for {url!r}: {e!r}"
+                ) from e
 
         # `Connection: close` (HTTP/1.0 default, or sent by Cloudflare-
         # fronted hosts on some responses) means the server has already
