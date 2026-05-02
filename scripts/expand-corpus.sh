@@ -182,6 +182,17 @@ for src in "${ENABLED[@]}"; do
 done
 
 echo
+echo "==> corpus-clean $FMT"
+clean_log="$LOG_DIR/corpus-clean-$FMT.log"
+# Drops decks that fail _validate_for_corpus (catches both legacy
+# entries pre-dating the fetch-time gate and anything that slipped
+# past it). Runs BEFORE freq --rebuild so the index is built from
+# the pruned corpus. corpus-clean rebuilds _freq.json itself after
+# deletions; the explicit `freq --rebuild` below is kept as a belt-
+# and-braces guarantee that the index reflects current on-disk state.
+"$MTG" corpus-clean "$FMT" 2>&1 | tee "$clean_log"
+
+echo
 echo "==> rebuilding freq index for $FMT"
 freq_log="$LOG_DIR/freq-$FMT.log"
 # Stream full output to the log AND echo last 2 lines (the success
