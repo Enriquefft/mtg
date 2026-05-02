@@ -25,14 +25,24 @@ and the `/Historic/h-<slug>-decklist-by-<user>-<id>` deck pages):
   winrate into `winrate`, decks count into `sample`. Tier maps via
   `_TIER_CLASS_TO_LETTER`.
 
-* **Archetype** — server-rendered list of individual user-submitted
-  decks. The first `<a href="/Historic/h-<slug>-decklist-by-<user>-<id>">`
-  in document order is the most-recent submission (mtgdecks lists by
-  recency by default). We take the top 3 decks per archetype (most recent
-  submissions first) to multiply corpus breadth by ~3x; duplicates with
-  identical lists are dropped downstream by `_write_meta_corpus`'s
-  near-dup deduplication. When an archetype's URL appears multiple times
-  in the index (very rare), we suffix deck names with variant markers.
+* **Archetype** — server-rendered table of up to ~15 user-submitted
+  decks (verified 2026-05-02 across 6 archetypes; consistently 15
+  unique deck rows). The deck rows live inside a stable container —
+  `<table cellpadding="0" cellspacing="0" class="clickable table table-
+  striped hidden-xs">` — and each row carries a per-deck winrate cell of
+  the form `W/L <br> (W&nbsp;-&nbsp;L) <br/> NN%`, plus a deck-page
+  link of the form `/Historic/<slug>-decklist-by-<user>-<id>` (slug is
+  free-form, not constrained to an `h-` prefix as an earlier probe
+  suggested). We walk the rows of that container and take a per-archetype
+  cap derived from `--limit / num_archetypes` (or all rows when no
+  `--limit` is set), preserving document order = recency order.
+  Duplicates with identical lists are collapsed downstream by
+  `_write_meta_corpus`'s near-dup deduplication. When an archetype's URL
+  appears multiple times in the index (very rare), we suffix deck names
+  with variant markers. Per-deck winrate replaces the per-archetype
+  winrate on `ParsedDeck.winrate` (more granular signal); `sample` is
+  the per-row W+L count (per-deck match volume), falling back to the
+  per-archetype count when the row's win/loss cells are missing.
 
 * **Deck** — embeds the full MTGA paste verbatim in
   `<textarea id="arena_deck">Deck\n4 …\nSideboard\n…</textarea>`. Plain
@@ -135,14 +145,41 @@ _TILE_WINRATE_RE = re.compile(
 
 # --- per-archetype-page region carving -----------------------------------
 
-# Deck-page links inside an archetype page. The slug appears prefixed by
-# `h-<archetype-slug>-decklist-by-<user>-<id>`. We capture the relative
-# href; document order = recency order (newest first). All matches are
-# extracted; we take up to top 3. Anchors on the relative `/Historic/h-`
-# form that the archetype-page deck table uses (the sidebar / footer never
-# link to `h-` URLs, so there's no false-positive risk).
+# The archetype page wraps its deck list in this distinctive table tag
+# (verified 2026-05-02 across 6 archetypes — every page used this exact
+# class string). Carving on this container is essential because mtgdecks
+# also emits `/Historic/<other-slug>-decklist-by-…` links in sidebar
+# nav and breadcrumbs that would steal the wrong slugs if we matched
+# across the whole document.
+_DECK_TABLE_RE = re.compile(
+    r'<table\s+cellpadding="0"\s+cellspacing="0"\s+class="clickable\s+table\s+table-striped\s+hidden-xs">(.*?)</table>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Split the deck-table body into one chunk per `<tr>`. Each chunk holds
+# at most one deck link + at most one W/L winrate cell; pairing them by
+# row position keeps deck-link / winrate / sample correlated even when
+# some rows have missing winrate cells (occasional `&mdash;` entries).
+_DECK_TABLE_ROW_SPLIT_RE = re.compile(r'<tr\b[^>]*>', re.IGNORECASE)
+
+# Deck-page links inside the deck-table body. The slug is free-form
+# (`bo3-new-jeskai-chorus`, `gsz-gates`, `jeskai-truths-4`, `h-chorus`
+# — no `h-` prefix invariant); the load-bearing structure is
+# `<archetype-or-variant-slug>-decklist-by-<user>-<id>`. Document order
+# is recency order (newest first); we slice to the per-archetype cap
+# below.
 _DECK_LINK_RE = re.compile(
-    r'href="(/Historic/h-[a-z0-9-]+-decklist-by-[a-z0-9-]+-\d+)"',
+    r'href="(/Historic/[a-z0-9-]+decklist-by[a-z0-9-]+-\d+)"',
+    re.IGNORECASE,
+)
+
+# Per-deck winrate cell. Format observed: `W/L <br> (13&nbsp;-&nbsp;8)
+# <br/> 61%`. We capture wins, losses, and the percent so we can derive
+# both `winrate` (the percent) and a per-deck `sample` (W + L = total
+# matches). Some rows have missing winrate cells (rare); those decks fall
+# back to the per-archetype winrate / sample.
+_DECK_ROW_WINRATE_RE = re.compile(
+    r'W/L[^<]*<br[^>]*>\s*\((\d+)\s*&nbsp;-&nbsp;(\d+)\)\s*<br[^>]*>\s*(\d+)%',
     re.IGNORECASE,
 )
 
@@ -206,6 +243,18 @@ def parse_mtgdecks(
     if not tile_matches:
         return decks
 
+    # Per-archetype deck cap: ~15 decks live in each archetype page (verified
+    # 2026-05-02). Without a `--limit`, take all of them; with one, divide
+    # evenly (round UP via ceil) so the per-archetype budget never under-
+    # shoots the requested cap when limit is close to num_archetypes (e.g.
+    # `--limit 50` against 30 archetypes => 2 decks per archetype = 60 raw,
+    # truncated by cmd_fetch_meta to 50). Floor of 1 means even `--limit 1`
+    # returns the most-recent deck from each archetype.
+    if limit is not None and limit > 0:
+        per_archetype_cap = max(1, -(-limit // len(tile_matches)))
+    else:
+        per_archetype_cap = None  # take all rows in each archetype
+
     # Append a sentinel so each tile body slices to the next tile's start.
     bounds = [m.start() for m in tile_matches] + [len(raw_html)]
     seen_archetypes: dict[str, int] = {}  # Track archetype slug collisions
@@ -228,27 +277,29 @@ def parse_mtgdecks(
         tier_class = m.group(1).lower()
         tier_letter = _TIER_CLASS_TO_LETTER.get(tier_class, "")
 
-        sample: int | None = None
+        # Per-archetype winrate / sample (fallback when a deck row's own
+        # W/L cell is missing — rare, ~1 row per page).
+        archetype_sample: int | None = None
         sample_m = _TILE_SAMPLE_RE.search(body)
         if sample_m:
             try:
-                sample = int(sample_m.group(1))
+                archetype_sample = int(sample_m.group(1))
             except ValueError:
-                sample = None
+                archetype_sample = None
 
-        winrate: float | None = None
+        archetype_winrate: float | None = None
         wr_m = _TILE_WINRATE_RE.search(body)
         if wr_m:
             try:
-                winrate = float(wr_m.group(1)) / 100.0
+                archetype_winrate = float(wr_m.group(1)) / 100.0
             except ValueError:
-                winrate = None
+                archetype_winrate = None
 
         archetype_url = f"https://mtgdecks.net/Historic/{slug}"
 
-        # Fetch the archetype page to get up to 3 deck URLs. We use
-        # the index URL as Referer per the documented contract. A 4xx
-        # after retry drops this archetype; the rest of the run continues.
+        # Fetch the archetype page. We use the index URL as Referer per the
+        # documented contract. A 4xx after retry drops this archetype; the
+        # rest of the run continues.
         try:
             arch_html = http_get_text(
                 archetype_url, retry_403_once=True, referer=url,
@@ -258,18 +309,66 @@ def parse_mtgdecks(
         except urllib.error.URLError:
             continue
 
-        # Extract up to top 3 deck links (document order = recency order).
-        deck_links = _DECK_LINK_RE.findall(arch_html)
-        if not deck_links:
-            # Drift: archetype page rendered but no deck link inside.
+        # Carve out the deck-list table (stable container — see _DECK_TABLE_RE
+        # rationale above). Falling outside this container would pull
+        # sidebar / breadcrumb deck links from the wrong archetype.
+        table_m = _DECK_TABLE_RE.search(arch_html)
+        if not table_m:
+            # Drift: archetype page rendered but the deck table is missing.
             continue
+        table_body = table_m.group(1)
+
+        # Walk per-row chunks. Each `<tr>` chunk has at most one deck link
+        # and at most one W/L winrate cell, so positional pairing within the
+        # chunk keeps signal correlated to its deck.
+        row_chunks = _DECK_TABLE_ROW_SPLIT_RE.split(table_body)
+        deck_rows: list[tuple[str, float | None, int | None]] = []
+        seen_paths: set[str] = set()
+        for chunk in row_chunks:
+            link_m = _DECK_LINK_RE.search(chunk)
+            if not link_m:
+                continue
+            deck_path = link_m.group(1)
+            if deck_path in seen_paths:
+                # Same deck linked twice in the same row (anchor + thumbnail).
+                continue
+            seen_paths.add(deck_path)
+            wr_row_m = _DECK_ROW_WINRATE_RE.search(chunk)
+            if wr_row_m:
+                try:
+                    wins = int(wr_row_m.group(1))
+                    losses = int(wr_row_m.group(2))
+                    pct = float(wr_row_m.group(3)) / 100.0
+                    row_winrate: float | None = pct
+                    row_sample: int | None = wins + losses
+                except ValueError:
+                    row_winrate = archetype_winrate
+                    row_sample = archetype_sample
+            else:
+                row_winrate = archetype_winrate
+                row_sample = archetype_sample
+            deck_rows.append((deck_path, row_winrate, row_sample))
+
+        if not deck_rows:
+            # Drift: archetype page rendered but no deck links in the table.
+            continue
+
+        # Cap per-archetype takes. None = unlimited (no --limit set);
+        # otherwise slice to the budget computed above.
+        if per_archetype_cap is not None:
+            deck_rows = deck_rows[:per_archetype_cap]
 
         # Track archetype slug collisions separately from per-deck variants.
         arch_count = seen_archetypes.get(slug, 0) + 1
         seen_archetypes[slug] = arch_count
         arch_suffix = "" if arch_count == 1 else f"-{arch_count}"
 
-        for deck_idx, deck_path in enumerate(deck_links[:3], start=1):
+        for deck_idx, (deck_path, row_winrate, row_sample) in enumerate(
+            deck_rows, start=1
+        ):
+            if limit is not None and limit > 0 and len(decks) >= limit:
+                break
+
             deck_url = "https://mtgdecks.net" + deck_path
 
             try:
@@ -302,8 +401,8 @@ def parse_mtgdecks(
                 source="mtgdecks",
                 url=deck_url,
                 tier=tier_letter,
-                winrate=winrate,
-                sample=sample,
+                winrate=row_winrate,
+                sample=row_sample,
                 fetched=fetched,
                 entries=entries,
                 unresolved=unresolved,
