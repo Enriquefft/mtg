@@ -6191,6 +6191,94 @@ def cmd_freq(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_corpus_clean(args: argparse.Namespace) -> int:
+    """Audit `data/corpus/<fmt>/*.txt` and evict decks failing corpus policy.
+
+    Walks the on-disk corpus, runs :func:`_validate_for_corpus` against
+    each deck (same gate the fetch-time path uses in `cmd_fetch_meta`),
+    and removes failing decks plus their `meta.json` rows. After
+    deletions, rebuilds `_freq.json` so downstream consumers see the
+    pruned corpus immediately.
+
+    `--dry-run` enumerates the deletions that would happen + their
+    reasons and exits 0 without touching disk.
+
+    Catches drift between the write-time gate (added in Phase B) and
+    older corpus entries scraped before the gate existed, plus any
+    deck that slips through the gate (e.g. due to a Scryfall index
+    refresh that newly bans a card).
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    files = _corpus_deck_files(fmt)
+    if not files:
+        print(f"no corpus for {fmt}", file=sys.stderr)
+        return 1
+
+    drop_reasons: dict[str, int] = collections.Counter()
+    to_drop: list[tuple[str, list[str]]] = []  # (slug, reasons)
+    for path in files:
+        try:
+            entries = parse_deck(path)
+        except (OSError, UnicodeDecodeError) as exc:
+            # Treat parse failure as a corpus-policy fail — the file is
+            # broken and recommend can't use it. Surface a synthetic
+            # reason so the breakdown is honest.
+            to_drop.append((path.stem, [f"parse error: {exc}"]))
+            drop_reasons["parse error"] += 1
+            continue
+        ok, reasons = _validate_for_corpus(entries, fmt)
+        if ok:
+            continue
+        to_drop.append((path.stem, reasons))
+        for r in reasons:
+            cat = r.split(":", 1)[0] if ":" in r else r
+            drop_reasons[cat] += 1
+
+    scanned = len(files)
+    dropped = len(to_drop)
+    breakdown = (
+        ", ".join(f"{k}={v}" for k, v in sorted(drop_reasons.items()))
+        if drop_reasons else "none"
+    )
+
+    if args.dry_run:
+        print(f"corpus-clean {fmt} (DRY RUN): scanned {scanned}, "
+              f"would drop {dropped} (reasons: {breakdown})")
+        for slug, reasons in to_drop:
+            print(f"  {slug}")
+            for r in reasons:
+                print(f"      - {r}")
+        return 0
+
+    if not to_drop:
+        print(f"corpus-clean {fmt}: scanned {scanned}, dropped 0")
+        return 0
+
+    out_dir = CORPUS / fmt
+    _evict_corpus_slugs(out_dir, [slug for slug, _ in to_drop])
+
+    # Rebuild _freq.json so downstream consumers see the pruned
+    # corpus. Reuses the same path cmd_freq --rebuild walks — single
+    # source of truth for the freq computation.
+    index = _compute_freq_index(fmt)
+    _write_freq_index(fmt, index)
+
+    print(f"corpus-clean {fmt}: scanned {scanned}, dropped {dropped} "
+          f"(reasons: {breakdown})")
+    for slug, reasons in to_drop:
+        print(f"  {slug}")
+        for r in reasons:
+            print(f"      - {r}")
+    return 0
+
+
 # ---------- shells <-> corpus archetype matching --------------------------
 
 
@@ -9482,6 +9570,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_freq)
+
+    s = sub.add_parser(
+        "corpus-clean",
+        help=(
+            "drop corpus decks failing _validate_for_corpus, then rebuild "
+            "_freq.json (use --dry-run to preview)"
+        ),
+    )
+    s.add_argument(
+        "format",
+        help="Arena format (must have a corpus under data/corpus/<format>/)",
+    )
+    s.add_argument(
+        "--dry-run", action="store_true",
+        help="enumerate the deletions that would happen without acting",
+    )
+    s.set_defaults(func=cmd_corpus_clean)
 
     s = sub.add_parser(
         "shells",
