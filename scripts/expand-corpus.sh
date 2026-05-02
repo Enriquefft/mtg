@@ -8,21 +8,24 @@
 #         scripts/expand-corpus.sh all                       # walk every Arena format
 #         scripts/expand-corpus.sh historic --fresh          # wipe meta-cache + corpus first
 #         PARALLEL_FORMATS=4 scripts/expand-corpus.sh all    # fan out 4 formats at a time
+#         WORKERS=4 scripts/expand-corpus.sh historic        # concurrent sources within a format
+#         WORKERS=4 PARALLEL_FORMATS=4 scripts/expand-corpus.sh all  # both axes
 #
-# Sources run sequentially inside `mtg fetch-meta-all`, which merges all
-# source results into one dedup pass and writes once per format. A
-# cross-source parallel mode existed briefly but was removed: meta.json,
-# _freq.json, and _existing_corpus_hashes are read-modify-write under
-# a single per-format lock that doesn't exist, so concurrent workers
-# silently corrupted the sidecar. Phase B's "merge then write once"
-# orchestration removes that corruption surface entirely; Phase C may
-# re-introduce cross-source HTTP parallelism inside fetch-meta-all
-# under a single in-process writer.
+# Sources run inside `mtg fetch-meta-all`, which merges all source results
+# into one dedup pass and writes once per format — a single in-process
+# writer with no sidecar corruption surface.
 #
-# Cross-FORMAT parallelism IS safe (and is exposed via PARALLEL_FORMATS
-# in `all` mode below): each format owns its own data/corpus/<fmt>/
-# directory with its own meta.json + _freq.json sidecar, so two formats
-# fetched concurrently never touch the same sidecar.
+# WORKERS=N enables Phase C cross-source HTTP parallelism: `fetch-meta-all`
+# fans out up to N sources concurrently using Python threads.  Each source
+# still runs sequentially internally (per-page throttle preserved); the
+# concurrency is at the source level, not the page level.  N=1 (default)
+# keeps the Phase B sequential path (identical semantics, cleaner traces).
+# Tune N up to the number of sources for a format (≈7); higher gives no
+# additional benefit.
+#
+# Cross-FORMAT parallelism IS independently safe (each format owns its own
+# data/corpus/<fmt>/ directory with its own meta.json + _freq.json sidecar,
+# so two formats fetched concurrently never touch the same sidecar).
 #
 # RAM ceiling: each child process loads the ~80MB Scryfall index pickle.
 # PARALLEL_FORMATS=4 is a sane default for ≥8GB-RAM machines (~320MB
@@ -170,14 +173,21 @@ START_TS=$(date +%s)
 FAILED=()
 
 # `fetch-meta-all` runs every source whose url_for_format(fmt) returns
-# non-None, sequentially, then merges + deduplicates + writes once.
+# non-None, then merges + deduplicates + writes once.
 # `_FETCH_META_PARSERS` IS the source-of-truth for which sources support
 # which format; the old case-block ENABLED matrix is gone.
 #
 # Per-source log files still land at $LOG_DIR/<src>-$FMT.log because
 # _fetch_one_source opens each file in Python (overwrite mode, line-
 # buffered) — same final path as the old tee pattern.
-"$MTG" fetch-meta-all "$FMT" 2>&1 | tee "$LOG_DIR/fetch-meta-all-$FMT.log"
+#
+# WORKERS env var enables Phase C concurrent sources (--workers N flag).
+# Unset or empty → default 1 = serial (Phase B semantics).
+WORKERS_FLAG=()
+if [ -n "${WORKERS:-}" ]; then
+  WORKERS_FLAG=(--workers "$WORKERS")
+fi
+"$MTG" fetch-meta-all "$FMT" "${WORKERS_FLAG[@]}" 2>&1 | tee "$LOG_DIR/fetch-meta-all-$FMT.log"
 rc=${PIPESTATUS[0]}
 case "$rc" in
   0) ;;

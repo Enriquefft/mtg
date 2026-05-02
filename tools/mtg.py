@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures
 import datetime as _dt
 import glob as glob_mod
 import hashlib
@@ -7689,32 +7690,111 @@ def cmd_fetch_meta_all(args: argparse.Namespace) -> int:
     )
     sys.stderr.flush()
 
-    # --- Phase 1: fetch + parse (sequential; Phase C grafts ThreadPool) ---
+    # --- Phase 1: fetch + parse ---
     # per_source_stats tracks per-source outcome for the summary table.
+    # all_raw is only mutated from the main thread (sequential extend inside
+    # the result-collection loop), so no locking is needed.
     per_source_stats: dict[str, dict] = {}
     all_raw: list[_common.ParsedDeck] = []
 
-    for source in enabled_sources:
-        log_file = log_dir / f"{source}-{fmt}.log"
-        print(f"\n--- [{source}] {time.strftime('%Y-%m-%dT%H:%M:%S')} ---", file=sys.stderr)
-        sys.stderr.flush()
-        try:
-            raw = _fetch_one_source(source, fmt, args, log_file_path=log_file)
-        except _SourceUnsupportedError as e:
-            # url_fn was not None at discovery time; a race is possible
-            # if the source module was updated mid-run, but guard anyway.
-            print(f"[{source}] unsupported (skipped): {e}", file=sys.stderr)
-            per_source_stats[source] = {"status": "unsupported", "fetched": 0, "error": str(e)}
-            continue
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
-            print(f"[{source}] FAILED: {e}", file=sys.stderr)
-            per_source_stats[source] = {"status": "failed", "fetched": 0, "error": str(e)}
-            continue
+    workers = max(1, getattr(args, "workers", 1))
 
-        per_source_stats[source] = {"status": "ok", "fetched": len(raw), "error": None}
-        all_raw.extend(raw)
-        print(f"    [{source}] ok — {len(raw)} raw decks", file=sys.stderr)
+    def _collect_result(source: str, raw_or_exc: "list[_common.ParsedDeck] | Exception") -> None:
+        """Apply one completed future's outcome to shared accumulators.
+
+        Called from the main thread only — either inside the sequential loop
+        or inside the `as_completed` loop (both single-threaded at call site).
+        """
+        if isinstance(raw_or_exc, _SourceUnsupportedError):
+            print(f"[{source}] unsupported (skipped): {raw_or_exc}", file=sys.stderr)
+            per_source_stats[source] = {"status": "unsupported", "fetched": 0, "error": str(raw_or_exc)}
+        elif isinstance(raw_or_exc, (urllib.error.HTTPError, urllib.error.URLError, ValueError, Exception)):
+            # Catches every non-list value that isn't a ParsedDeck list.
+            print(f"[{source}] FAILED: {raw_or_exc}", file=sys.stderr)
+            per_source_stats[source] = {"status": "failed", "fetched": 0, "error": str(raw_or_exc)}
+        else:
+            raw: list[_common.ParsedDeck] = raw_or_exc  # type: ignore[assignment]
+            per_source_stats[source] = {"status": "ok", "fetched": len(raw), "error": None}
+            all_raw.extend(raw)
+            print(f"    [{source}] ok — {len(raw)} raw decks", file=sys.stderr)
+            sys.stderr.flush()
+
+    if workers == 1:
+        # Sequential path: identical semantics to Phase B.  Preserved as a
+        # fallback for debugging and single-host-flake reproduction; also
+        # produces cleaner stack traces than the threaded path.
+        for source in enabled_sources:
+            log_file = log_dir / f"{source}-{fmt}.log"
+            print(f"\n--- [{source}] {time.strftime('%Y-%m-%dT%H:%M:%S')} ---", file=sys.stderr)
+            sys.stderr.flush()
+            try:
+                raw = _fetch_one_source(source, fmt, args, log_file_path=log_file)
+            except Exception as e:
+                # Covers _SourceUnsupportedError, HTTPError, URLError,
+                # ValueError, and any other parser-level exception.
+                _collect_result(source, e)
+                continue
+            _collect_result(source, raw)
+    else:
+        # Concurrent path: one thread per source (I/O-bound HTTP).
+        #
+        # Print order changes vs. the sequential path: `as_completed` fires
+        # in wall-clock completion order (fastest source first) rather than
+        # the enabled_sources registry order.  The per-source summary table
+        # printed at the end is order-independent so this is acceptable.
+        #
+        # Thread-safety notes:
+        # - _collect_result is only called from the main thread inside the
+        #   `as_completed` loop — all_raw.extend and per_source_stats writes
+        #   are sequential.
+        # - _common._POOL_LOCK serialises the HTTP keep-alive pool at the
+        #   request/getresponse/read level.  Threads targeting DIFFERENT
+        #   hosts (moxfield, archidekt, untapped, aetherhub, …) each acquire
+        #   their own pool slot; the lock is held only for the brief dict
+        #   access + socket hand-off, not for I/O wait — so concurrency is
+        #   fully exploited across distinct hosts.
+        # - Per-source log files go to disjoint paths
+        #   (data/corpus/.fetch-logs/<source>-<fmt>.log) — no contention.
+        # - Per-source _PER_DECK_THROTTLE_SECS sleeps run per-thread; each
+        #   source observes its own independent politeness budget, which is
+        #   correct because different hosts have independent rate limits.
+        # - KeyboardInterrupt / SystemExit: ThreadPoolExecutor.__exit__
+        #   waits for in-flight futures (no dangling threads left behind).
+        # - If one source raises, its future propagates the exception here
+        #   and is recorded as "failed"; sibling futures are NOT cancelled —
+        #   each source is independent and partial success is useful.
+        print(
+            f"[fetch-meta-all] workers={workers} — sources run concurrently "
+            f"(print order = completion order, not registry order)",
+            file=sys.stderr,
+        )
         sys.stderr.flush()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="fetch"
+        ) as pool:
+            futures: dict[concurrent.futures.Future, str] = {
+                pool.submit(
+                    _fetch_one_source,
+                    source,
+                    fmt,
+                    args,
+                    log_file_path=log_dir / f"{source}-{fmt}.log",
+                ): source
+                for source in enabled_sources
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                source = futures[fut]
+                print(
+                    f"\n--- [{source}] completed {time.strftime('%Y-%m-%dT%H:%M:%S')} ---",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
+                try:
+                    raw = fut.result()
+                except Exception as e:
+                    _collect_result(source, e)
+                    continue
+                _collect_result(source, raw)
 
     # Determine aggregate outcome before post-processing.
     statuses = {s["status"] for s in per_source_stats.values()}
@@ -10272,6 +10352,19 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "skip near-dup deduplication (Jaccard >= 0.85 collapse). "
             "Useful for measuring raw dedup impact; default is to deduplicate."
+        ),
+    )
+    s.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help=(
+            "number of concurrent HTTP fetches across distinct sources "
+            "(default: 1 = serial, identical to Phase B behaviour). "
+            "Each source still runs sequentially internally (per-page "
+            "throttle preserved). Tune up to len(sources) (≈7); higher "
+            "gives no benefit since each format has at most ~7 sources. "
+            "Each worker runs in a Python thread; CPython GIL is fine for "
+            "I/O-bound HTTP. N=1 keeps the sequential path with cleaner "
+            "stack traces."
         ),
     )
     s.set_defaults(func=cmd_fetch_meta_all)
