@@ -105,10 +105,13 @@ def _get_conn(
 ) -> http.client.HTTPConnection:
     """Return a pooled HTTP(S)Connection for `(scheme, host, port)`.
 
-    Caller must hold `_POOL_LOCK`. Creates a fresh connection on first
-    use; otherwise returns the cached one. http.client lazily opens the
-    socket on the first `request()` call, so the cost of cache-miss on
-    `_get_conn` itself is just object allocation.
+    Caller must hold `_POOL_LOCK`. The `_POOL` dict is mutated only
+    under that lock — every read, insert, and `pop()` on `_POOL` happens
+    inside `with _POOL_LOCK:` blocks in `_do_http_get`. Creates a fresh
+    connection on first use; otherwise returns the cached one.
+    http.client lazily opens the socket on the first `request()` call,
+    so the cost of cache-miss on `_get_conn` itself is just object
+    allocation.
     """
     key = (scheme, host, port)
     conn = _POOL.get(key)

@@ -5,8 +5,9 @@
 #
 # Usage:  scripts/expand-corpus.sh [format|all] [--fresh]   (default: brawl)
 #         scripts/expand-corpus.sh historic
-#         scripts/expand-corpus.sh all              # walk every Arena format
-#         scripts/expand-corpus.sh historic --fresh # wipe meta-cache + corpus first
+#         scripts/expand-corpus.sh all                       # walk every Arena format
+#         scripts/expand-corpus.sh historic --fresh          # wipe meta-cache + corpus first
+#         PARALLEL_FORMATS=4 scripts/expand-corpus.sh all    # fan out 4 formats at a time
 #
 # Sources run sequentially inside `mtg fetch-meta-all`, which merges all
 # source results into one dedup pass and writes once per format. A
@@ -87,7 +88,10 @@ if [ "$FMT" = "all" ]; then
     # FAILED_FMTS can't be appended from a subshell, so each child
     # writes its exit status to /tmp/expand-corpus-rc.<pid>/<fmt>.rc and
     # the parent collects them after `wait`.
-    rcdir=$(mktemp -d -t expand-corpus-rc.XXXXXX)
+    rcdir=$(mktemp -d -t expand-corpus-rc.XXXXXX) || {
+      echo "==> mktemp -d failed; cannot collect child exit codes" >&2
+      exit 1
+    }
     trap 'rm -rf "$rcdir"' EXIT
     for f in "${ALL_FORMATS[@]}"; do
       # Cap concurrent jobs at PARALLEL_FORMATS. `wait -n` blocks until
