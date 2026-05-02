@@ -39,6 +39,7 @@ Run `mtg <subcommand> --help` for details.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as _dt
 import glob as glob_mod
 import hashlib
@@ -7192,6 +7193,54 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     decks = [d for d in decks if not _common.is_stub_deck(d, _resolve_card)]
     stub_dropped = pre_stub - len(decks)
 
+    # Write-time validation gate (Phase B). Drops decks that fail
+    # `_validate_for_corpus` (Arena legality, format legality, deck
+    # size, singleton/4-of, color identity, commander presence). Sits
+    # AFTER the stub filter (so we don't validate obvious junk) and
+    # BEFORE the winrate/sample filters (so a source-published signal
+    # can't rescue a deck that's still illegal in the target format).
+    #
+    # Per-deck rejection reasons + slugs are appended to
+    # `data/corpus/.fetch-logs/validate-<fmt>.log` so multiple fetches
+    # against the same format aggregate into one diagnostic trail.
+    # The directory is gitignored (see data/.gitignore -> corpus/).
+    gate_dropped: dict[str, int] = collections.Counter()
+    gate_dropped_total = 0
+    pre_gate = len(decks)
+    gate_kept: list[_common.ParsedDeck] = []
+    gate_log_path = CORPUS / ".fetch-logs" / f"validate-{fmt}.log"
+    gate_log_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_log_lines: list[str] = []
+    for d in decks:
+        ok_corpus, reasons = _validate_for_corpus(d.entries, fmt)
+        if ok_corpus:
+            gate_kept.append(d)
+            continue
+        gate_dropped_total += 1
+        for r in reasons:
+            # Bucket by rejection-reason category prefix (the substring
+            # before the first colon). Keeps the dict bounded — per-card
+            # detail is preserved in the log file, not the in-memory
+            # Counter.
+            cat = r.split(":", 1)[0] if ":" in r else r
+            gate_dropped[cat] += 1
+            gate_log_lines.append(
+                f"[{fetched}] {source} {fmt} slug={d.slug} reason={r}"
+            )
+    if gate_log_lines:
+        with gate_log_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(gate_log_lines) + "\n")
+    decks = gate_kept
+    if gate_dropped_total:
+        breakdown = " ".join(
+            f"{k}={v}" for k, v in sorted(gate_dropped.items())
+        )
+        print(
+            f"[fetch-meta] gate: kept {len(decks)}/{pre_gate}, "
+            f"dropped {gate_dropped_total} ({breakdown})",
+            file=sys.stderr,
+        )
+
     # Quality gate: source-published winrate / sample-size floors. Only
     # filters decks that carry the relevant signal; decks without it are
     # kept (the gate is opt-in per fetch — caller should not switch to
@@ -7271,6 +7320,8 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
             "deck_count": len(decks),
             "unresolved_total": total_dropped,
             "stub_dropped": stub_dropped,
+            "gate_dropped": gate_dropped_total,
+            "gate_dropped_by_reason": dict(gate_dropped),
             "winrate_dropped": winrate_dropped,
             "sample_dropped": sample_dropped,
             "dedup_dropped": exact_dedup_dropped,
@@ -7306,6 +7357,13 @@ def cmd_fetch_meta(args: argparse.Namespace) -> int:
     print(f"decks  : {len(decks)}")
     if stub_dropped:
         print(f"stub-d : {stub_dropped} dropped (basic-land padding)")
+    if gate_dropped_total:
+        breakdown = ", ".join(
+            f"{k}={v}" for k, v in sorted(gate_dropped.items())
+        )
+        print(
+            f"gate   : {gate_dropped_total} dropped (validate fail: {breakdown})"
+        )
     if winrate_dropped:
         print(f"winrate: {winrate_dropped} dropped (< {args.min_winrate:.2%})")
     if sample_dropped:
