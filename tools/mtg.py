@@ -120,6 +120,11 @@ DATA = ROOT / "data"
 BULK_JSON = DATA / "default_cards.json"
 INDEX_PKL = DATA / "index.pkl"
 META_JSON = DATA / "bulk-meta.json"
+# Cached `{grpId: (set_lc, collector)}` extracted from MTGA's own
+# Raw_CardDatabase_*.mtga SQLite. Used to backfill arena_id lookups for
+# printings Scryfall hasn't tagged with `arena_id` (FCA / OMB / cosmetic
+# skin reprints). Rebuilt automatically when MTGA's CardDatabase changes.
+MTGA_GRPID_MAP_PKL = DATA / "mtga-grpid-map.pkl"
 STRICTLYBETTER_CACHE = DATA / "strictlybetter-cache.json"
 # Sidecar for locally-computed heuristic fallback hits (cards missing from
 # strictlybetter.eu, typically freshly-printed). Kept separate so a future
@@ -325,6 +330,287 @@ def _build_index(cards: list[dict]) -> dict:
 _INDEX: dict | None = None
 
 
+def _find_mtga_carddb() -> Path | None:
+    """Return the path to MTGA's `Raw_CardDatabase_*.mtga` SQLite, or None.
+
+    The hash in the filename rotates whenever Wizards pushes a new card
+    drop, so we glob and pick the lexicographically last (most-recent
+    mtime would also work; lex sort is deterministic and cheap).
+    """
+    home = Path(os.path.expanduser("~"))
+    base = home / ".steam/steam/steamapps/common/MTGA/MTGA_Data/Downloads/Raw"
+    if not base.exists():
+        return None
+    files = sorted(base.glob("Raw_CardDatabase_*.mtga"))
+    return files[-1] if files else None
+
+
+_MTGA_GRPID_MAP: dict[int, tuple[str, str]] | None = None
+
+
+_MTGA_GRPID_MAP_VERSION = 3  # bump on schema/heuristic change
+
+# Alchemy yearly-set buckets (`Y23`, `Y24`, `Y25`, `Y26`, ...) re-skin
+# parent-set cards with new collector numbers; Scryfall files those under
+# a `y<parent>` set code (e.g. `ybro`, `ydft`), while MTGA stores them
+# under `Y2N` with a `Y2N-XXX` parent hint in `DigitalReleaseSet`. This
+# regex extracts the parent so we can derive the Scryfall set code.
+_ALCHEMY_DIGITAL_RE = re.compile(r"^Y\d{2}-([A-Z0-9]+)$")
+
+
+class _MtgaCardEntry:
+    """Resolution hints for one MTGA grpId.
+
+    Carried forward from MTGA's own CardDatabase. Used by the augment
+    pass to find the matching Scryfall printing across three stages:
+
+    1. `(set_candidate, collector)` against `idx['by_printing']` —
+       handles ~all printings where MTGA and Scryfall agree on
+       collector numbers.
+    2. `(alchemy_set_candidate, collector)` — same, after Alchemy
+       yearly-bucket remap (`Y23-BRO` → `ybro`).
+    3. `(set_candidate, name)` — last-resort lookup via name when MTGA
+       stores a placeholder collector (`0`) but a real printing exists
+       under a known set (SPG bonus sheets, anthology re-issues).
+    """
+
+    __slots__ = ("name", "set_candidates", "collector")
+
+    def __init__(self, name: str, set_candidates: tuple[str, ...], collector: str):
+        self.name = name
+        self.set_candidates = set_candidates
+        self.collector = collector
+
+
+def _mtga_set_candidates(expansion: str, digital: str | None) -> tuple[str, ...]:
+    """Return the candidate Scryfall set codes for one MTGA card row.
+
+    MTGA's `ExpansionCode` is the headline guess (`OGW`, `SPG`, `Y25`).
+    `DigitalReleaseSet` carries the real parent set for re-skin buckets
+    (`Y23-BRO`, `EA2`, `SPG-DFT`). We emit each plausible reading in
+    priority order, deduplicated.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def push(code: str | None) -> None:
+        if not code:
+            return
+        c = code.strip().lower()
+        if c and c not in seen:
+            out.append(c)
+            seen.add(c)
+
+    push(expansion)
+    if digital:
+        d = digital.strip()
+        m = _ALCHEMY_DIGITAL_RE.match(d)
+        if m:
+            push(f"y{m.group(1)}")
+        if "-" in d:
+            head, _, tail = d.partition("-")
+            push(head)
+            push(tail)
+        else:
+            push(d)
+    return tuple(out)
+
+
+def _load_mtga_grpid_map() -> dict[int, _MtgaCardEntry]:
+    """Map MTGA grpId -> resolution hints.
+
+    Sourced from MTGA's own card-database SQLite (read-only) including
+    the en-US Localizations table for name-based fallback. Cached on
+    disk at `MTGA_GRPID_MAP_PKL`, keyed by the upstream filename so a
+    new card drop invalidates the cache automatically.
+
+    Returns `{}` if MTGA isn't installed or the SQLite can't be opened.
+    The empty-dict path keeps the rest of the CLI usable without a local
+    MTGA install (CI, fresh checkouts, contributors on macOS).
+    """
+    global _MTGA_GRPID_MAP
+    if _MTGA_GRPID_MAP is not None:
+        return _MTGA_GRPID_MAP
+    db = _find_mtga_carddb()
+    if db is None:
+        _MTGA_GRPID_MAP = {}
+        return _MTGA_GRPID_MAP
+
+    if MTGA_GRPID_MAP_PKL.exists():
+        try:
+            with MTGA_GRPID_MAP_PKL.open("rb") as f:
+                cached = pickle.load(f)
+            if (
+                cached.get("source") == db.name
+                and cached.get("version") == _MTGA_GRPID_MAP_VERSION
+            ):
+                _MTGA_GRPID_MAP = cached["map"]
+                return _MTGA_GRPID_MAP
+        except (OSError, pickle.UnpicklingError, KeyError):
+            pass
+
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        _MTGA_GRPID_MAP = {}
+        return _MTGA_GRPID_MAP
+    out: dict[int, _MtgaCardEntry] = {}
+    try:
+        for grp, exp, coll, digital, name in con.execute(
+            "SELECT c.GrpId, c.ExpansionCode, c.CollectorNumber, "
+            "       c.DigitalReleaseSet, l.Loc "
+            "FROM Cards c "
+            "LEFT JOIN Localizations_enUS l ON l.LocId = c.TitleId "
+            "WHERE c.ExpansionCode IS NOT NULL AND c.ExpansionCode != '' "
+            "AND c.CollectorNumber IS NOT NULL AND c.CollectorNumber != '' "
+            "AND c.IsToken = 0"
+        ):
+            if not name:
+                continue
+            out[int(grp)] = _MtgaCardEntry(
+                name=str(name),
+                set_candidates=_mtga_set_candidates(str(exp), digital),
+                collector=str(coll),
+            )
+    finally:
+        con.close()
+
+    try:
+        MTGA_GRPID_MAP_PKL.parent.mkdir(parents=True, exist_ok=True)
+        with MTGA_GRPID_MAP_PKL.open("wb") as f:
+            pickle.dump(
+                {
+                    "source": db.name,
+                    "version": _MTGA_GRPID_MAP_VERSION,
+                    "map": out,
+                },
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+    except OSError:
+        pass
+    _MTGA_GRPID_MAP = out
+    return _MTGA_GRPID_MAP
+
+
+def _scryfall_card_arena_ids(card: dict) -> list[int]:
+    """Return all known MTGA grpIds for a Scryfall card record.
+
+    Scryfall's own `arena_id` field is incomplete for several Arena
+    printings (FCA, OMB, alchemy/historic-anthology re-skins, etc.), so
+    a single source-of-truth lookup misses copies the user actually
+    owns. We layer MTGA's CardDatabase on top: any (set, collector)
+    pair MTGA knows is also a valid arena_id, and MTGA's name-keyed
+    entries (SPG bonus sheets with placeholder `0` collectors) chain
+    via the per-set name index.
+
+    Returns a deduplicated list (arena_id from Scryfall first, then any
+    MTGA-only ids) so callers can sum ownership across all routes.
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    aid = card.get("arena_id")
+    if isinstance(aid, int):
+        out.append(aid)
+        seen.add(aid)
+    set_lc = (card.get("set") or "").lower()
+    coll = card.get("collector_number") or ""
+    name_lc = (card.get("name") or "").lower()
+    if set_lc and coll:
+        for grp in _mtga_inverse_collector().get((set_lc, coll), ()):
+            if grp not in seen:
+                out.append(grp)
+                seen.add(grp)
+    if set_lc and name_lc:
+        for grp in _mtga_inverse_name().get((set_lc, name_lc), ()):
+            if grp not in seen:
+                out.append(grp)
+                seen.add(grp)
+    return out
+
+
+_MTGA_INV_COLLECTOR: dict[tuple[str, str], tuple[int, ...]] | None = None
+_MTGA_INV_NAME: dict[tuple[str, str], tuple[int, ...]] | None = None
+
+
+def _mtga_inverse_collector() -> dict[tuple[str, str], tuple[int, ...]]:
+    """(set_lc, collector) -> grpIds, deduped across set candidates."""
+    global _MTGA_INV_COLLECTOR
+    if _MTGA_INV_COLLECTOR is not None:
+        return _MTGA_INV_COLLECTOR
+    fwd = _load_mtga_grpid_map()
+    rev: dict[tuple[str, str], list[int]] = {}
+    for grp, entry in fwd.items():
+        for s in entry.set_candidates:
+            rev.setdefault((s, entry.collector), []).append(grp)
+    _MTGA_INV_COLLECTOR = {k: tuple(v) for k, v in rev.items()}
+    return _MTGA_INV_COLLECTOR
+
+
+def _mtga_inverse_name() -> dict[tuple[str, str], tuple[int, ...]]:
+    """(set_lc, name_lc) -> grpIds, used when collector is a placeholder."""
+    global _MTGA_INV_NAME
+    if _MTGA_INV_NAME is not None:
+        return _MTGA_INV_NAME
+    fwd = _load_mtga_grpid_map()
+    rev: dict[tuple[str, str], list[int]] = {}
+    for grp, entry in fwd.items():
+        nm = entry.name.lower()
+        for s in entry.set_candidates:
+            rev.setdefault((s, nm), []).append(grp)
+    _MTGA_INV_NAME = {k: tuple(v) for k, v in rev.items()}
+    return _MTGA_INV_NAME
+
+
+def _augment_arena_ids_from_mtga(idx: dict) -> int:
+    """Backfill `idx['by_arena_id']` using MTGA's own grpId mapping.
+
+    Scryfall's `arena_id` field is incomplete: several Arena printings
+    (FCA, OMB, alchemy/historic anthology re-skins, SPG bonus sheets
+    with placeholder collectors) ship without it, so a raw
+    `idx['by_arena_id'][grp]` lookup misses silently. MTGA's
+    CardDatabase carries the grpId -> (set, collector, name) hints; we
+    try (set, collector) first, then fall back to (set, name) for rows
+    where MTGA stores `0` as the collector. After this, every consumer
+    of `by_arena_id` works for the union of (Scryfall-tagged ∪
+    MTGA-known) printings, which is what users expect.
+
+    Returns the number of grpIds backfilled.
+    """
+    mtga_map = _load_mtga_grpid_map()
+    if not mtga_map:
+        return 0
+    by_aid = idx["by_arena_id"]
+    by_printing = idx["by_printing"]
+    by_name = idx["by_name"]
+    added = 0
+    for grp, entry in mtga_map.items():
+        if grp in by_aid:
+            continue
+        resolved = None
+        for s in entry.set_candidates:
+            card = by_printing.get((s, entry.collector))
+            if card is not None:
+                resolved = card
+                break
+        if resolved is None:
+            name_lc = entry.name.lower()
+            for s in entry.set_candidates:
+                for printing in by_name.get(name_lc, ()):
+                    if (printing.get("set") or "").lower() == s:
+                        resolved = printing
+                        break
+                if resolved is not None:
+                    break
+        if resolved is not None:
+            by_aid[grp] = resolved
+            added += 1
+    idx["_arena_id_mtga_backfill"] = added
+    return added
+
+
 def _rebuild_index_from_bulk() -> dict:
     """Rebuild `index.pkl` from the on-disk bulk JSON (no network).
 
@@ -364,6 +650,7 @@ def _load_index() -> dict:
             file=sys.stderr,
         )
         idx = _rebuild_index_from_bulk()
+    _augment_arena_ids_from_mtga(idx)
     _INDEX = idx
     return _INDEX
 
@@ -462,6 +749,7 @@ def _card_to_json(c: dict) -> dict:
         "name": c.get("name"),
         "set": (c.get("set") or "").upper(),
         "collector_number": c.get("collector_number"),
+        "arena_id": c.get("arena_id"),
         "mana_cost": c.get("mana_cost"),
         "cmc": c.get("cmc"),
         "type_line": c.get("type_line"),
@@ -2101,13 +2389,24 @@ def cmd_check(args: argparse.Namespace) -> int:
 # ---------- search (live) ------------------------------------------------
 
 
-def _scryfall_search_url(query: str) -> str:
-    return f"{SCRYFALL_API}/cards/search?q={urllib.parse.quote(query)}&unique=cards"
+def _scryfall_search_url(query: str, *, unique: str = "cards") -> str:
+    return (
+        f"{SCRYFALL_API}/cards/search?q={urllib.parse.quote(query)}"
+        f"&unique={unique}"
+    )
 
 
-def _scryfall_search_all(query: str) -> list[dict]:
-    """Fetch every page of a Scryfall search. Returns [] on 404 (no match)."""
-    url: str | None = _scryfall_search_url(query)
+def _scryfall_search_all(query: str, *, unique: str = "cards") -> list[dict]:
+    """Fetch every page of a Scryfall search. Returns [] on 404 (no match).
+
+    `unique=cards` (default) returns one printing per oracle id, matching
+    `cmd_search` UX. Pass `unique=prints` from ownership-aware callers
+    so every Arena printing surfaces — Scryfall's `arena_id` field is
+    incomplete (FCA / OMB / cosmetic skins), and we sum ownership across
+    the (set, collector) → grpId reverse map so a single oracle hit
+    misses copies the user actually owns.
+    """
+    url: str | None = _scryfall_search_url(query, unique=unique)
     out: list[dict] = []
     first = True
     while url:
@@ -3102,6 +3401,77 @@ def cmd_collection_from_decks(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_collection_diagnose(args: argparse.Namespace) -> int:
+    """List arena_ids in the dump that aren't in the Scryfall index.
+
+    Scryfall's `arena_id` field is incomplete for several Arena-only
+    printings (FCA, OMB, alchemy/historic anthologies, cosmetic-skin
+    reprints, etc.). MTGA dumps the grpId verbatim; if Scryfall hasn't
+    populated arena_id for the matching printing, every lookup keyed
+    on arena_id silently misses. This command surfaces that gap.
+    """
+    snap = _load_collection()
+    if snap is None:
+        sys.exit(_empty_state_message().rstrip())
+    cards = _cards_owned(snap)
+    idx = _load_index()
+    by_arena_id = idx["by_arena_id"]
+
+    resolved_ids: list[int] = []
+    unresolved: list[tuple[int, int]] = []
+    for aid, qty in cards.items():
+        if aid in by_arena_id:
+            resolved_ids.append(aid)
+        else:
+            unresolved.append((aid, qty))
+    unresolved.sort(key=lambda x: (-x[1], x[0]))
+
+    total_copies = sum(cards.values())
+    resolved_copies = sum(cards[a] for a in resolved_ids)
+    unresolved_copies = total_copies - resolved_copies
+
+    if getattr(args, "json", False):
+        rows = unresolved if args.limit == 0 else unresolved[: args.limit]
+        _emit_json({
+            "snapshot_at": snap.get("snapshot_at"),
+            "unique_arena_ids": len(cards),
+            "resolved_unique": len(resolved_ids),
+            "unresolved_unique": len(unresolved),
+            "total_copies": total_copies,
+            "resolved_copies": resolved_copies,
+            "unresolved_copies": unresolved_copies,
+            "scryfall_arena_id_count": len(by_arena_id),
+            "unresolved_sample": [
+                {"arena_id": aid, "quantity": qty} for aid, qty in rows
+            ],
+        })
+        return 0
+
+    backfill = idx.get("_arena_id_mtga_backfill", 0)
+    mtga_db = _find_mtga_carddb()
+    print(f"snapshot:                   {snap.get('snapshot_at')}")
+    print(f"scryfall arena_id count:    {len(by_arena_id)}  (incl. +{backfill} mtga backfill)")
+    print(f"mtga carddb:                {mtga_db.name if mtga_db else '(not found)'}")
+    print(
+        f"dump unique arena_ids:      {len(cards)}  "
+        f"(resolved {len(resolved_ids)}, unresolved {len(unresolved)})"
+    )
+    print(
+        f"dump total copies:          {total_copies}  "
+        f"(resolved {resolved_copies}, unresolved {unresolved_copies})"
+    )
+    if not unresolved:
+        return 0
+    print()
+    rows = unresolved if args.limit == 0 else unresolved[: args.limit]
+    print(f"unresolved arena_ids (top {len(rows)} by quantity):")
+    for aid, qty in rows:
+        print(f"  arena_id={aid:<8}  qty={qty}")
+    if args.limit and len(unresolved) > args.limit:
+        print(f"  … {len(unresolved) - args.limit} more (use --limit 0 for full list)")
+    return 0
+
+
 def cmd_collection_dump(args: argparse.Namespace) -> int:
     _warn_if_stale()
     _warn_if_collection_stale()
@@ -3187,7 +3557,11 @@ def cmd_owned(args: argparse.Namespace) -> int:
         return 2
     cards_owned = _cards_owned(snap)
     try:
-        results = _scryfall_search_all(args.query)
+        # `unique=prints` so we see every printing — needed because
+        # ownership is keyed on grpId, and Scryfall's per-oracle
+        # canonical printing often lacks an arena_id even when other
+        # printings (FCA, OMB, anthology) do exist on Arena.
+        results = _scryfall_search_all(args.query, unique="prints")
     except urllib.error.HTTPError as e:
         print(f"Scryfall HTTP {e.code}: {e.reason}", file=sys.stderr)
         return 1
@@ -3198,14 +3572,25 @@ def cmd_owned(args: argparse.Namespace) -> int:
         print(f"no Scryfall matches for: {args.query}", file=sys.stderr)
         return 0
 
-    arena_eligible = sum(1 for c in results if isinstance(c.get("arena_id"), int))
+    arena_eligible = sum(1 for c in results if _scryfall_card_arena_ids(c))
 
+    # Track grpIds already attributed to an earlier printing in this
+    # result set. Some MTGA grpIds (SPG bonus-sheet entries with
+    # placeholder `0` collectors) resolve via name fallback to *every*
+    # Scryfall printing under the matched set; without dedup, one
+    # owned copy gets counted once per Scryfall variant.
+    attributed: set[int] = set()
     rows: list[tuple[int, str, str, str, str, float | None, str]] = []
     for c in results:
-        aid = c.get("arena_id")
-        if not isinstance(aid, int):
+        aids = _scryfall_card_arena_ids(c)
+        if not aids:
             continue
-        qty = cards_owned.get(aid, 0)
+        qty = 0
+        for a in aids:
+            if a in attributed:
+                continue
+            qty += cards_owned.get(a, 0)
+            attributed.add(a)
         if qty < args.min:
             continue
         rows.append(
@@ -10084,6 +10469,19 @@ def main(argv: list[str] | None = None) -> int:
         help="explicit Player.log path (default: auto-detect Linux/Proton, macOS, WSL)",
     )
     sf.set_defaults(func=cmd_collection_from_decks)
+
+    sdg = csub.add_parser(
+        "diagnose",
+        help="report dump arena_ids that don't resolve in the Scryfall index",
+    )
+    sdg.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="max unresolved ids to print (default 20; 0 = all)",
+    )
+    _add_json_flag(sdg)
+    sdg.set_defaults(func=cmd_collection_diagnose)
 
     s = sub.add_parser("own", help="show owned count for a card")
     s.add_argument("name", help="card name (Arena-style)")
