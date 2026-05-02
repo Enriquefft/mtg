@@ -7100,6 +7100,15 @@ def _fetch_meta_page(url: str, *, source: str, no_cache: bool) -> str:
         referer=_FETCH_META_INDEX_REFERER.get(source),
         user_agent=_FETCH_META_INDEX_USER_AGENT.get(source),
         extra_headers=_FETCH_META_INDEX_EXTRA_HEADERS.get(source),
+        # Search-page calls fan out under PARALLEL_FORMATS=N → bursty
+        # cross-process load on hosts that send bare 429 (archidekt).
+        # Heavy schedule (5/15/45s + jitter, 3 retries) escapes the
+        # >30s block window when the cross-process flock alone isn't
+        # enough (e.g. residual counter from a prior burst). Per-deck
+        # calls in parsers leave this default-False — they run under
+        # the same flock so concurrent 429 risk is already low, and
+        # the heavy schedule × 50 decks would compound to hours.
+        heavy_429_retry=True,
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)

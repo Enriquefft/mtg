@@ -8,15 +8,20 @@ re-deriving regex / section / multi-face rules. Single source of truth.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import http.client
+import os
+import random
 import re
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Iterator
 from urllib.parse import urljoin, urlsplit
 
 # Single source of truth for the toolkit's outbound User-Agent. Used by
@@ -43,10 +48,79 @@ USER_AGENT = "mtg-toolkit/0.1 (github.com/Enriquefft/mtg)"
 _TRANSIENT_RETRY_CODES: frozenset[int] = frozenset({429, 502, 503, 504, 526})
 
 # Cap on `Retry-After` honoring so a hostile or buggy origin can't park
-# our worker for minutes.  30s = 60x our default sleep cadence (0.5s);
-# beyond that, give up and let the parser hard-fail so the operator sees
-# the source is genuinely down.
-_RETRY_AFTER_CAP_SECS: float = 30.0
+# our worker for minutes.  60s honors legitimate minute-scale waits
+# (some origins legitimately need ~45-60s after a burst) while still
+# bounding worker-pool-park risk; sustained blocks beyond this surface
+# as a hard fail so the operator sees the source is genuinely down.
+_RETRY_AFTER_CAP_SECS: float = 60.0
+
+# Hosts that exhibit cross-process burst-rate-limit behavior under
+# `PARALLEL_FORMATS=N`. Outbound requests to these hosts are serialized
+# across all Python processes via fcntl.flock on a per-host lockfile in
+# `_LOCK_DIR`. archidekt.com returns bare 429 (no Retry-After) on
+# concurrent `/search/decks/` GETs from PARALLEL_FORMATS=8; verified
+# 6/8 → 429 via concurrent curl probe. Other hosts (moxfield, untapped,
+# aetherhub, mtgazone, mtggoldfish, mtgdecks) have not exhibited this
+# pattern in `data/corpus/.fetch-logs/`. Add evidence-supported entries
+# only — over-broad locking trades wall-clock for nothing on hosts that
+# already cope with N=8 concurrency.
+_CROSS_PROCESS_LOCK_HOSTS: frozenset[str] = frozenset({"archidekt.com"})
+
+# Pause inside the lock window AFTER the HTTP response is read but BEFORE
+# releasing the flock, so the next process to acquire doesn't immediately
+# re-fire and re-trip the host's burst counter. archidekt's empirical
+# block window is ≥30s; 1s spacing → 1 req/s sustained across 8 procs,
+# well below archidekt's per-IP threshold while still keeping a
+# `--fresh all` build under ~2 min of archidekt time total.
+_CROSS_PROCESS_COOLDOWN_SECS: float = 1.0
+
+# Per-host lockfile directory. Reuses the per-source log dir already
+# created by `tools/mtg.py:_fetch_one_source` during corpus builds, so
+# no new dir convention. Created lazily and idempotently on first lock
+# acquisition (no tempdir fallback — cross-process semantics require
+# every process to agree on the path).
+_LOCK_DIR: Path = Path("data/corpus/.fetch-logs")
+
+# Backoff schedule for HTTP 429 when `heavy_429_retry=True` AND the
+# response carries no `Retry-After` header (archidekt's case). Three
+# retries with ±20% jitter; total worst-case wait ~65s before hard
+# fail. Calibrated against archidekt's observed ≥30s block window:
+# attempt 0 fires after 4-6s (often within the block, may still 429),
+# attempt 1 after another 12-18s (block likely cleared if no sibling
+# burst), attempt 2 after 36-54s (clears all but sustained outages).
+_HEAVY_429_SCHEDULE_SECS: tuple[float, ...] = (5.0, 15.0, 45.0)
+_HEAVY_429_JITTER_FRAC: float = 0.20
+
+
+@contextlib.contextmanager
+def _host_cross_process_lock(hostname: str | None) -> "Iterator[None]":
+    """fcntl.flock-based cross-process serialization for fragile hosts.
+
+    No-op for hosts not in `_CROSS_PROCESS_LOCK_HOSTS`. For registered
+    hosts: acquires `LOCK_EX` on `_LOCK_DIR/.host-<hostname>.lock`,
+    yields, then sleeps `_CROSS_PROCESS_COOLDOWN_SECS` BEFORE releasing
+    so the next process inherits a quiet host. Concurrent-curl probe
+    against archidekt confirmed 200ms cooldown is too tight (next proc
+    re-trips); 1s spaces 8-proc fan-out cleanly.
+
+    Linux-only (fcntl). The dev shell and CI are Linux per
+    flake.nix / CLAUDE.md.
+    """
+    if hostname is None or hostname not in _CROSS_PROCESS_LOCK_HOSTS:
+        yield
+        return
+    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _LOCK_DIR / f".host-{hostname}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            time.sleep(_CROSS_PROCESS_COOLDOWN_SECS)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _retry_sleep_for(exc: urllib.error.HTTPError, default: float) -> float:
@@ -75,6 +149,7 @@ def http_get_text(
     referer: str | None = None,
     user_agent: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    heavy_429_retry: bool = False,
 ) -> str:
     """Fetch `url` as text using the shared User-Agent.
 
@@ -83,11 +158,11 @@ def http_get_text(
     back into `tools/mtg.py` (circular) and don't grow a parallel HTTP
     stack with a different UA / timeout policy.
 
-    Transient-error retry: any response whose status is in
-    `_TRANSIENT_RETRY_CODES` (429/502/503/504/526) gets one retry after
-    a backoff.  429 honors `Retry-After`; others use `retry_sleep_secs`.
-    A second failure on the same code re-raises — sustained 5xx / 429
-    across two attempts is a real outage, not a blip.
+    Transient-error retry (legacy path, default): any response whose
+    status is in `_TRANSIENT_RETRY_CODES` (429/502/503/504/526) gets
+    one retry after a backoff.  429 honors `Retry-After`; others use
+    `retry_sleep_secs`.  A second failure on the same code re-raises —
+    sustained 5xx / 429 across two attempts is a real outage, not a blip.
 
     `retry_403_once`: per `docs/sources.md` mtggoldfish "occasionally
     403s; retry once". When True, a single retry with `retry_sleep_secs`
@@ -107,29 +182,60 @@ def http_get_text(
     after Accept/User-Agent/Referer. Used by JSON APIs that demand
     `Origin` (moxfield) or other custom headers without making each
     one a named keyword.
+
+    `heavy_429_retry`: opt-in stronger 429 backoff for hosts that send
+    bare 429 (no `Retry-After`) under cross-process burst load. When
+    True AND the response is 429 AND no `Retry-After` is present:
+    `_HEAVY_429_SCHEDULE_SECS` (5/15/45s) with ±20% jitter, up to 3
+    retries (4 attempts total). 429 with `Retry-After`, and all other
+    transient codes, fall through to the legacy single-retry path
+    above. Off by default — the heavy schedule is too costly for hosts
+    that 429 per-deck (would compound 50× per format); enable only at
+    search-page call sites where one slow retry is worth a successful
+    fetch.
     """
-    try:
-        return _do_http_get(
-            url, accept=accept, referer=referer,
-            user_agent=user_agent, extra_headers=extra_headers,
-        )
-    except urllib.error.HTTPError as e:
-        retry_this = (
-            e.code in _TRANSIENT_RETRY_CODES
-            or (retry_403_once and e.code == 403)
-        )
-        if not retry_this:
-            raise
-        sleep_for = (
-            _retry_sleep_for(e, retry_sleep_secs)
-            if e.code in _TRANSIENT_RETRY_CODES
-            else retry_sleep_secs
-        )
-        time.sleep(sleep_for)
-        return _do_http_get(
-            url, accept=accept, referer=referer,
-            user_agent=user_agent, extra_headers=extra_headers,
-        )
+    legacy_retried = False
+    heavy_429_attempts = 0
+    while True:
+        try:
+            return _do_http_get(
+                url, accept=accept, referer=referer,
+                user_agent=user_agent, extra_headers=extra_headers,
+            )
+        except urllib.error.HTTPError as e:
+            has_retry_after = bool(
+                e.headers and e.headers.get("Retry-After")
+            )
+
+            if (
+                e.code == 429
+                and heavy_429_retry
+                and not has_retry_after
+            ):
+                if heavy_429_attempts >= len(_HEAVY_429_SCHEDULE_SECS):
+                    raise
+                base = _HEAVY_429_SCHEDULE_SECS[heavy_429_attempts]
+                jitter = random.uniform(
+                    1.0 - _HEAVY_429_JITTER_FRAC,
+                    1.0 + _HEAVY_429_JITTER_FRAC,
+                )
+                time.sleep(base * jitter)
+                heavy_429_attempts += 1
+                continue
+
+            retry_this = (
+                e.code in _TRANSIENT_RETRY_CODES
+                or (retry_403_once and e.code == 403)
+            )
+            if not retry_this or legacy_retried:
+                raise
+            sleep_for = (
+                _retry_sleep_for(e, retry_sleep_secs)
+                if e.code in _TRANSIENT_RETRY_CODES
+                else retry_sleep_secs
+            )
+            time.sleep(sleep_for)
+            legacy_retried = True
 
 
 # Per-host HTTP connection pool. `urllib.request.urlopen` builds a
@@ -290,57 +396,72 @@ def _do_http_get(
     `Referer` is dropped on cross-host hops to mirror urllib's behaviour
     (the original referer becomes meaningless once we've left the origin
     site, and some hosts treat a stale referer as anti-CSRF noise).
+
+    Cross-process serialization: the entire redirect-following request
+    runs under `_host_cross_process_lock(initial_hostname)`. Hosts not
+    in `_CROSS_PROCESS_LOCK_HOSTS` get a no-op context. Locking the
+    redirect loop (vs. each hop) keeps the 308-then-200 sequence atomic
+    so sibling processes can't interleave between the redirect and the
+    actual fetch. Cross-host redirects (none currently observed in the
+    registered hosts) proceed under the initial host's lock — the
+    registry stays single-host until evidence demands otherwise to
+    avoid lock-ordering deadlock risk if two registered hosts ever
+    redirected to each other.
     """
     seen: set[str] = set()
     current_url = url
     current_referer = referer
+    initial_hostname = urlsplit(url).hostname
 
-    for _hop in range(_MAX_REDIRECTS + 1):
-        if current_url in seen:
-            raise urllib.error.URLError(
-                f"redirect loop detected at {current_url!r}"
+    with _host_cross_process_lock(initial_hostname):
+        for _hop in range(_MAX_REDIRECTS + 1):
+            if current_url in seen:
+                raise urllib.error.URLError(
+                    f"redirect loop detected at {current_url!r}"
+                )
+            seen.add(current_url)
+
+            status, reason, resp_headers, raw = _do_one_hop(
+                current_url,
+                accept=accept,
+                referer=current_referer,
+                user_agent=user_agent,
+                extra_headers=extra_headers,
             )
-        seen.add(current_url)
 
-        status, reason, resp_headers, raw = _do_one_hop(
-            current_url,
-            accept=accept,
-            referer=current_referer,
-            user_agent=user_agent,
-            extra_headers=extra_headers,
-        )
-
-        if status in (301, 302, 303, 307, 308):
-            location = None
-            for k, v in resp_headers:
-                if k.lower() == "location":
-                    location = v
+            if status in (301, 302, 303, 307, 308):
+                location = None
+                for k, v in resp_headers:
+                    if k.lower() == "location":
+                        location = v
+                        break
+                if not location:
+                    # 3xx without Location is a server bug; fall through
+                    # to HTTPError so the caller sees the real status code.
                     break
-            if not location:
-                # 3xx without Location is a server bug; fall through to
-                # HTTPError so the caller sees the real status code.
-                break
-            next_url = urljoin(current_url, location)
-            # Drop Referer on cross-origin hops (urllib parity).
-            prev_host = urlsplit(current_url).hostname
-            next_host = urlsplit(next_url).hostname
-            if prev_host != next_host:
-                current_referer = None
-            current_url = next_url
-            continue
+                next_url = urljoin(current_url, location)
+                # Drop Referer on cross-origin hops (urllib parity).
+                prev_host = urlsplit(current_url).hostname
+                next_host = urlsplit(next_url).hostname
+                if prev_host != next_host:
+                    current_referer = None
+                current_url = next_url
+                continue
 
-        if status != 200:
-            # Mimic urllib.error.HTTPError exactly: callers
-            # (http_get_text retry-403-once, parsers' urllib.error.HTTPError
-            # except-clauses) check `.code` and that contract is the public
-            # surface of this function. Headers wrapped via http.client's
-            # HTTPMessage so `.headers.get(...)` works downstream.
-            hdrs = http.client.HTTPMessage()
-            for k, v in resp_headers:
-                hdrs[k] = v
-            raise urllib.error.HTTPError(current_url, status, reason, hdrs, None)
+            if status != 200:
+                # Mimic urllib.error.HTTPError exactly: callers
+                # (http_get_text retry-403-once, parsers' urllib.error.HTTPError
+                # except-clauses) check `.code` and that contract is the public
+                # surface of this function. Headers wrapped via http.client's
+                # HTTPMessage so `.headers.get(...)` works downstream.
+                hdrs = http.client.HTTPMessage()
+                for k, v in resp_headers:
+                    hdrs[k] = v
+                raise urllib.error.HTTPError(
+                    current_url, status, reason, hdrs, None,
+                )
 
-        return raw.decode("utf-8", errors="replace")
+            return raw.decode("utf-8", errors="replace")
 
     # Loop exhausted without a terminal response.
     raise urllib.error.URLError(
