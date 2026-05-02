@@ -23,7 +23,7 @@ Cloudflare IUAM blocks scripted requests on several MTG sites. Verified
 | `magic.wizards.com` | 200 | official ban announcements |
 | `mtggoldfish.com` | 200 (occasional 403) | primary paper meta; retry once on 403, then fall back |
 | `aetherhub.com` | 200 (re-verified 2026-05-01) | **auto-fetched, all formats with `/Metagame/<slug>/`.** Earlier `403` resolved; vanilla UA gets 200 on both index and `/Deck/<slug>` pages. Wired as `fetch-meta --source aetherhub <fmt>` for brawl/standard/alchemy/historic/timeless/pioneer. |
-| `mtgdecks.net` | 200 (re-verified 2026-05-01) | **third Historic source.** Earlier `403` resolved; vanilla UA gets 200. Wired as `fetch-meta --source mtgdecks historic`. |
+| `mtgdecks.net` | 200 (re-verified 2026-05-01) | **third Historic source.** Earlier `403` resolved; vanilla UA gets 200. Wired as `fetch-meta --source mtgdecks historic`. `--deep` walks `/<archetype>/page:N` pagination (~165 decks/archetype reachable on the heaviest archetype, observed 2026-05-02). |
 | `archidekt.com` | 200 | **user-deckbuilder source, all formats.** High novelty bias (different selection than tier-list scrapers). Wired as `fetch-meta --source archidekt <format>`. |
 | `api2.moxfield.com` | 200 (browser-UA + Origin/Referer headers) | **highest-volume user-deckbuilder source, all formats** (their `historicBrawl` filter maps to our `brawl`; their "Brawl" is Standard Brawl). Wired as `fetch-meta --source moxfield <format>`. No winrate/sample (user-built, not metagame). 0.6s throttle. |
 
@@ -89,7 +89,7 @@ Listed primary → fallback per format.
 - https://www.archidekt.com/ — `fetch-meta --source archidekt historic`
 - https://www.mtggoldfish.com/metagame/historic — `fetch-meta --source mtggoldfish historic`
 - https://mtgazone.com/historic-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone historic`
-- https://mtgdecks.net/Historic — `fetch-meta --source mtgdecks historic` (one deck per archetype, most-recent submission; tier from row class, winrate + sample from index)
+- https://mtgdecks.net/Historic — `fetch-meta --source mtgdecks historic` (one deck per archetype, most-recent submission; tier from row class, winrate + sample from index; `--deep` walks `/page:N` pagination for full archetype coverage, ~165 decks/archetype max observed 2026-05-02)
 
 ### Timeless
 - https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=timeless — `fetch-meta --source untapped timeless`
@@ -105,6 +105,12 @@ Listed primary → fallback per format.
 - https://www.archidekt.com/ — `fetch-meta --source archidekt pioneer`
 - https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer` (also reached via `--source mtgazone pioneer`)
 - https://www.mtggoldfish.com/metagame/pioneer — paper Pioneer; retry once on 403
+
+### Explorer (Scryfall key: `explorer`; Arena-specific Pioneer subset)
+- https://mtga.untapped.gg/sitemap/constructed-archetypes.xml?format=explorer — `fetch-meta --source untapped explorer` (sitemap is a 219-byte empty stub upstream; the parser auto-falls-back to `decks_by_event_scope_and_rank_v2/free` with `MetaPeriodId=703` (`Explorer_Ladder`) and synthesises archetypes by `ptg` field. ~270 decks across ~20 ptg buckets recovered, 2026-05-02.)
+- https://www.moxfield.com/decks/public?fmt=pioneer — `fetch-meta --source moxfield pioneer` (Moxfield has no separate Explorer filter; Pioneer is the closest semantic match)
+- https://aetherhub.com/Metagame/Explorer-BO1/ — `fetch-meta --source aetherhub pioneer` (already covered under Pioneer above)
+- https://mtgazone.com/explorer-bo1-metagame-tier-list/ — `fetch-meta --source mtgazone explorer`
 
 ## Banlist + announcements
 

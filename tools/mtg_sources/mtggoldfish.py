@@ -47,6 +47,9 @@ Tier stays `""` and winrate stays `None` per spec; synthesising a
 letter from %-share would be fiction. Sample size comes from the
 parenthesised count next to META% — the only sample number on the
 tile and the natural deck-count signal for that archetype.
+Re-probed 2026-05-02 against `/archetype/pioneer-izzet-prowess`:
+zero winrate-shaped strings on per-archetype pages either; META%
+share is the only deck-level stat upstream publishes. Don't re-open.
 
 Probe verified 2026-04-30 against
 `https://www.mtggoldfish.com/metagame/{historic, pioneer, standard}`
@@ -68,13 +71,20 @@ from ._common import DeckEntry, ParsedDeck, http_get_text, slugify
 # Arena-niche and the curated source list pins us to the three with
 # meaningful sample sizes; adding more without a re-curate would silently
 # expand scope past what the project's source-of-truth doc declares.
-# `historic` and `explorer` deliberately omitted: re-verified 2026-05-02
-# the metagame pages for these formats now SSR a single "Other" archetype
-# tile (the catch-all bucket) and stream the remaining tiles via Turbo.
-# The SSR-tile parser sees only the placeholder and surfaces 0 decks.
-# Standard and pioneer still SSR ~15 tiles, so they keep working.
-# Re-add `historic` / `explorer` here once a Turbo-aware deep parser ships
-# (see docs/corpus-expansion-followups.md item #1).
+# `historic`, `explorer`, `timeless` deliberately omitted (2026-05-02):
+# `/metagame/{historic,explorer,timeless}` consolidated into a single
+# "Other" archetype whose `/archetype/<slug>/decks` index DOES paginate
+# (50 decks/page, 6-77 pages depending on format) — but the per-deck
+# `/deck/<id>` page is hard-walled by Cloudflare's Turnstile JS
+# challenge (HTTP 403 with `cf-mitigated: challenge`). Wall is not
+# bypassable from any Python HTTP stack: TLS-impersonation via
+# curl_cffi (probed all 12 chrome/safari/firefox/edge fingerprint
+# profiles) still 403s; headless Chromium via Playwright with stealth
+# flags + real DISPLAY also 403s. See docs/corpus-expansion-followups.md
+# §3 for the full probe matrix. Standard and pioneer SSR ~15 tiles each
+# and the per-archetype pages (`/archetype/<slug>`, not
+# `/archetype/<slug>/decks`) still serve the `deck_input` form
+# unwalled, so those keep working unchanged.
 _URL_TEMPLATES = {
     "standard": "https://www.mtggoldfish.com/metagame/standard",
     "pioneer": "https://www.mtggoldfish.com/metagame/pioneer",

@@ -44,6 +44,14 @@ and the `/Historic/h-<slug>-decklist-by-<user>-<id>` deck pages):
   the per-row W+L count (per-deck match volume), falling back to the
   per-archetype count when the row's win/loss cells are missing.
 
+  Pagination: the archetype page paginates as `/Historic/<slug>/page:N`,
+  observed up to 11 pages × 15 decks ≈ 165 unique decks per archetype
+  on `boros-energy` (probe 2026-05-02). The page:N walk only triggers
+  under `--deep`, where `tools/mtg.py:7308` substitutes `_DEEP_LIMIT`
+  for the caller's missing `--limit`, blowing the per-archetype budget
+  past page-1's ~15-row yield. Default (non-deep) invocations skip the
+  walk and preserve the original page-1-only behaviour bit-for-bit.
+
 * **Deck** — embeds the full MTGA paste verbatim in
   `<textarea id="arena_deck">Deck\n4 …\nSideboard\n…</textarea>`. Plain
   `<count> <name>` lines, same shape mtggoldfish's hidden form input
@@ -91,6 +99,18 @@ _TIER_CLASS_TO_LETTER = {
 _URL_TEMPLATES = {
     "historic": "https://mtgdecks.net/Historic",
 }
+
+# Per-archetype deep-walk ceiling. Probe (2026-05-02) shows
+# `boros-energy` paginates ~11 pages × 15 decks = ~165 unique decks
+# reachable per archetype; multiplied by the ~30-archetype index gives a
+# theoretical 5000-deck-per-format ceiling. `tools/mtg.py` reads this
+# constant via `getattr` when `--deep` is set and passes it as `limit`.
+_DEEP_LIMIT = 5000
+
+# Hard cap on the page-walk. Observed max in the wild is 11; we triple
+# it as a safety belt against a future archetype that paginates deeper.
+# Beyond this we trust the "no new rows" terminator to stop us.
+_MAX_PAGES = 50
 
 
 def url_for_format(fmt: str) -> str | None:
@@ -320,38 +340,54 @@ def parse_mtgdecks(
 
         # Walk per-row chunks. Each `<tr>` chunk has at most one deck link
         # and at most one W/L winrate cell, so positional pairing within the
-        # chunk keeps signal correlated to its deck.
-        row_chunks = _DECK_TABLE_ROW_SPLIT_RE.split(table_body)
-        deck_rows: list[tuple[str, float | None, int | None]] = []
+        # chunk keeps signal correlated to its deck. `seen_paths` is shared
+        # across pages so the page:N walk below dedupes against page-1 too.
         seen_paths: set[str] = set()
-        for chunk in row_chunks:
-            link_m = _DECK_LINK_RE.search(chunk)
-            if not link_m:
-                continue
-            deck_path = link_m.group(1)
-            if deck_path in seen_paths:
-                # Same deck linked twice in the same row (anchor + thumbnail).
-                continue
-            seen_paths.add(deck_path)
-            wr_row_m = _DECK_ROW_WINRATE_RE.search(chunk)
-            if wr_row_m:
-                try:
-                    wins = int(wr_row_m.group(1))
-                    losses = int(wr_row_m.group(2))
-                    pct = float(wr_row_m.group(3)) / 100.0
-                    row_winrate: float | None = pct
-                    row_sample: int | None = wins + losses
-                except ValueError:
-                    row_winrate = archetype_winrate
-                    row_sample = archetype_sample
-            else:
-                row_winrate = archetype_winrate
-                row_sample = archetype_sample
-            deck_rows.append((deck_path, row_winrate, row_sample))
+        deck_rows = _rows_from_archetype_table(
+            table_body, seen_paths, archetype_winrate, archetype_sample,
+        )
 
         if not deck_rows:
             # Drift: archetype page rendered but no deck links in the table.
             continue
+
+        # Pagination walk (`--deep`): only triggers when caller passed a
+        # `limit` large enough that page-1 (~15 rows) doesn't satisfy the
+        # per-archetype budget. `tools/mtg.py:7308` injects `_DEEP_LIMIT`
+        # as `limit` when `--deep` is set, producing a `per_archetype_cap`
+        # of ~167 against the ~30-archetype index — well past the 15/page
+        # ceiling. Default invocations leave `per_archetype_cap` either
+        # None (no `--limit`) or small (e.g. `--limit 50` -> cap=2), and
+        # the loop is skipped entirely so historic behaviour is unchanged.
+        if per_archetype_cap is not None and len(deck_rows) < per_archetype_cap:
+            for page in range(2, _MAX_PAGES + 1):
+                if len(deck_rows) >= per_archetype_cap:
+                    break
+                page_url = f"{archetype_url}/page:{page}"
+                try:
+                    page_html = http_get_text(
+                        page_url, retry_403_once=True, referer=archetype_url,
+                    )
+                except urllib.error.HTTPError:
+                    break
+                except urllib.error.URLError:
+                    break
+                page_table_m = _DECK_TABLE_RE.search(page_html)
+                if not page_table_m:
+                    # End of pagination (mtgdecks 200s with empty body
+                    # past the last page rather than 404'ing) or drift.
+                    break
+                new_rows = _rows_from_archetype_table(
+                    page_table_m.group(1),
+                    seen_paths,
+                    archetype_winrate,
+                    archetype_sample,
+                )
+                if not new_rows:
+                    # No fresh deck paths on this page -> walked off the
+                    # end of paginated content. Stop before _MAX_PAGES.
+                    break
+                deck_rows.extend(new_rows)
 
         # Cap per-archetype takes. None = unlimited (no --limit set);
         # otherwise slice to the budget computed above.
@@ -409,6 +445,49 @@ def parse_mtgdecks(
             ))
 
     return decks
+
+
+def _rows_from_archetype_table(
+    table_body: str,
+    seen_paths: set[str],
+    archetype_winrate: float | None,
+    archetype_sample: int | None,
+) -> list[tuple[str, float | None, int | None]]:
+    """Extract `(deck_path, winrate, sample)` rows from one table body.
+
+    Splits `table_body` on `<tr>` boundaries; each chunk holds at most one
+    deck link and at most one W/L cell, so positional pairing within the
+    chunk keeps signal correlated to its deck. Mutates `seen_paths` so the
+    caller's `--deep` page:N walk dedupes across pages (the same deck can
+    bubble up onto multiple pages when authors edit a deck and the site
+    re-shuffles the order). Falls back to `archetype_winrate` / `_sample`
+    when a row's W/L cell is missing or malformed (rare: ~1 row per page).
+    """
+    rows: list[tuple[str, float | None, int | None]] = []
+    for chunk in _DECK_TABLE_ROW_SPLIT_RE.split(table_body):
+        link_m = _DECK_LINK_RE.search(chunk)
+        if not link_m:
+            continue
+        deck_path = link_m.group(1)
+        if deck_path in seen_paths:
+            continue
+        seen_paths.add(deck_path)
+        wr_row_m = _DECK_ROW_WINRATE_RE.search(chunk)
+        if wr_row_m:
+            try:
+                wins = int(wr_row_m.group(1))
+                losses = int(wr_row_m.group(2))
+                pct = float(wr_row_m.group(3)) / 100.0
+                row_winrate: float | None = pct
+                row_sample: int | None = wins + losses
+            except ValueError:
+                row_winrate = archetype_winrate
+                row_sample = archetype_sample
+        else:
+            row_winrate = archetype_winrate
+            row_sample = archetype_sample
+        rows.append((deck_path, row_winrate, row_sample))
+    return rows
 
 
 def _entries_from_deck_page(
