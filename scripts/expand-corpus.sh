@@ -8,18 +8,20 @@
 #         scripts/expand-corpus.sh all              # walk every Arena format
 #         scripts/expand-corpus.sh historic --fresh # wipe meta-cache + corpus first
 #
-# Sources run sequentially per format. A parallel mode existed briefly
-# but was removed: meta.json + _freq.json + _existing_corpus_hashes are
-# read-modify-write under a single per-format lock that doesn't exist,
-# so concurrent workers silently corrupted the sidecar. Wall-clock cost
-# of serial mode is dominated by network I/O per source, not CPU, so
-# the gain from parallelism wasn't worth the corruption risk.
+# Sources run sequentially inside `mtg fetch-meta-all`, which merges all
+# source results into one dedup pass and writes once per format. A
+# cross-source parallel mode existed briefly but was removed: meta.json,
+# _freq.json, and _existing_corpus_hashes are read-modify-write under
+# a single per-format lock that doesn't exist, so concurrent workers
+# silently corrupted the sidecar. Phase B's "merge then write once"
+# orchestration removes that corruption surface entirely; Phase C may
+# re-introduce cross-source HTTP parallelism inside fetch-meta-all
+# under a single in-process writer.
 #
 # Cross-FORMAT parallelism IS safe (and is exposed via PARALLEL_FORMATS
 # in `all` mode below): each format owns its own data/corpus/<fmt>/
 # directory with its own meta.json + _freq.json sidecar, so two formats
-# fetched concurrently never touch the same sidecar. This is the only
-# parallelism layer in the pipeline.
+# fetched concurrently never touch the same sidecar.
 #
 # RAM ceiling: each child process loads the ~80MB Scryfall index pickle.
 # PARALLEL_FORMATS=4 is a sane default for ≥8GB-RAM machines (~320MB
@@ -54,8 +56,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # `all` mode: re-invoke this script once per Arena format. Default is
 # sequential across formats (PARALLEL_FORMATS=1); set PARALLEL_FORMATS=N
 # to fan out N formats concurrently. Cross-format is race-free (each
-# format owns its sidecars), but cross-source within a format is NOT —
-# see the header comment for why. RAM ceiling: ~80MB pickle per child.
+# format owns its sidecars). RAM ceiling: ~80MB pickle per child.
 if [ "$FMT" = "all" ]; then
   ALL_FORMATS=(standard alchemy historic timeless pioneer brawl explorer standardbrawl)
 
@@ -152,98 +153,33 @@ if [ "$FRESH" -eq 1 ]; then
   fi
 fi
 
-# Sources to try, in priority order. moxfield first (largest corpus, no
-# throttle pain); archidekt next (user-deckbuilder, high novelty); aetherhub last
-# (Cloudflare can JS-challenge bursts). untapped is the all-formats baseline.
-SOURCES=(untapped moxfield archidekt aetherhub)
-
-# Format -> sources that publish for it. Order = dedup priority (first
-# source wins on near-dup match in `_write_meta_corpus`); tier/winrate-
-# bearing sources (mtgazone, mtgdecks, mtggoldfish) FIRST so their signal-
-# rich rows survive over signal-less duplicates from untapped/moxfield.
-#
-# - mtggoldfish enabled only for standard + pioneer (historic + explorer
-#   pages are upstream-thin per live probe — 1 budget tile, parser
-#   correctly filters; not a parser bug).
-# - mtgdecks enabled only for historic (its sole supported format per
-#   mtgdecks.py:81-83).
-# - standardbrawl: aetherhub publishes <10 decks under /Metagame/Brawl/
-#   (per aetherhub.py:64) — not worth the throttle.
-case "$FMT" in
-  standardbrawl)    ENABLED=(untapped moxfield archidekt) ;;
-  brawl)            ENABLED=(untapped moxfield archidekt aetherhub) ;;
-  standard)         ENABLED=(mtgazone mtggoldfish untapped moxfield archidekt aetherhub) ;;
-  historic)         ENABLED=(mtgazone mtgdecks untapped moxfield archidekt aetherhub) ;;
-  pioneer)          ENABLED=(mtgazone mtggoldfish untapped moxfield archidekt aetherhub) ;;
-  explorer)         ENABLED=(mtgazone untapped moxfield archidekt aetherhub) ;;
-  alchemy|timeless) ENABLED=(mtgazone untapped moxfield archidekt aetherhub) ;;
-  *)                ENABLED=("${SOURCES[@]}") ;;
-esac
-
-# Drift detector: warn if the registry knows of sources for this format
-# that the case-block above excludes. Prevents the script from silently
-# missing a parser added in Python without a corresponding script edit.
-# Failure in --list-sources is non-fatal — we don't want a transient mtg
-# CLI bug to block the whole expand run.
-if registry_sources=$("$MTG" fetch-meta "$FMT" --list-sources 2>/dev/null); then
-  for src in $registry_sources; do
-    found=0
-    for enabled in "${ENABLED[@]}"; do
-      if [ "$src" = "$enabled" ]; then found=1; break; fi
-    done
-    if [ "$found" -eq 0 ]; then
-      echo "==> WARNING: registry parser '$src' supports $FMT but is not in ENABLED list" >&2
-    fi
-  done
-fi
-
-echo "==> expand-corpus fmt=$FMT sources=${ENABLED[*]}"
+echo "==> expand-corpus fmt=$FMT"
 echo "==> logs: $LOG_DIR/<source>-$FMT.log"
 
 # Truncate the gate's validate log at the start of every run so it
 # accumulates within ONE run (across all parsers) but doesn't grow
-# unbounded across runs. Matches the per-source-log semantics: each
-# `<src>-<fmt>.log` is overwritten by `tee` at the start of that
-# source's fetch. Without this, the gate log opens in append mode
-# (tools/mtg.py:7344) and a weekly cron grows it forever.
+# unbounded across runs.  Per-source logs are managed by _fetch_one_source
+# in Python (overwrite-mode open), so no bash tee needed.
 : > "$LOG_DIR/validate-$FMT.log"
 
 START_TS=$(date +%s)
 FAILED=()
 
-# Per-source argv overrides. moxfield's CLI default is 300 (single-shot
-# ergonomics); a max-corpus build pass benefits from going ~6x deeper,
-# well under the 10000-deck API cap (50/page * 200 pages).
-extra_args_for() {
-  case "$1" in
-    moxfield) printf -- '--limit 2000' ;;
-    *)        printf '' ;;
-  esac
-}
-
-for src in "${ENABLED[@]}"; do
-  log="$LOG_DIR/${src}-${FMT}.log"
-  # shellcheck disable=SC2046  # we want word splitting on the override
-  extras=($(extra_args_for "$src"))
-  echo
-  echo "--- [$src] $(date -Iseconds) ---"
-  # stdbuf forces line-buffering so progress shows live; tee writes the
-  # log AND streams to stdout so a hung fetch is visible.
-  stdbuf -oL -eL "$MTG" fetch-meta "$FMT" --source "$src" "${extras[@]}" 2>&1 | tee "$log"
-  rc=${PIPESTATUS[0]}
-  case "$rc" in
-    0) echo "    [$src] ok" ;;
-    # Exit 2 = source provably doesn't serve this format (per
-    # tools/mtg.py:7062-7071). Treated as "skipped, expected" rather
-    # than failure so the per-format ENABLED matrix stays robust
-    # against url_for_format drift without operator action.
-    2) echo "    [$src] skipped (unsupported for $FMT)" ;;
-    *)
-      echo "    [$src] FAILED (exit $rc) — see $log"
-      FAILED+=("$src")
-      ;;
-  esac
-done
+# `fetch-meta-all` runs every source whose url_for_format(fmt) returns
+# non-None, sequentially, then merges + deduplicates + writes once.
+# `_FETCH_META_PARSERS` IS the source-of-truth for which sources support
+# which format; the old case-block ENABLED matrix is gone.
+#
+# Per-source log files still land at $LOG_DIR/<src>-$FMT.log because
+# _fetch_one_source opens each file in Python (overwrite mode, line-
+# buffered) — same final path as the old tee pattern.
+"$MTG" fetch-meta-all "$FMT" 2>&1 | tee "$LOG_DIR/fetch-meta-all-$FMT.log"
+rc=${PIPESTATUS[0]}
+case "$rc" in
+  0) ;;
+  2) echo "==> no sources support $FMT (skipped)" ;;
+  *) FAILED+=("fetch-meta-all"); echo "==> fetch-meta-all FAILED (exit $rc)" ;;
+esac
 
 echo
 echo "==> corpus-clean $FMT"
