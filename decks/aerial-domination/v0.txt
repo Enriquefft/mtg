@@ -1,0 +1,19 @@
+Deck
+1 Frilled Sea Serpent (ANB) 27
+2 Riddlemaster Sphinx (M19) 287
+2 Soulblade Djinn (ANB) 34
+3 Warden of Evos Isle (J25) 385
+2 Wall of Runes (ANB) 37
+2 Sworn Guardian (RIX) 58
+3 Waterkin Shaman (M20) 288
+3 Cloudkin Seer (M20) 54
+2 Octoprophet (M20) 70
+2 Windstorm Drake (RNA) 60
+3 Unsummon (FDN) 750
+2 Glint (ANB) 28
+2 Winged Words (ANB) 43
+3 Waterknot (ANB) 40
+1 Sleep (ANB) 33
+25 Island (ELD) 255
+1 Overflowing Insight (J25) 341
+1 Windreader Sphinx (J25) 391

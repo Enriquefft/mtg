@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 19,
+    "derived_at": "2026-05-02",
+    "fillable": 19,
+    "missing_total": 19,
+    "source_origin": "aetherhub",
+    "source_path": "data/corpus/brawl/giada-font-of-hope.txt",
+    "source_slug": "giada-font-of-hope",
+    "source_url": "https://aetherhub.com/Deck/giada-font-of-hope-1392315",
+    "subs_acceptable": true,
+    "subs_pct": 0.2639,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

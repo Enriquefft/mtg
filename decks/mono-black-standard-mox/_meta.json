@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 2,
+    "derived_at": "2026-05-02",
+    "fillable": 2,
+    "missing_total": 2,
+    "source_origin": "moxfield",
+    "source_path": "data/corpus/standard/mono-black-standard-hz7bsk.txt",
+    "source_slug": "mono-black-standard-hz7bsk",
+    "source_url": "https://www.moxfield.com/decks/Hz7Bs-kzLkWwfq2wg9_HcA",
+    "subs_acceptable": true,
+    "subs_pct": 0.0556,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

@@ -1,0 +1,24 @@
+Deck
+1 Temple of Epiphany (M20) 253
+1 Balmor, Battlemage Captain (DMU) 336
+1 Ovika, Enigma Goliath (FDN) 663
+1 Archmage of Runes (FDN) 30
+1 Drake Hatcher (FDN) 35
+1 Niv-Mizzet, Visionary (FDN) 123
+1 Stock Up (DFT) 67
+1 Steam Vents (ECL) 267
+1 Spirebluff Canal (OTJ) 270
+2 Riverpyre Verge (DFT) 260
+2 Enigma Drake (AKR) 234
+2 Heartfire Immolator (M21) 396
+2 Arcane Epiphany (FDN) 29
+2 Mischievous Mystic (FDN) 47
+2 Fiery Annihilation (FDN) 86
+2 Tolarian Terror (FDN) 167
+3 Chart a Course (JMP) 142
+3 Dive Down (FDN) 588
+4 Opt (DOM) 60
+4 Burst Lightning (FDN) 192
+4 Ghitu Lavarunner (FDN) 623
+9 Mountain (M21) 312
+10 Island (ELD) 255

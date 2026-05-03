@@ -1,0 +1,40 @@
+Deck
+1 Dirgur Island Dragon // Skimming Strike (TDM) 40
+1 Agent of Kotis (TDM) 36
+1 Dusyut Earthcarver (TDM) 141
+1 Camellia, the Seedmiser (BLB) 207
+2 Jeskai Monument (TDM) 244
+1 Watcher of the Wayside (TDM) 249
+1 Summit Intimidator (TDM) 125
+1 Temur Devotee (TDM) 61
+1 The Rollercrusher Ride (DSK) 317
+1 Surrak, Elusive Hunter (TDM) 161
+1 Descendant of Storms (TDM) 8
+1 Frontier Bivouac (TDM) 256
+1 Krumar Initiate (TDM) 84
+1 Lie in Wait (TDM) 203
+1 Heritage Reclamation (TDM) 145
+1 Snakeskin Veil (OTJ) 181
+1 Alesha's Legacy (TDM) 72
+1 Narset's Rebuke (TDM) 114
+1 Feral Deathgorger // Dusk Sight (TDM) 80
+1 Call the Spirit Dragons (TDM) 174
+1 Stormshriek Feral // Flush Out (TDM) 124
+1 Temur Tawnyback (TDM) 229
+1 Thunder of Unity (TDM) 231
+1 Worthy Cost (TDM) 99
+1 Fire-Rim Form (TDM) 107
+1 Krotiq Nestguard (TDM) 148
+1 Delta Bloodflies (TDM) 77
+1 Aggressive Negotiations (TDM) 70
+1 Arashin Sunshield (TDM) 3
+1 Champion of Dusan (TDM) 137
+1 Nightblade Brigade (TDM) 85
+1 Poised Practitioner (TDM) 18
+1 Wingblade Disciple (TDM) 65
+1 Kin-Tree Nurturer (TDM) 83
+5 Island (ELD) 255
+5 Mountain (M21) 312
+5 Forest (BLB) 280
+5 Plains (MOM) 277
+5 Swamp (JMP) 59

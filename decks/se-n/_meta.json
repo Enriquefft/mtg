@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 8,
+    "derived_at": "2026-05-03",
+    "fillable": 8,
+    "missing_total": 8,
+    "source_origin": "archidekt",
+    "source_path": "data/corpus/timeless/se-n-216404.txt",
+    "source_slug": "se-n-216404",
+    "source_url": "https://archidekt.com/decks/21640483/",
+    "subs_acceptable": true,
+    "subs_pct": 0.1818,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

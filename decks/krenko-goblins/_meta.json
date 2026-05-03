@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 30,
+    "derived_at": "2026-05-02",
+    "fillable": 30,
+    "missing_total": 30,
+    "source_origin": "aetherhub",
+    "source_path": "data/corpus/brawl/krenko-mob-boss.txt",
+    "source_slug": "krenko-mob-boss",
+    "source_url": "https://aetherhub.com/Deck/krenko-mob-boss-1402517",
+    "subs_acceptable": true,
+    "subs_pct": 0.4478,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

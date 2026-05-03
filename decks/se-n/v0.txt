@@ -1,0 +1,41 @@
+Deck
+1 Dead Weight (LCI) 99
+1 Hylderblade (EOE) 106
+1 Sanitarium Skeleton (ANB) 57
+1 Typhoid Rats (J25) 497
+1 Pacifism (JMP) 125
+1 Barbed Bloodletter (ECL) 86
+1 Cruel Cut (ANB) 47
+1 Eternal Thirst (JMP) 229
+1 Fake Your Own Death (J25) 440
+2 Malakir Cullblade (ANB) 51
+1 Moment of Craving (FDN) 524
+1 Sanguine Syphoner (FDN) 68
+1 Rahilda, Wanted Cutthroat // Rahilda, Feral Outlaw (YMID) 42
+1 Vampire Opportunist (ANB) 65
+1 Vengeful Bloodwitch (FDN) 76
+1 Ob Nixilis's Cruelty (WAR) 101
+1 Mardu Outrider (ANB) 52
+1 Markov Baron (MAT) 14
+1 Murder (ANB) 53
+2 Savage Gorger (ANB) 58
+1 Tribute to Hunger (FDN) 614
+1 Legions to Ashes (PBRO) 215s
+1 Mortify (FDN) 662
+1 Angelic Destiny (FDN) 565
+1 Ashcoat of the Shadow Swarm (J22) 19
+2 Skeleton Archer (M20) 324
+1 Elenda, Saint of Dusk (FDN) 119
+1 Orcus, Prince of Undeath (AFR) 388
+1 Angelic Reward (OANA) 1
+1 Shredder, Unrelenting (TMT) 210
+1 Sengir Vampire (ANB) 60
+1 Rise of the Dark Realms (M14) 111
+1 Canyon Crawler (TLA) 90
+1 Nightmare (ANB) 54
+1 Demon of Loathing (ANB) 48
+8 Snow-Covered Swamp (KHM) 280
+8 Swamp (JMP) 59
+1 Forlorn Flats (OTJ) 258
+4 Scoured Barrens (NEO) 274
+1 Temple of Silence (M21) 255

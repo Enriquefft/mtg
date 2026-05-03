@@ -1,0 +1,23 @@
+Deck
+1 Phyrexian Arena (FDN) 180
+1 Temple of Silence (M21) 255
+1 Elenda, Saint of Dusk (FDN) 119
+1 Cat Collector (FDN) 4
+2 Vampire Nighthawk (FDN) 186
+2 Mortify (FDN) 662
+2 Tribute to Hunger (FDN) 614
+2 Moment of Triumph (RIX) 15
+2 Moment of Craving (FDN) 524
+2 Healer's Hawk (FDN) 734
+2 Twinblade Paladin (FDN) 503
+2 Inspiring Overseer (SNC) 18
+2 Hinterland Sanctifier (FDN) 730
+2 Dazzling Angel (FDN) 9
+2 Sun-Blessed Healer (FDN) 25
+2 Sanguine Syphoner (FDN) 68
+2 Vengeful Bloodwitch (FDN) 76
+2 Fiendish Panda (FDN) 120
+3 Ajani's Pridemate (FDN) 135
+4 Scoured Barrens (NEO) 274
+11 Plains (MOM) 277
+10 Swamp (JMP) 59

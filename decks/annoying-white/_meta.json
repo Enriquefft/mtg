@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 3,
+    "derived_at": "2026-05-03",
+    "fillable": 2,
+    "missing_total": 2,
+    "source_origin": "archidekt",
+    "source_path": "data/corpus/timeless/annoying-white-bitch-202275.txt",
+    "source_slug": "annoying-white-bitch-202275",
+    "source_url": "https://archidekt.com/decks/20227527/",
+    "subs_acceptable": true,
+    "subs_pct": 0.0833,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

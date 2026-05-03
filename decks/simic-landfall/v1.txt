@@ -1,0 +1,23 @@
+Deck
+1 Rampaging Baloths (FDN) 645
+1 Temple of Mystery (M21) 389
+1 Loot, Exuberant Explorer (FDN) 106
+1 Mossborn Hydra (FDN) 107
+2 Tatyova, Benthic Druid (DOM) 206
+2 Circuitous Route (GRN) 125
+2 Spectral Sailor (FDN) 164
+2 Magnigoth Sentry (FDN) 556
+2 Quick Study (FDN) 513
+2 Bigfin Bouncer (FDN) 31
+2 Mischievous Mystic (FDN) 47
+2 Apothecary Stomper (FDN) 99
+2 Elfsworn Giant (FDN) 103
+2 Felling Blow (FDN) 105
+2 Mild-Mannered Librarian (FDN) 228
+3 Llanowar Elves (PANA) 4
+3 Exclusion Mage (FDN) 508
+4 Simic Guildgate (RNA) 258
+4 Thornwood Falls (FDN) 269
+4 Druid of the Cowl (M19) 177
+11 Forest (BLB) 280
+5 Island (ELD) 255

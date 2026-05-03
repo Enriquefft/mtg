@@ -960,8 +960,21 @@ def _write_mtga_export(path: Path, entries: list[DeckEntry]) -> None:
     path.write_text("\n\n".join(chunks) + "\n")
 
 
-def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
-    """Return (exit_code, messages). 0 = clean."""
+def validate_deck(
+    entries: list[DeckEntry],
+    fmt: str,
+    *,
+    strict_castable: bool = False,
+) -> tuple[int, list[str]]:
+    """Return (exit_code, messages). 0 = clean.
+
+    `strict_castable=True` adds a non-Brawl CI gate: every non-land card
+    in commander/deck/companion sections must have `color_identity ⊆
+    _compute_deck_ci(entries, fmt)`. Catches cases like a UB card in a
+    mono-B deck whose lands cannot produce U. Off by default to preserve
+    legacy behaviour; cmd_derive and cmd_suggest_subs --apply pass True
+    as a defense-in-depth gate against substitution bugs.
+    """
     msgs: list[str] = []
     if fmt not in ARENA_FORMATS:
         return 2, [f"unknown format: {fmt}"]
@@ -1017,7 +1030,11 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
             if n > 4 and not is_basic:
                 msgs.append(f"4-of: {name} appears {n} times")
 
-    # color identity (Brawl only)
+    # color identity. Brawl always gates against the commander's CI.
+    # Non-Brawl gates only when strict_castable=True (per-card-excluded
+    # union: a card's CI must be a subset of the union of every OTHER
+    # non-land card's CI; otherwise that card is a singleton off-color
+    # contributor — exactly the Kaito-in-mono-B failure mode).
     cmdr_identity: set[str] | None = None
     if is_brawl and commanders:
         cmdr = _resolve_card(commanders[0].name)
@@ -1067,6 +1084,27 @@ def validate_deck(entries: list[DeckEntry], fmt: str) -> tuple[int, list[str]]:
                     f"identity violation: {e.name} adds {{{extras}}} "
                     f"outside commander identity {{{''.join(sorted(cmdr_identity))}}}"
                 )
+        elif strict_castable and not is_brawl:
+            # Pip-aware castability gate: each colored pip in the card's
+            # mana cost must be satisfiable by the union of OTHER
+            # non-land cards' colors. Hybrid pips ({U/B}) pass when
+            # either color is available — so a {1}{U/B} Shapeshifter is
+            # castable in mono-B even though Scryfall lists its CI as BU.
+            # Lands are exempt — they're the manabase, not a constraint
+            # on it.
+            type_line = (c.get("type_line") or "").lower()
+            is_land = "land" in type_line and "creature" not in type_line
+            if not is_land:
+                others_ci = _compute_deck_ci(
+                    entries, fmt, exclude_name=c.get("name") or e.name,
+                ) or set()
+                bad_pip = _card_uncoverable_pip(c, others_ci)
+                if bad_pip is not None:
+                    msgs.append(
+                        f"identity violation: {e.name} requires "
+                        f"{{{bad_pip}}} outside deck identity "
+                        f"{{{''.join(sorted(others_ci)) or 'C'}}}"
+                    )
 
     return (0 if not msgs else 1), msgs
 
@@ -1168,8 +1206,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     entries = parse_deck(path)
     fmt = args.format.lower()
 
+    strict_castable = bool(getattr(args, "strict_castable", False))
     if getattr(args, "json", False):
-        code, msgs = validate_deck(entries, fmt)
+        code, msgs = validate_deck(entries, fmt, strict_castable=strict_castable)
         cmdrs = [e.name for e in entries if e.section == "commander"]
         total = sum(
             e.count for e in entries if e.section in {"deck", "commander"}
@@ -1219,7 +1258,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             )
         print(f"  -- {ok_n} ok, {bad_n} flagged")
 
-    code, msgs = validate_deck(entries, fmt)
+    code, msgs = validate_deck(entries, fmt, strict_castable=strict_castable)
     if msgs:
         for m in msgs:
             print(f"  ✗ {m}")
@@ -4417,6 +4456,120 @@ def _fallback_save_cache(cache: dict) -> None:
         _FALLBACK_FLUSH_REGISTERED = True
 
 
+def _card_uncoverable_pip(
+    card: dict,
+    available_colors: set[str],
+) -> str | None:
+    """Return the pip-token (e.g. "U", "U/B") a card requires that the
+    available colors can't satisfy, or None if every pip is coverable.
+
+    Hybrid pips (`{U/B}`) are satisfied by EITHER color, so a UB
+    Shapeshifter is castable in mono-B. Phyrexian (`{W/P}`, `{B/P}`,
+    etc.) is universally satisfiable — the P alternative pays 2 life
+    instead of the colored mana, so Surgical Extraction is castable
+    in any deck. Generic / X / colorless pips never fail.
+
+    Multi-face cards (split / DFC / adventure / aftermath): if either
+    face is fully castable in `available_colors`, the card passes.
+    Returns the failing pip from the FRONT face when both fail (front
+    is the canonical "what you cast" side for non-MDFCs; MDFCs let you
+    cast either, so they pass when either side does).
+    """
+    cost = (card.get("mana_cost") or "").strip()
+    if not cost:
+        return None
+    faces = [f for f in cost.split(" // ") if f.strip()]
+    if not faces:
+        return None
+    front_fail: str | None = None
+    for face in faces:
+        face_fail: str | None = None
+        for tok in _PIP_RE.findall(face):
+            # Phyrexian: any pip listing P is castable for 2 life,
+            # independent of available colors. _pip_colors strips P,
+            # which is correct for manabase pip-demand (its other
+            # caller) but wrong for castability.
+            if "P" in tok.upper():
+                continue
+            colors = _pip_colors(tok)
+            if not colors:
+                continue
+            if not (colors & available_colors):
+                face_fail = tok
+                break
+        if face_fail is None:
+            return None  # this face is castable
+        if front_fail is None:
+            front_fail = face_fail
+    return front_fail
+
+
+def _compute_deck_ci(
+    entries: list[DeckEntry],
+    fmt: str,
+    *,
+    exclude_name: str | None = None,
+) -> set[str] | None:
+    """Effective color identity of a deck.
+
+    Brawl: commander's CI (the format gates this at validate time —
+    every other card must already be a subset, so the union is the
+    commander's CI).
+
+    Non-Brawl: union of `color_identity` for every NON-LAND entry in
+    `commander` ∪ `deck` ∪ `companion`. Lands are excluded because
+    their identity is the constraint target, not a contributor — a
+    deck running 24 Swamps + a single Counterspell is a B/U deck
+    whose manabase is broken, not a B/U deck.
+
+    `exclude_name`: when set, every entry whose canonical name matches
+    is skipped from the union. Used by `validate_deck`'s strict-castable
+    per-card gate so a card under check doesn't self-contribute (a
+    1-of off-color card is a violation only when no OTHER card already
+    expanded the deck's CI to cover it).
+
+    Returns None when nothing resolves (empty deck file, all entries
+    unresolvable). Callers treat None as "no gate" — same shape as
+    pre-fix behaviour for empty inputs.
+    """
+    is_brawl = fmt in BRAWL_FORMATS
+    if is_brawl:
+        for e in entries:
+            if e.section != "commander":
+                continue
+            c = _resolve_card(e.name)
+            if c is None:
+                continue
+            return set(c.get("color_identity") or [])
+        return None
+
+    union: set[str] = set()
+    saw_any = False
+    exclude_lc = (exclude_name or "").lower() or None
+    for e in entries:
+        if e.section not in {"commander", "deck", "companion"}:
+            continue
+        c = _resolve_card(e.name)
+        if c is None:
+            continue
+        if exclude_lc is not None and (c.get("name") or "").lower() == exclude_lc:
+            continue
+        if _is_basic(c):
+            saw_any = True
+            continue
+        type_line = (c.get("type_line") or "").lower()
+        if "land" in type_line and "creature" not in type_line:
+            # Pure lands don't contribute to non-land CI. Man-lands /
+            # creature-lands DO (they cast nothing but their CI matters
+            # for any spell that interacts with them, and we want the
+            # gate to permit lands the deck already plays).
+            saw_any = True
+            continue
+        union.update(c.get("color_identity") or [])
+        saw_any = True
+    return union if saw_any else None
+
+
 def _heuristic_functional_reprints(card_name: str, fmt: str) -> list[str]:
     """Local-heuristic functional-reprint candidates for *card_name*.
 
@@ -4715,12 +4868,17 @@ def _score_candidate(
            + type_term
            + super_term
            + 2.0 * oracle_text_jaccard
-           + 1.5 * archetype_prior
            - 1.0 * pip_shape_distance
       if rare_role_overlap: base *= 1.5
       if slot_weight == 0.5:           # soft anchor
           base = base * 0.5 - 3.0
-      base += freq_adjustment(cand_deck_pct)
+
+    `archetype_prior` and `freq_adj` are reported in the components dict
+    but DO NOT contribute to `total` — they're tiebreak keys only,
+    consumed by the caller's `candidates.sort` as secondary keys after
+    `total`. Rationale: derive's job is downgrade-search ("an owned card
+    that doesn't change what the deck does"), not recommendation. A
+    popular off-role card should not outrank an unpopular on-role card.
 
     Hard anchors (slot_weight == 1.0) are short-circuited by the caller
     BEFORE this function runs — they never reach the scorer. Soft anchors
@@ -4747,7 +4905,6 @@ def _score_candidate(
         + type_term
         + super_term
         + 2.0 * oracle_jac
-        + 1.5 * arch_prior
         - 1.0 * pip_dist
     )
     if rare_role:
@@ -4757,8 +4914,9 @@ def _score_candidate(
         # flex-slot equivalent exists. 0.5x + -3.0 means a soft-anchor
         # sub trails an identically-scored flex sub by 3+ points.
         base = base * 0.5 - 3.0
+    # archetype_prior and freq_adj computed for tiebreak only — not added
+    # to base. See docstring.
     freq_adj = _freq_score_adjustment(cand_deck_pct)
-    base += freq_adj
 
     return {
         "total": base,
@@ -5009,15 +5167,10 @@ def _run_suggest_subs(
         return role_freq.get(r, 0) < 3  # T=3
 
     is_brawl = fmt in BRAWL_FORMATS
-    cmdr_identity: set[str] | None = None
-    if is_brawl:
-        cmdr_entry = next(
-            (e for e in entries if e.section == "commander"), None
-        )
-        if cmdr_entry is not None:
-            cmdr = _resolve_deck_card(idx, cmdr_entry)
-            if cmdr is not None:
-                cmdr_identity = set(cmdr.get("color_identity") or [])
+    # Effective deck color identity. Brawl: commander's CI. Non-Brawl:
+    # union of non-land CIs across commander+deck+companion. Always-on
+    # (was Brawl-only — see _compute_deck_ci docstring for rationale).
+    deck_ci: set[str] | None = _compute_deck_ci(entries, fmt)
 
     # Companion guard: only honored outside Brawl (Brawl decks don't run
     # companions in the standard sideboard slot — and `_COMPANION_PREDICATES`
@@ -5132,15 +5285,32 @@ def _run_suggest_subs(
                 fmt == "alchemy" or fmt in BRAWL_FORMATS
             ):
                 continue
-            if cmdr_identity is not None:
-                # spec deviation: ⊆ matches validator
+            if deck_ci is not None:
+                # CI subset gate. Brawl: matches commander's CI (same
+                # rule as validate_deck). Non-Brawl: matches the deck's
+                # union of non-land CIs (the manabase / non-land cards
+                # already in the list). Always-on; pre-fix this only
+                # ran in Brawl, which let cards like Kaito (BU) sub
+                # into a mono-B deck because no gate existed in
+                # constructed.
                 ci = set(c.get("color_identity") or [])
-                if not ci.issubset(cmdr_identity):
+                if not ci.issubset(deck_ci):
                     continue
             cand_roles = classify_card(c)
             if not (cand_roles & miss_roles):
                 continue
-            if abs((c.get("cmc") or 0) - miss_cmc) > 2:
+            # CMC band-±1 hard gate (was raw ±2). Bands collapse 0-1 /
+            # 2 / 3 / 4 / 5+, so a 3-drop can sub a 2 or 4-drop but
+            # NOT a 5+-drop. Tighter manabase-curve preservation —
+            # raw ±2 let a 7-drop sub a 5-drop on role overlap alone.
+            if abs(_cmc_band(c.get("cmc") or 0) - _cmc_band(miss_cmc)) > 1:
+                continue
+            # Pip-shape hard cap: previously a soft -1.0 penalty,
+            # which let a {W}{W}{W} candidate sub for {2}{B} when
+            # the role/Jaccard signal was strong enough to absorb
+            # the penalty. > 0.5 means the pip shapes are more
+            # different than they are alike — never the right sub.
+            if _pip_shape_distance(c, miss_card) > 0.5:
                 continue
             in_deck = deck_copies.get(cand_display, 0)
             if not _is_basic(c) and in_deck >= max_copies:
@@ -5192,7 +5362,17 @@ def _run_suggest_subs(
                 sb_source, score_components,
             ))
 
-        candidates.sort(key=lambda t: (-t[0], (t[1].get("name") or "")))
+        # Sort: primary by score (post-strictlybetter-boost). Tiebreak by
+        # popularity priors (archetype_prior, freq_adj) — these were
+        # demoted from the main score in `_score_candidate`, so they only
+        # matter when two candidates have the same role-fit signal. Final
+        # tiebreak by name for determinism across runs.
+        candidates.sort(key=lambda t: (
+            -t[0],
+            -float(t[7].get("archetype_prior") or 0.0),
+            -float(t[7].get("freq_adj") or 0.0),
+            (t[1].get("name") or ""),
+        ))
         candidates = candidates[:max_per_card]
 
         if candidates:
@@ -5563,6 +5743,22 @@ def cmd_suggest_subs(args: argparse.Namespace) -> int:
                     del top_by_name[key]
             else:
                 new_entries.append(e)
+        # Defense-in-depth: same gate cmd_derive uses. Reject the write
+        # when the substituted deck contains an off-CI non-land card —
+        # the candidate filter should never produce one, but a regression
+        # here would silently ship uncastable output.
+        post_code, post_msgs = validate_deck(
+            new_entries, fmt, strict_castable=True,
+        )
+        if post_code != 0:
+            print(
+                f"[error] post-substitution validation failed "
+                f"({len(post_msgs)} issue(s)); rewrite refused",
+                file=sys.stderr,
+            )
+            for m in post_msgs:
+                print(f"  {m}", file=sys.stderr)
+            return 2
         _write_mtga_export(Path(args.apply), new_entries)
         print(f"wrote substituted deck → {args.apply}", file=sys.stderr)
 
@@ -9721,7 +9917,13 @@ def cmd_derive(args: argparse.Namespace) -> int:
     )
 
     # --- validation gate ---------------------------------------------------
-    val_code, val_msgs = validate_deck(new_entries, fmt)
+    # strict_castable=True is defense-in-depth against substitution bugs:
+    # even if the candidate filter regresses, an off-CI card derived
+    # into a constructed deck surfaces as a validation failure here
+    # rather than silently shipping uncastable output.
+    val_code, val_msgs = validate_deck(
+        new_entries, fmt, strict_castable=True,
+    )
     validation_passed = val_code == 0
 
     if not validation_passed:
@@ -10264,7 +10466,11 @@ def cmd_invent(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _write_mtga_export(out_path, entries)
 
-    rc, msgs = validate_deck(entries, fmt)
+    # invent's pool already CI-filters at construction (line ~10239), so
+    # strict_castable=True here is a sanity check — every emitted card
+    # should already be in CI. Failing this gate would mean the pool's
+    # CI filter regressed.
+    rc, msgs = validate_deck(entries, fmt, strict_castable=True)
 
     sidecar_path = out_path.parent / "_meta.json"
     sidecar: dict[str, dict] = {}
@@ -10447,6 +10653,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument(
         "-v", "--verbose", action="store_true",
         help="print per-card pass/fail status (default: only failures)",
+    )
+    s.add_argument(
+        "--strict-castable", action="store_true", default=False,
+        help=(
+            "non-Brawl: also gate every non-land card's color identity "
+            "against the union of non-land CIs in the deck. Catches "
+            "uncastable cards (e.g. UB card in mono-B deck)."
+        ),
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_validate)

@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 7,
+    "derived_at": "2026-05-02",
+    "fillable": 7,
+    "missing_total": 7,
+    "source_origin": "moxfield",
+    "source_path": "data/corpus/historic/dragon-storm-draft-6-uzf8xu.txt",
+    "source_slug": "dragon-storm-draft-6-uzf8xu",
+    "source_url": "https://www.moxfield.com/decks/uZf8xuoUrEmDTBt3HLuMSg",
+    "subs_acceptable": true,
+    "subs_pct": 0.1667,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

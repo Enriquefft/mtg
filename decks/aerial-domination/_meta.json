@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 0,
+    "derived_at": "2026-05-02",
+    "fillable": 0,
+    "missing_total": 0,
+    "source_origin": "archidekt",
+    "source_path": "data/corpus/timeless/aerial-domination-201912.txt",
+    "source_slug": "aerial-domination-201912",
+    "source_url": "https://archidekt.com/decks/20191277/",
+    "subs_acceptable": true,
+    "subs_pct": 0.0,
+    "unfilled": 0,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}

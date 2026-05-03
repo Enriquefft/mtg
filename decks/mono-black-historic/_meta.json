@@ -1,0 +1,18 @@
+{
+  "v0.txt": {
+    "anchor_unfilled": 0,
+    "cards_substituted": 4,
+    "derived_at": "2026-05-03",
+    "fillable": 3,
+    "missing_total": 4,
+    "source_origin": "aetherhub",
+    "source_path": "data/corpus/historic/mono-black-2.txt",
+    "source_slug": "mono-black-2",
+    "source_url": "https://aetherhub.com/Deck/mono-black-1397600",
+    "subs_acceptable": true,
+    "subs_pct": 0.1111,
+    "unfilled": 1,
+    "validation_failures": [],
+    "validation_passed": true
+  }
+}
