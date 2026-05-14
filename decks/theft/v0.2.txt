@@ -1,0 +1,84 @@
+Deck
+1 Ragavan, Nimble Pilferer (MUL) 86
+1 Plargg and Nassari (MAT) 18
+1 Gonti, Lord of Luxury (JMP) 240
+1 Grenzo, Crooked Jailer (YOTJ) 22
+1 Impetuous Lootmonger (YOTJ) 12
+1 Bitterblossom (MOR) 58
+1 Goldspan Dragon (KHM) 139
+1 Young Pyromancer (J25) 618
+1 Anax, Hardened in the Forge (THB) 125
+1 Mayhem Devil (WAR) 204
+1 Judith, the Scourge Diva (MUL) 45
+1 Pia and Kiran Nalaar (PIO) 151
+1 Akki Ember-Keeper (NEO) 130
+1 Chandra, Acolyte of Flame (M20) 126
+1 Zulaport Cutthroat (PIO) 121
+1 Bonecrusher Giant // Stomp (ELD) 115
+1 Bloodthirsty Adversary (MID) 129
+1 Dreadhorde Arcanist (WAR) 125
+1 Squee, Dubious Monarch (DMU) 146
+1 Fleshbag Marauder (J21) 331
+1 Abrade (SOA) 37
+1 Cast Down (DOM) 81
+1 Cut Down (DMU) 89
+1 Bitter Triumph (SOA) 26
+1 Fatal Push (KLR) 84
+1 Go Blank (STX) 72
+1 Damnation (SPG) 68
+1 Terminate (OMB) 40
+1 Sheoldred's Edict (SOA) 32
+1 Cast into the Fire (LTR) 118
+1 Bone Shards (J21) 298
+1 Diabolic Intent (BRO) 89
+1 Dark Deal (PIO) 89
+1 Bag of Holding (AFR) 240
+1 Chandra, Torch of Defiance (FRA) 244
+1 Jaya, Fiery Negotiator (DMU) 133
+1 Tectonic Giant (THB) 158
+1 Goblin Ringleader (M20) 143
+1 Liliana, Dreadhorde General (WAR) 97
+1 Phyrexian Tower (JMP) 493
+1 Rakdos Signet (AA1) 10
+1 Voldaren Bloodcaster // Bloodbat Summoner (VOW) 137
+1 Ovalchase Daredevil (PIO) 337
+1 Bloodchief's Thirst (ZNR) 94
+1 Escape Velocity (THB) 132
+1 Witch's Cottage (ELD) 249
+1 Fabled Passage (ELD) 244
+1 Rakdos Charm (PA1) 7
+1 Angrath, Captain of Chaos (WAR) 227
+1 Dreadhorde Butcher (WAR) 194
+1 Liliana of the Veil (ISD) 105
+1 Goblin Dark-Dwellers (OGW) 110
+1 Goblin Barrage (DOM) 128
+1 Asmodeus the Archfiend (AFR) 88
+11 Mountain (HOB) 197
+10 Swamp (JMP) 59
+1 Dragonskull Summit (XLN) 252
+1 Foreboding Ruins (SIR) 265
+1 Blackcleave Cliffs (ONE) 248
+1 Bloodfell Caves (TDM) 250
+1 Cinder Barrens (M19) 248
+1 Lavaclaw Reaches (WWK) 139
+1 Auntie's Hovel (LRW) 267
+1 Razortrap Gorge (DSK) 267
+1 Boiling Rock Prison (TLA) 267
+1 Immersturm Skullcairn (KHM) 263
+1 Restless Vents (LCI) 284
+1 Jagged Barrens (OTJ) 259
+1 Drossforge Bridge (HA6) 12
+1 Ominous Asylum (OM1) 182
+1 Rakdos Guildgate (PIO) 272
+1 Temple of Malice (FDN) 701
+1 Cavern of Souls (AVR) 226
+1 Spire of Industry (AER) 184
+1 Mountain (HOB) 197
+1 Swamp (JMP) 59
+1 Mountain (HOB) 197
+1 Swamp (JMP) 59
+1 Mountain (HOB) 197
+1 Swamp (JMP) 59
+
+Commander
+1 Axavar, Fate Thief (YEOE) 23

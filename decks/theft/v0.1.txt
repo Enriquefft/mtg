@@ -1,0 +1,87 @@
+Deck
+1 Ragavan, Nimble Pilferer (FCA) 43
+1 Gonti, Lord of Luxury (JMP) 240
+1 Etali, Primal Conqueror // Etali, Primal Sickness (MOM) 137
+1 Plargg and Nassari (MAT) 18
+1 Dragon's Rage Channeler (MH2) 121
+1 Aether Channeler (DMU) 39
+1 Archfiend's Vessel (SNC) 54
+1 Voldaren Bloodcaster // Bloodbat Summoner (VOW) 134
+1 Sedge Sliver (UMA) 75
+1 Mischievous Catgeist // Catlike Curiosity (VOW) 76
+1 Flusterstorm (J25) 66
+1 Murktide (MH2) 52
+1 Tymna the Weaver (CNS) 81
+1 Opposition Agent (UND) 57
+1 Fallen Shinobi (NEO) 112
+1 Profane Tutor (JMP) 97
+1 Binding Negotiation (DAR) 234
+1 Cultivate (J25) 175
+1 Ignoble Initiate (SNC) 97
+1 Harbinger of Night (SNC) 98
+1 Fallen Shinobi (NEO) 112
+1 Death's Shadow (TSB) 83
+1 Plague Mare (VOW) 81
+1 Thassa's Intervention (THB) 72
+1 Neoform (WAR) 206
+1 Grisly Salvage (RTR) 159
+1 Thought Scour (ISD) 68
+1 Jace, the Mind Sculptor (J25) 288
+1 Teferi, Time Raveler (WAR) 221
+1 Tamiyo, Collector of Tales (WAR) 220
+1 Ponder (J25) 60
+1 Brainstorm (J25) 51
+1 Dress Down (SNC) 87
+1 Spell Pierce (XLN) 81
+1 Unholy Heat (MH2) 145
+1 Damnation (PLC) 85
+1 Urza's Ruinous Blast (DAM) 75
+1 Diabolic Intent (BRO) 92
+1 Dark Deal (ALA) 42
+1 Go Blank (SNC) 86
+1 Fatal Push (KLR) 84
+1 Assassinate (J25) 89
+1 Ice-Fang Coatl (UMA) 51
+1 Wraith of Echoes (JMP) 52
+1 Satyr Wayfinder (GRN) 102
+1 Once Upon a Time (ELD) 169
+1 Counterspell (J25) 52
+1 Delay (TSP) 41
+1 Negate (J25) 59
+1 Spell Snare (MH2) 137
+1 Noble Benefactor (VIS) 71
+1 Gilded Goose (ELD) 160
+1 Birds of Paradise (J25) 173
+1 Elvish Visionary (KLR) 163
+1 Sagittarian's Volley (DMU) 202
+1 Llanowar Loamspeaker (DMU) 197
+1 Rampant Growth (J25) 174
+1 Sylvan Library (J25) 179
+1 Ancestral Recall (LEA) 48
+1 Time Walk (LEA) 269
+4 Forest (FDN) 350
+4 Island (FDN) 352
+4 Swamp (FDN) 353
+1 Breeding Pool (RNA) 246
+1 Watery Grave (GRN) 259
+1 Overgrown Tomb (GRN) 253
+1 Flooded Grove (KHM) 245
+1 Tropical Island (LEA) 285
+1 Misty Rainforest (ZFE) 207
+1 Scalding Tarn (ZFE) 211
+1 Marsh Flats (ZFE) 204
+1 Verdant Catacombs (ZFE) 208
+1 Bayou (LEA) 278
+1 Underground Sea (LEA) 282
+1 Sunken Hollow (DTK) 438
+1 Drowned Catacomb (XLN) 253
+1 Woodland Cemetery (DAR) 248
+1 Hinterland Harbor (DAR) 240
+1 Breeding Pool (RNA) 246
+1 Tangled Islet (J25) 316
+1 Temple of Mystery (BNG) 228
+1 Temple of Abandon (THS) 227
+1 Creeping Tar Pit (WWK) 167
+
+Commander
+1 Gonti, Canny Acquisitor (OTC) 1

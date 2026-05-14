@@ -204,6 +204,7 @@ KEEP_FIELDS = (
     "rarity",
     "released_at",
     "game_changer",
+    "promo_types",  # Filter out non-importable MTGA promotional variants
 )
 
 # Bump when the index dict schema changes (new field, dropped field,
@@ -730,6 +731,114 @@ def _resolve_card(name: str) -> dict | None:
     return prints[0]
 
 
+def _get_arena_printings(idx: dict, name: str) -> list[dict]:
+    """Return all Arena-legal printings for a card name, preferring importable versions.
+
+    MTGA deck import only accepts base (non-promotional) versions. Scryfall marks
+    promotional variants (boosterfun, draculaseries, showcase, extended-art) as
+    arena=yes for collection purposes, but they're not importable via deck export.
+    This filters to importable versions, preferring non-promo base versions.
+    """
+    candidates = idx["by_name"].get(_normalize_name(name)) or []
+    arena_prints = [c for c in candidates if "arena" in (c.get("games") or [])]
+
+    # Filter to importable versions: exclude promotional-only variants
+    # Promo types that make a card non-importable for deck import:
+    non_importable_promos = {
+        'boosterfun',      # Extended art / special editions
+        'draculaseries',   # Special themed versions
+        'showcase',        # Showcase frame versions
+        'extendedart',     # Extended art frame
+        'borderless',      # Borderless versions (newer)
+        'textured',        # Textured versions
+    }
+
+    importable = []
+    for c in arena_prints:
+        promo_types = set(c.get("promo_types") or [])
+        if not promo_types.intersection(non_importable_promos):
+            importable.append(c)
+
+    # If no importable versions found (shouldn't happen), return arena versions anyway
+    # (better to try than silently fail)
+    return importable if importable else arena_prints
+
+
+def _check_printing_match(idx: dict, e) -> bool:
+    """Check if a DeckEntry's (set, collector) resolves to the expected card name."""
+    found = idx["by_printing"].get((e.set_code.lower(), e.collector))
+    if found is None:
+        return False
+    return _normalize_name(found.get("name", "")) == _normalize_name(e.name)
+
+
+def _try_fix_entry(idx: dict, e, *, unsafe: bool = False) -> tuple | None:
+    """Try to fix a DeckEntry's (set, collector).
+
+    Returns (fixed_entry, mode_str) if fixable, or (None, skip_reason) if skipped.
+    Mode: 'safe' (1 printing) or 'unsafe' (multiple printings).
+    """
+    # Check if this is a non-importable promotional variant (not importable in MTGA)
+    non_importable_promos = {
+        'boosterfun', 'draculaseries', 'showcase', 'extendedart', 'borderless', 'textured'
+    }
+    found = idx["by_printing"].get((e.set_code.lower(), e.collector))
+    if found:
+        promo_types = set(found.get("promo_types") or [])
+        if promo_types.intersection(non_importable_promos):
+            # This is a non-importable promo — treat as needing fixing
+            pass
+        elif _check_printing_match(idx, e):
+            return None, "correct"
+    elif _check_printing_match(idx, e):
+        return None, "correct"
+
+    arena_prints = _get_arena_printings(idx, e.name)
+    if not arena_prints:
+        return None, "no Arena printing — cannot fix"
+
+    if len(arena_prints) == 1:
+        p = arena_prints[0]
+        mode = "safe"
+    elif unsafe:
+        p = max(arena_prints, key=lambda c: c.get("released_at", ""))
+        mode = "unsafe"
+    else:
+        return None, f"{len(arena_prints)} Arena printings — use --unsafe to auto-select"
+
+    new_set = p["set"].upper()
+    new_col = p["collector_number"]
+
+    # Already correct (shouldn't happen but paranoid)
+    if new_set == e.set_code.upper() and new_col == e.collector:
+        return None, "correct"
+
+    fixed = DeckEntry(e.count, e.name, new_set, new_col, e.section)
+    return fixed, mode
+
+
+def _serialize_deck(entries) -> str:
+    """Serialize a list of DeckEntry back to MTGA export format."""
+    ORDER = ["deck", "commander", "companion", "sideboard", "maybeboard"]
+    buckets = {s: [] for s in ORDER}
+    for e in entries:
+        buckets.get(e.section, buckets["deck"]).append(e)
+
+    lines = []
+    first = True
+    for section in ORDER:
+        if not buckets[section]:
+            continue
+        if not first:
+            lines.append("")
+        lines.append(section.capitalize())
+        for e in buckets[section]:
+            lines.append(f"{e.count} {e.name} ({e.set_code}) {e.collector}")
+        first = False
+    lines.append("")  # trailing newline
+    return "\n".join(lines)
+
+
 # ---------- card / printing -----------------------------------------------
 
 
@@ -829,6 +938,43 @@ def cmd_printing(args: argparse.Namespace) -> int:
         _emit_json(_card_to_json(c))
     else:
         print(_format_card(c))
+    return 0
+
+
+def cmd_printings(args: argparse.Namespace) -> int:
+    """List all Arena-legal printings of a card, sorted by release date (newest first)."""
+    _warn_if_stale()
+    printings = _get_arena_printings(_load_index(), args.name)
+    if not printings:
+        print(f"no Arena printings found: {args.name}", file=sys.stderr)
+        return 1
+
+    # Sort by released_at descending (newest first)
+    sorted_prints = sorted(
+        printings,
+        key=lambda p: p.get("released_at", ""),
+        reverse=True
+    )
+
+    if getattr(args, "json", False):
+        _emit_json([{
+            "name": p["name"],
+            "set": p["set"].upper(),
+            "collector_number": p["collector_number"],
+            "released_at": p.get("released_at", ""),
+            "rarity": p.get("rarity", "?"),
+            "cmc": p.get("cmc"),
+            "type_line": p.get("type_line", ""),
+        } for p in sorted_prints])
+    else:
+        print(f"{sorted_prints[0]['name']} — {len(sorted_prints)} Arena printing(s):\n")
+        for p in sorted_prints:
+            rarity = p.get("rarity", "?").capitalize()
+            released = p.get("released_at", "?")
+            print(
+                f"  ({p['set'].upper():<4}) {p['collector_number']:<6} "
+                f"{rarity:<8} {released}"
+            )
     return 0
 
 
@@ -1206,6 +1352,95 @@ def cmd_validate(args: argparse.Namespace) -> int:
     entries = parse_deck(path)
     fmt = args.format.lower()
 
+    # Printing mismatch check (always) and optional fixing
+    idx = _load_index()
+    mismatches = []
+    non_importable_promos = {
+        'boosterfun', 'draculaseries', 'showcase', 'extendedart', 'borderless', 'textured'
+    }
+
+    for e in entries:
+        # Check if this is a non-importable promotional variant (not importable in MTGA)
+        found = idx["by_printing"].get((e.set_code.lower(), e.collector))
+        if found:
+            promo_types = set(found.get("promo_types") or [])
+            if promo_types.intersection(non_importable_promos):
+                # This is a promotional variant that won't import to MTGA
+                mismatches.append(e)
+                continue
+
+        # Check if (set, collector) resolves to the expected card name
+        if not _check_printing_match(idx, e):
+            mismatches.append(e)
+
+    # Handle --fix or --preview-unsafe
+    fixes_applied = []
+    fixes_skipped = []
+    if getattr(args, "fix", False) or getattr(args, "preview_unsafe", False):
+        fixed_entries = []
+        # --preview-unsafe implies unsafe=True
+        unsafe_mode = getattr(args, "unsafe", False) or getattr(args, "preview_unsafe", False)
+        for e in entries:
+            if e in mismatches:
+                result = _try_fix_entry(idx, e, unsafe=unsafe_mode)
+                if result[0] is not None:
+                    fixed = result[0]
+                    mode = result[1]
+                    fixed_entries.append(fixed)
+                    fixes_applied.append({
+                        "name": e.name,
+                        "old_set": e.set_code,
+                        "old_collector": e.collector,
+                        "new_set": fixed.set_code,
+                        "new_collector": fixed.collector,
+                        "mode": mode,
+                    })
+                else:
+                    fixed_entries.append(e)
+                    reason = result[1]
+                    fixes_skipped.append({
+                        "name": e.name,
+                        "old_set": e.set_code,
+                        "old_collector": e.collector,
+                        "reason": reason,
+                    })
+            else:
+                fixed_entries.append(e)
+
+        # Write fixed entries back to file (unless --dry-run or --preview-unsafe)
+        wrote_path = None
+        if fixes_applied and not getattr(args, "dry_run", False) and not getattr(args, "preview_unsafe", False):
+            path.write_text(_serialize_deck(fixed_entries))
+            wrote_path = str(path)
+            # Re-parse to validate the fixed deck
+            entries = fixed_entries
+        elif (getattr(args, "dry_run", False) or getattr(args, "preview_unsafe", False)) and (fixes_applied or fixes_skipped):
+            if getattr(args, "preview_unsafe", False):
+                print("(--preview-unsafe: showing what --unsafe would fix, not applied)")
+            else:
+                print("(--dry-run: showing what would be changed, not written)")
+
+    # Warnings for mismatches (even without --fix)
+    warnings = []
+    if not getattr(args, "fix", False) and not getattr(args, "preview_unsafe", False) and mismatches:
+        for e in mismatches:
+            arena_prints = _get_arena_printings(idx, e.name)
+            if arena_prints:
+                if len(arena_prints) == 1:
+                    correct_set = arena_prints[0]["set"].upper()
+                    correct_col = arena_prints[0]["collector_number"]
+                    warnings.append(
+                        f"{e.name} ({e.set_code}) {e.collector}: printing mismatch — "
+                        f"correct: ({correct_set}) {correct_col}. Run with --fix to auto-correct."
+                    )
+                else:
+                    # Multiple printings - suggest --fix with --unsafe
+                    warnings.append(
+                        f"{e.name} ({e.set_code}) {e.collector}: printing mismatch "
+                        f"({len(arena_prints)} Arena printings). Run with --fix to fix obvious ones, "
+                        f"or --preview-unsafe to see all options."
+                    )
+
     strict_castable = bool(getattr(args, "strict_castable", False))
     if getattr(args, "json", False):
         code, msgs = validate_deck(entries, fmt, strict_castable=strict_castable)
@@ -1213,16 +1448,41 @@ def cmd_validate(args: argparse.Namespace) -> int:
         total = sum(
             e.count for e in entries if e.section in {"deck", "commander"}
         )
-        _emit_json({
+        payload = {
             "deck": str(path),
             "format": fmt,
             "ok": code == 0,
             "errors": msgs,
-            "warnings": [],
+            "warnings": warnings,
             "card_total": total,
             "commander": cmdrs[0] if cmdrs else None,
-        })
+        }
+        if getattr(args, "fix", False) or getattr(args, "preview_unsafe", False):
+            payload["fixes"] = fixes_applied
+            payload["fix_skipped"] = fixes_skipped
+            payload["wrote"] = wrote_path if 'wrote_path' in locals() else None
+        _emit_json(payload)
         return code
+
+    # Print mismatch warnings
+    if warnings:
+        for w in warnings:
+            print(f"  ⚠ {w}")
+
+    # Print fix results (if --fix or --preview-unsafe)
+    if getattr(args, "fix", False) or getattr(args, "preview_unsafe", False):
+        if fixes_applied:
+            for fix in fixes_applied:
+                print(
+                    f"  ✓ {fix['name']}: ({fix['old_set']}) {fix['old_collector']} "
+                    f"→ ({fix['new_set']}) {fix['new_collector']} [{fix['mode']}]"
+                )
+        if fixes_skipped:
+            for skip in fixes_skipped:
+                print(
+                    f"  ✗ {skip['name']}: ({skip['old_set']}) {skip['old_collector']} — "
+                    f"{skip['reason']}"
+                )
 
     if args.verbose:
         cmdr_entry = next((e for e in entries if e.section == "commander"), None)
@@ -11369,6 +11629,23 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(func=cmd_printing)
 
     s = sub.add_parser(
+        "printings",
+        help="list all Arena-legal printings of a card",
+        description=(
+            "List every Arena-legal printing of a card, sorted by release date "
+            "(newest first). Helps when `validate --preview-unsafe` shows "
+            "multiple ambiguous printings and you want to inspect which is best."
+        ),
+    )
+    s.add_argument(
+        "name",
+        help="card name (Arena-style; case-insensitive). Multi-face cards "
+        "accept either face or `Front // Back`.",
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_printings)
+
+    s = sub.add_parser(
         "legal",
         help="check legality in an Arena format",
         description=(
@@ -11419,6 +11696,22 @@ def main(argv: list[str] | None = None) -> int:
             "against the union of non-land CIs in the deck. Catches "
             "uncastable cards (e.g. UB card in mono-B deck)."
         ),
+    )
+    s.add_argument(
+        "--fix", action="store_true", default=False,
+        help="auto-correct wrong collector numbers (safe: only when 1 Arena printing exists)",
+    )
+    s.add_argument(
+        "--unsafe", action="store_true", default=False,
+        help="with --fix: pick newest printing when multiple Arena printings exist",
+    )
+    s.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="with --fix: show what would change without writing the file",
+    )
+    s.add_argument(
+        "--preview-unsafe", action="store_true", default=False,
+        help="show what --unsafe would fix without applying (preview mode)",
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_validate)
