@@ -15,17 +15,17 @@ Deck
 1 Daxos, Blessed by the Sun (THB) 9
 1 Lightstall Inquisitor (EOE) 24
 1 Roaming Throne (LCI) 258
-1 Giver of Runes (HA7) 2
-1 Starling, Aerial Ally (OM1) 10
-1 Malamet War Scribe (LCI) 21
+1 Momo, Playful Pet (TLA) 30
+1 Appa, Loyal Sky Bison (TLA) 9
+1 Sally Pride, Lioness Leader (ATMT) 3
 1 Felidar Savior (FDN) 12
 1 Lyra Dawnbringer (DOM) 26
-1 Phelia, Exuberant Shepherd (AMH3) 46
+1 Spectacular Spider-Man (SPM) 241
 1 Resplendent Angel (M19) 34
-1 Arachne, Psionic Weaver (PSPM) 2s
-1 Angel of Grace (RNA) 1
+1 Silver Sable, Mercenary Leader (OM1) 12
+1 Syr Alin, the Lion's Claw (ELD) 32
 1 Witch Enchanter // Witch-Blessed Meadow (MH3) 239
-1 Flowerfoot Swordmaster (TBLB) 1
+1 Zack Fair (PMEI) 2026-3
 1 Elspeth, Storm Slayer (TDM) 11
 1 Swords to Plowshares (SPG) 54
 1 Unwanted Remake (DSK) 39
@@ -33,13 +33,13 @@ Deck
 1 Exorcise (DSK) 8
 1 Sungold Barrage (DBL) 36
 1 Not on My Watch (MKM) 28
-1 Luminous Bonds (RIX) 12
+1 Pacifism (WC04) gn33sb
 1 Flowering of the White Tree (PLTR) 15s
-1 Lightning Greaves (CMA) 220
+1 Agatha's Soul Cauldron (WOE) 242
 1 Sheltered by Ghosts (DSK) 30
 1 Banishing Light (BLB) 1
 1 Dawn's Truce (BLB) 9
-1 Excalibur II (PFIN) 257s
+1 Stone of Erech (LTR) 702
 1 Stroke of Midnight (WOE) 33
 1 Trapped in the Screen (DSK) 36
 1 Day of Judgment (STA) 2
@@ -47,10 +47,10 @@ Deck
 1 Patchwork Banner (BLB) 247
 1 Farewell (NEO) 436
 1 Sunfall (MOM) 40
-1 Grand Entryway // Elegant Rotunda (DSK) 287
+1 Valkyrie's Call (FDN) 27
 1 Ghost Vacuum (DSK) 248
 1 Arcane Signet (ELD) 331
-1 Omni-Cheese Pizza (TMT) 176
+1 Instant Ramen (FIN) 259
 1 Coldsteel Heart (PLST) CM2-181
 1 Swiftfoot Boots (FDN) 258
 1 Heraldic Banner (ELD) 222
@@ -70,7 +70,7 @@ Deck
 1 Rogue's Passage (PIO) 273
 1 Reliquary Tower (M19) 254
 1 Soulstone Sanctuary (FDN) 133
-1 Eiganjo, Seat of the Empire (PRM) 98121
+1 Three Tree City (BLB) 338
 1 Gemstone Caverns (EOS) 16
-1 Plains (CMA) 292
+1 Eiganjo, Seat of the Empire (PRM) 98121
 1 Windswept Heath (MH3) 235
