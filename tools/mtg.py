@@ -2914,6 +2914,76 @@ def _decks_from_log(text: str) -> tuple[dict[int, int], int]:
 # ---- query helpers ----------------------------------------------------
 
 
+def _format_collection_diff(
+    prev: dict[int, int] | None, new: dict[int, int], idx: dict
+) -> list[str]:
+    """Human-readable summary of what changed between two snapshots.
+
+    Both dicts are arena_id -> copies. `prev=None` means no prior snapshot
+    (first-time import). Diff is rolled up to card-name granularity so that
+    re-prints across multiple sets count as one card.
+    """
+    if prev is None:
+        agg = _aggregate_by_name(idx, new)
+        rarity_counts: dict[str, int] = {}
+        for slot in agg.values():
+            r = slot.get("rarity") or "unknown"
+            rarity_counts[r] = rarity_counts.get(r, 0) + 1
+        rarity_str = ", ".join(
+            f"{rarity_counts[r]} {r}"
+            for r in ("mythic", "rare", "uncommon", "common")
+            if rarity_counts.get(r)
+        )
+        return [
+            f"first snapshot: {len(agg)} unique cards"
+            + (f" ({rarity_str})" if rarity_str else "")
+        ]
+
+    prev_by_name = _aggregate_by_name(idx, prev)
+    new_by_name = _aggregate_by_name(idx, new)
+
+    new_names = sorted(set(new_by_name) - set(prev_by_name))
+    removed_names = sorted(set(prev_by_name) - set(new_by_name))
+
+    extra_copies = 0
+    fewer_copies = 0
+    for key in set(prev_by_name) & set(new_by_name):
+        delta = new_by_name[key]["owned"] - prev_by_name[key]["owned"]
+        if delta > 0:
+            extra_copies += delta
+        elif delta < 0:
+            fewer_copies += -delta
+
+    lines: list[str] = []
+    if new_names:
+        rarity_counts = {}
+        for key in new_names:
+            r = new_by_name[key].get("rarity") or "unknown"
+            rarity_counts[r] = rarity_counts.get(r, 0) + 1
+        rarity_str = ", ".join(
+            f"{rarity_counts[r]} {r}"
+            for r in ("mythic", "rare", "uncommon", "common")
+            if rarity_counts.get(r)
+        )
+        head = f"+{len(new_names)} new cards"
+        if rarity_str:
+            head += f" ({rarity_str})"
+        sample = [new_by_name[k]["name"] for k in new_names[:5]]
+        head += ": " + ", ".join(sample)
+        if len(new_names) > 5:
+            head += f", … (+{len(new_names) - 5} more)"
+        lines.append(head)
+    if extra_copies:
+        lines.append(f"+{extra_copies} extra copies of cards already owned")
+    if removed_names:
+        lines.append(f"-{len(removed_names)} cards no longer present")
+    if fewer_copies:
+        lines.append(f"-{fewer_copies} fewer copies of retained cards")
+    if not lines:
+        lines.append("no changes vs. previous snapshot")
+    return lines
+
+
 def _aggregate_by_name(
     idx: dict, cards: dict[int, int]
 ) -> dict[str, dict]:
@@ -3515,6 +3585,8 @@ def cmd_collection_dump(args: argparse.Namespace) -> int:
     _warn_if_stale()
     _warn_if_collection_stale()
     out_path = Path(args.out).expanduser() if args.out else (DATA / "collection.dump.json")
+    prev_snap = _load_collection()
+    prev_cards = _cards_owned(prev_snap) if prev_snap is not None else None
     cards = _inject_dump(out_path)
     if not cards:
         sys.exit(
@@ -3529,6 +3601,9 @@ def cmd_collection_dump(args: argparse.Namespace) -> int:
         f"({sum(cards.values())} total copies) → {out}",
         file=sys.stderr,
     )
+    idx = _load_index()
+    for line in _format_collection_diff(prev_cards, cards, idx):
+        print(line, file=sys.stderr)
     return 0
 
 
@@ -4502,6 +4577,54 @@ def _card_uncoverable_pip(
         if front_fail is None:
             front_fail = face_fail
     return front_fail
+
+
+def _wilson_lower_bound(
+    wins: float, n: int, *, confidence: float = 0.95
+) -> float:
+    """Wilson score interval lower bound for a binomial proportion.
+
+    Used by `meta-rank` to avoid the n=31 / 60%-winrate trap: a small-
+    sample high-winrate deck gets a wide CI and ranks below a large-
+    sample 55% deck. `wins` may be fractional (winrate * sample,
+    rounded).
+    """
+    import math
+    if n <= 0:
+        return 0.0
+    z = {0.90: 1.6449, 0.95: 1.9600, 0.99: 2.5758}.get(
+        round(confidence, 2), 1.9600,
+    )
+    p = wins / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return (centre - margin) / denom
+
+
+_FULL_WUBRG = frozenset({"W", "U", "B", "R", "G"})
+_CI_PIPS = {"w": "W", "u": "U", "b": "B", "r": "R", "g": "G"}
+
+
+def _parse_ci_filter(spec: str) -> tuple[frozenset[str], str, str]:
+    """Parse --ci into (color_set, mode_hint, label).
+
+    mode_hint is '', 'force_exact', or 'mono'. Caller resolves the
+    final mode by combining mode_hint with the explicit --ci-mode arg
+    (mode_hint='force_exact' wins to avoid the `--ci 5c` silent-no-op
+    when subset mode is in effect — every deck CI is ⊆ WUBRG).
+    """
+    raw = (spec or "").strip().lower()
+    if not raw:
+        return (frozenset(), "", "")
+    if raw == "wubrg-mono":
+        return (_FULL_WUBRG, "mono", "wubrg-mono")
+    if raw in {"5c", "wubrg"}:
+        return (_FULL_WUBRG, "force_exact", raw)
+    pips = frozenset(_CI_PIPS[c] for c in raw if c in _CI_PIPS)
+    if pips == _FULL_WUBRG:
+        return (pips, "force_exact", "wubrg")
+    return (pips, "", "".join(sorted(pips)).lower() or "c")
 
 
 def _compute_deck_ci(
@@ -6463,42 +6586,62 @@ def _archetype_for_deck(deck_path: Path) -> str:
     return deck_path.stem
 
 
+FREQ_INDEX_SCHEMA = 2
+
+
 def _compute_freq_index(fmt: str) -> dict:
     """Walk `data/corpus/<fmt>/*.txt` and tally per-card stats.
 
-    Schema is consumer-stable (F2/F3/F4 read this directly):
-      - `deck_count` / `deck_pct` — main+sideboard combined membership
-      - `total_main` / `total_sideboard` — copy split (commander &
-        companion fold into main: 1 commander + 1 companion = 1 main copy
-        each, matching how the deck legally plays)
-      - `archetypes` — sorted unique archetype slugs (filename stems by
-        default; sidecar `archetype` overrides for human-readable runs)
-      - `basic` flag — every deck has Forests; consumers ranking by
-        `deck_pct` should drop them rather than have us drop them here
-        (single source of truth for "is X a basic" lives in `_is_basic`)
+    Schema (`schema: 2`) is consumer-stable. Top-level keys:
+      - `cards` — per-card stats (F2/F3/F4 read this directly):
+        - `deck_count` / `deck_pct` — main+sideboard combined membership
+        - `total_main` / `total_sideboard` — copy split (commander &
+          companion fold into main: 1 commander + 1 companion = 1 main
+          copy each, matching how the deck legally plays)
+        - `archetypes` — sorted unique archetype slugs (filename stems
+          by default; sidecar `archetype` overrides for human-readable
+          runs)
+        - `basic` flag — every deck has Forests; consumers ranking by
+          `deck_pct` should drop them rather than have us drop them
+          here (single source of truth for "is X a basic" lives in
+          `_is_basic`)
+      - `commanders` — per-commander deck count (brawl only; empty for
+        60-card formats). Keyed by canonical Scryfall name (multi-face
+        rendered as `Front // Back`; partner pairs collapsed as
+        `"X + Y"` lexicographically sorted).
+      - `archetypes` — per-archetype deck count, keyed by the sidecar
+        `archetype` string (filename stem when sidecar absent).
 
     Variant-weighted aggregation: each on-disk deck file is the
-    representative of `meta.variant_count` near-duplicate uploads (cluster
-    survivors from `fetch-meta` near-dup compaction). All count-style
-    aggregates (`deck_count`, `total_copies`, `total_main`,
-    `total_sideboard`, `corpus_size`) sum the representative's contribution
-    by `variant_count` so that clustered staples retain their statistical
-    weight despite the dedup. Sidecar-less files default to 1 (no-op).
+    representative of `meta.variant_count` near-duplicate uploads
+    (cluster survivors from `fetch-meta` near-dup compaction). All
+    count-style aggregates (`deck_count`, `total_copies`, `total_main`,
+    `total_sideboard`, `corpus_size`) sum the representative's
+    contribution by `variant_count` so that clustered staples retain
+    their statistical weight despite the dedup. Sidecar-less files
+    default to 1 (no-op).
     """
     files = _corpus_deck_files(fmt)
     if not files:
         return {
+            "schema": FREQ_INDEX_SCHEMA,
             "format": fmt,
             "computed_at": _dt.date.today().isoformat(),
             "corpus_size": 0,
             "total_card_copies": 0,
             "unresolved_cards": 0,
             "cards": {},
+            "commanders": {},
+            "archetypes": {},
         }
 
     # Per-card running stats keyed by canonical Scryfall name.
     stats: dict[str, dict[str, Any]] = {}
     archetypes_per_card: dict[str, set[str]] = {}
+    commanders_idx: dict[str, dict[str, Any]] = {}
+    commanders_archs: dict[str, set[str]] = {}
+    archetypes_idx: dict[str, dict[str, Any]] = {}
+    archetypes_cmds: dict[str, set[str]] = {}
     total_copies = 0
     unresolved = 0
     corpus_size = 0
@@ -6510,11 +6653,13 @@ def _compute_freq_index(fmt: str) -> dict:
         vc_raw = meta.get("variant_count")
         weight = vc_raw if isinstance(vc_raw, int) and vc_raw >= 1 else 1
         corpus_size += weight
+        entries = parse_deck(path)
+        commander_label = _commander_label_for_entries(entries, fmt)
         # Per-deck membership: a card present in main + sideboard counts
         # as one deck for `deck_count` (spec: "main+sideboard combined"),
         # multiplied by the cluster's variant_count.
         seen_in_deck: set[str] = set()
-        for entry in parse_deck(path):
+        for entry in entries:
             if entry.section == "maybeboard":
                 continue
             if entry.section not in {"deck", "commander", "companion", "sideboard"}:
@@ -6550,6 +6695,24 @@ def _compute_freq_index(fmt: str) -> dict:
                 seen_in_deck.add(name)
                 row["deck_count"] += weight
                 archetypes_per_card[name].add(archetype or slug)
+        if commander_label:
+            crow = commanders_idx.get(commander_label)
+            if crow is None:
+                crow = {"deck_count": 0, "deck_pct": 0.0, "archetypes": []}
+                commanders_idx[commander_label] = crow
+                commanders_archs[commander_label] = set()
+            crow["deck_count"] += weight
+            if archetype:
+                commanders_archs[commander_label].add(archetype)
+        if archetype:
+            arow = archetypes_idx.get(archetype)
+            if arow is None:
+                arow = {"deck_count": 0, "deck_pct": 0.0, "commanders": []}
+                archetypes_idx[archetype] = arow
+                archetypes_cmds[archetype] = set()
+            arow["deck_count"] += weight
+            if commander_label:
+                archetypes_cmds[archetype].add(commander_label)
 
     for name, row in stats.items():
         row["deck_pct"] = (
@@ -6560,14 +6723,57 @@ def _compute_freq_index(fmt: str) -> dict:
         ) if row["deck_count"] else 0.0
         row["archetypes"] = sorted(archetypes_per_card[name])
 
+    for cname, crow in commanders_idx.items():
+        crow["deck_pct"] = (
+            round(crow["deck_count"] / corpus_size, 4) if corpus_size else 0.0
+        )
+        crow["archetypes"] = sorted(commanders_archs[cname])
+
+    for aname, arow in archetypes_idx.items():
+        arow["deck_pct"] = (
+            round(arow["deck_count"] / corpus_size, 4) if corpus_size else 0.0
+        )
+        arow["commanders"] = sorted(archetypes_cmds[aname])
+
     return {
+        "schema": FREQ_INDEX_SCHEMA,
         "format": fmt,
         "computed_at": _dt.date.today().isoformat(),
         "corpus_size": corpus_size,
         "total_card_copies": total_copies,
         "unresolved_cards": unresolved,
         "cards": stats,
+        "commanders": commanders_idx,
+        "archetypes": archetypes_idx,
     }
+
+
+def _commander_label_for_entries(
+    entries: list[DeckEntry], fmt: str
+) -> str | None:
+    """Canonical commander label for a deck.
+
+    Walks `section=="commander"` entries, resolves each through
+    `_resolve_card` to get the canonical Scryfall name (handles A-
+    prefix and multi-face cards — Scryfall's `name` already renders
+    them as `Front // Back`). Partner pairs are joined as `"X + Y"`
+    sorted lexicographically so the same pair always collapses to one
+    label. Returns None when no commander section exists (60-card
+    formats) or no commander entry resolves.
+    """
+    names: list[str] = []
+    for e in entries:
+        if e.section != "commander":
+            continue
+        card = _resolve_card(e.name)
+        nm = (card.get("name") if card else None) or e.name
+        if nm and nm not in names:
+            names.append(nm)
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    return " + ".join(sorted(names))
 
 
 def _freq_index_path(fmt: str) -> Path:
@@ -6627,9 +6833,20 @@ def _warn_if_corpus_stale(fmt: str) -> None:
 
 
 def _freq_index_is_stale(fmt: str) -> bool:
-    """True if `_freq.json` is missing or older than any deck file."""
+    """True if `_freq.json` is missing, schema-bumped, or older than
+    any deck file."""
     idx_path = _freq_index_path(fmt)
     if not idx_path.exists():
+        return True
+    # Schema bump forces a one-time rebuild so consumers that read the
+    # new top-level keys (`commanders`, `archetypes`) don't see a
+    # silently-empty payload. Probe via a small read; on any error,
+    # treat as stale.
+    try:
+        head = json.loads(idx_path.read_text())
+        if int(head.get("schema") or 0) < FREQ_INDEX_SCHEMA:
+            return True
+    except (OSError, json.JSONDecodeError):
         return True
     idx_mtime = idx_path.stat().st_mtime
     for p in _corpus_deck_files(fmt):
@@ -6696,13 +6913,219 @@ def _freq_rows_sorted(index: dict) -> list[tuple[str, dict]]:
     )
 
 
+def _cmd_freq_by_group(
+    args: argparse.Namespace,
+    fmt: str,
+    files: list[Path],
+    index: dict,
+    by: str,
+) -> int:
+    """Handle `freq --by commander|archetype`.
+
+    Two modes:
+      * default — list groups sorted by `deck_count` desc
+      * `--card NAME` — scope: walk only decks in the group matching
+        NAME (commander/archetype) and emit the per-card freq table
+        over just those decks (a one-pass walk; not cached on disk)
+    """
+    group_dict_key = "commanders" if by == "commander" else "archetypes"
+    groups: dict[str, dict] = index.get(group_dict_key) or {}
+
+    if by == "commander" and not groups:
+        # 60-card formats: no commander section in any deck.
+        if not args.json:
+            print(
+                f"[info] no commander section in {fmt} corpus "
+                f"(freq --by commander is brawl-only)",
+                file=sys.stderr,
+            )
+        if args.json:
+            _emit_json({
+                "format": fmt, "by": by,
+                "computed_at": index.get("computed_at"),
+                "corpus_size": index.get("corpus_size", 0),
+                "shown": 0, "total_groups": 0, "groups": [],
+            })
+        return 0
+
+    if args.card:
+        # Group-scoped per-card frequency. The user passes a commander
+        # or archetype name in --card (mild overload, but documented).
+        canonical = args.card
+        if by == "commander":
+            card = _resolve_card(args.card)
+            if card and isinstance(card.get("name"), str):
+                canonical = card["name"]
+        if canonical not in groups:
+            # Try case-insensitive fallback.
+            match = next(
+                (k for k in groups if k.lower() == canonical.lower()),
+                None,
+            )
+            if match is None:
+                print(
+                    f"{canonical}: not in {fmt} freq index ({by})",
+                    file=sys.stderr,
+                )
+                return 1
+            canonical = match
+        scoped = _freq_scoped_to_group(files, fmt, canonical, by)
+        rows = sorted(
+            scoped["cards"].items(),
+            key=lambda kv: (
+                -float(kv[1].get("deck_pct") or 0.0),
+                -int(kv[1].get("deck_count") or 0),
+                kv[0],
+            ),
+        )
+        limit = None if args.all else 30
+        shown = rows if limit is None else rows[:limit]
+        if args.json:
+            _emit_json({
+                "format": fmt, "by": by, "group": canonical,
+                "corpus_size_in_group": scoped["corpus_size"],
+                "shown": len(shown),
+                "total_unique_cards": len(rows),
+                "cards": [{"name": n, **r} for n, r in shown],
+            })
+            return 0
+        print(
+            f"freq (fmt={fmt}, {by}={canonical}, "
+            f"in-group corpus={scoped['corpus_size']}, "
+            f"unique={len(rows)})"
+        )
+        print()
+        print(
+            f"  {'name':<40} {'pct':>6} {'decks':>5} "
+            f"{'copies':>6} {'main':>5} {'sb':>4}"
+        )
+        print(f"  {'-' * 40} {'-' * 6} {'-' * 5} {'-' * 6} {'-' * 5} {'-' * 4}")
+        for name, row in shown:
+            print(
+                f"  {name[:40]:<40} "
+                f"{row['deck_pct'] * 100:>5.1f}% "
+                f"{row['deck_count']:>5} "
+                f"{row['total_copies']:>6} "
+                f"{row['total_main']:>5} "
+                f"{row['total_sideboard']:>4}"
+            )
+        if limit is not None and len(rows) > limit:
+            print(f"\n  ... {len(rows) - limit} more (use --all)")
+        return 0
+
+    rows_sorted = sorted(
+        groups.items(),
+        key=lambda kv: (
+            -int(kv[1].get("deck_count") or 0),
+            kv[0].lower(),
+        ),
+    )
+    limit = None if args.all else 30
+    shown = rows_sorted if limit is None else rows_sorted[:limit]
+
+    if args.json:
+        _emit_json({
+            "format": fmt, "by": by,
+            "computed_at": index.get("computed_at"),
+            "corpus_size": index.get("corpus_size", 0),
+            "shown": len(shown),
+            "total_groups": len(rows_sorted),
+            "groups": [{"name": n, **r} for n, r in shown],
+        })
+        return 0
+
+    print(
+        f"freq --by {by} (fmt={fmt}, corpus={index.get('corpus_size', 0)}, "
+        f"groups={len(rows_sorted)})"
+    )
+    print()
+    print(f"  {'name':<48} {'decks':>5} {'pct':>6}")
+    print(f"  {'-' * 48} {'-' * 5} {'-' * 6}")
+    for name, row in shown:
+        print(
+            f"  {name[:48]:<48} "
+            f"{row['deck_count']:>5} "
+            f"{row['deck_pct'] * 100:>5.1f}%"
+        )
+    if limit is not None and len(rows_sorted) > limit:
+        print(f"\n  ... {len(rows_sorted) - limit} more (use --all)")
+    return 0
+
+
+def _freq_scoped_to_group(
+    files: list[Path],
+    fmt: str,
+    group_name: str,
+    by: str,
+) -> dict:
+    """One-pass per-card freq computation over only the decks in
+    `group_name` (commander or archetype). Not cached — invoked
+    rarely (interactive `--by ... --card` lookups)."""
+    stats: dict[str, dict[str, Any]] = {}
+    corpus_size = 0
+    for path in files:
+        meta = _load_deck_meta(path)
+        if by == "archetype":
+            arch = (meta.get("archetype") or "").strip()
+            if arch != group_name:
+                continue
+        else:
+            entries = parse_deck(path)
+            label = _commander_label_for_entries(entries, fmt)
+            if label != group_name:
+                continue
+        vc_raw = meta.get("variant_count")
+        weight = vc_raw if isinstance(vc_raw, int) and vc_raw >= 1 else 1
+        corpus_size += weight
+        seen: set[str] = set()
+        for entry in parse_deck(path):
+            if entry.section == "maybeboard":
+                continue
+            if entry.section not in {"deck", "commander", "companion", "sideboard"}:
+                continue
+            card = _resolve_card(entry.name)
+            if card is None:
+                continue
+            name = card.get("name") or entry.name
+            row = stats.get(name)
+            if row is None:
+                row = {
+                    "deck_count": 0, "deck_pct": 0.0,
+                    "total_copies": 0, "total_main": 0,
+                    "total_sideboard": 0,
+                }
+                stats[name] = row
+            inc = entry.count * weight
+            if entry.section == "sideboard":
+                row["total_sideboard"] += inc
+            else:
+                row["total_main"] += inc
+            row["total_copies"] += inc
+            if name not in seen:
+                seen.add(name)
+                row["deck_count"] += weight
+    for row in stats.values():
+        row["deck_pct"] = (
+            round(row["deck_count"] / corpus_size, 4) if corpus_size else 0.0
+        )
+    return {"corpus_size": corpus_size, "cards": stats}
+
+
 def cmd_freq(args: argparse.Namespace) -> int:
     """Card-frequency index over `data/corpus/<fmt>/*.txt`.
 
-    Three viewing modes:
-      * default — top 30 cards by `deck_pct` as a text table
-      * --card NAME — single-row lookup (resolved through Scryfall so
-        casing / A-prefix / multi-face front-only inputs all hit)
+    Grouping dimensions via `--by`:
+      * `card` (default) — per-card popularity
+      * `commander` — per-commander deck count (brawl only; empty for
+        60-card formats)
+      * `archetype` — per-archetype deck count (from meta.json)
+
+    Viewing modes:
+      * default — top 30 by `deck_pct` (or `deck_count` for non-card
+        groupings) as a text table
+      * --card NAME — for `--by card`, single-row card lookup; for
+        `--by commander|archetype`, scope the per-card freq table to
+        decks in that group
       * --json [--all] — machine-readable; top 30 unless `--all`
       * --rebuild — force recompute, write `_freq.json`, print summary
       * --no-rebuild — read-only; never touch disk on stale index
@@ -6728,6 +7151,8 @@ def cmd_freq(args: argparse.Namespace) -> int:
             f"wrote {out_path} "
             f"(corpus={index['corpus_size']}, "
             f"unique_cards={len(index['cards'])}, "
+            f"commanders={len(index.get('commanders') or {})}, "
+            f"archetypes={len(index.get('archetypes') or {})}, "
             f"copies={index['total_card_copies']}, "
             f"unresolved={index['unresolved_cards']}, "
             f"size={size_b}B)"
@@ -6741,6 +7166,10 @@ def cmd_freq(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    by = getattr(args, "by", "card") or "card"
+    if by != "card":
+        return _cmd_freq_by_group(args, fmt, files, index, by)
 
     cards = index.get("cards") or {}
 
@@ -6909,6 +7338,335 @@ def cmd_corpus_clean(args: argparse.Namespace) -> int:
         for r in reasons:
             print(f"      - {r}")
     return 0
+
+
+# ---------- meta-rank / corpus-stats --------------------------------------
+
+
+def _meta_rank_ci_match(
+    deck_ci: set[str] | None,
+    filter_set: frozenset[str],
+    *,
+    mode: str,
+    mode_hint: str,
+) -> bool:
+    """True if a deck's color identity satisfies the --ci filter."""
+    if deck_ci is None:
+        return False
+    if mode_hint == "mono":
+        return len(deck_ci) == 1
+    effective = "exact" if mode_hint == "force_exact" else mode
+    if effective == "exact":
+        return deck_ci == set(filter_set)
+    return deck_ci.issubset(filter_set)
+
+
+def cmd_meta_rank(args: argparse.Namespace) -> int:
+    """Rank corpus decks by Wilson-lower-bound winrate.
+
+    Joins `data/corpus/<fmt>/*.txt` against the per-deck meta.json
+    sidecar, filters by source / quality / min-sample / color-identity,
+    computes the Wilson lower bound of each deck's winrate, and sorts
+    desc. The lower bound prevents the n=31 / 60%-winrate trap where
+    a small-sample lucky deck outranks a large-sample reliable one.
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+    if args.min_sample < 1:
+        print("--min-sample must be >= 1", file=sys.stderr)
+        return 2
+    if not (0.0 < args.confidence < 1.0):
+        print("--confidence must be in (0, 1)", file=sys.stderr)
+        return 2
+
+    _warn_if_corpus_stale(fmt)
+
+    paths = _corpus_deck_files(fmt)
+    if not paths:
+        print(f"no corpus for {fmt}", file=sys.stderr)
+        return 1
+
+    ci_set, mode_hint, ci_label = _parse_ci_filter(args.ci or "")
+    sources_filter: set[str] | None = None
+    if args.source:
+        sources_filter = {s.strip() for s in args.source.split(",") if s.strip()}
+    quality_sources: frozenset[str] | None = (
+        _RECOMMEND_STRICT_SOURCES if args.quality == "strict" else None
+    )
+    effective_mode = "exact" if mode_hint == "force_exact" else args.ci_mode
+
+    rows: list[dict] = []
+    for p in paths:
+        row_meta = _load_deck_meta(p)
+        src = row_meta.get("source")
+        if sources_filter is not None and src not in sources_filter:
+            continue
+        if quality_sources is not None and src not in quality_sources:
+            continue
+        wr = row_meta.get("winrate")
+        sample = row_meta.get("sample")
+        wr_present = isinstance(wr, (int, float))
+        sample_present = isinstance(sample, int) and sample > 0
+        if not (wr_present and sample_present):
+            if not args.include_no_winrate:
+                continue
+            if wr_present and not sample_present:
+                print(
+                    f"[warn] {p.name}: winrate without sample; skipping",
+                    file=sys.stderr,
+                )
+                continue
+        if sample_present and sample < args.min_sample:
+            continue
+        try:
+            entries = parse_deck(p)
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[warn] {p.name}: parse error ({exc}); skipping", file=sys.stderr)
+            continue
+        deck_ci = _compute_deck_ci(entries, fmt)
+        if args.ci:
+            if not _meta_rank_ci_match(
+                deck_ci, ci_set, mode=args.ci_mode, mode_hint=mode_hint,
+            ):
+                continue
+        commander = _commander_label_for_entries(entries, fmt)
+        lb: float | None = None
+        if wr_present and sample_present:
+            lb = _wilson_lower_bound(
+                round(wr * sample), sample, confidence=args.confidence,
+            )
+        rows.append({
+            "deck": str(p),
+            "commander": commander,
+            "archetype": row_meta.get("archetype"),
+            "winrate": wr if wr_present else None,
+            "sample": sample if sample_present else None,
+            "wilson_lb": lb,
+            "source": src,
+            "url": row_meta.get("url"),
+            "ci": sorted(deck_ci) if deck_ci else [],
+        })
+
+    rows.sort(key=lambda r: (
+        0 if r["wilson_lb"] is not None else 1,
+        -(r["wilson_lb"] or 0.0),
+        -(r["sample"] or 0),
+        (r["archetype"] or "").lower(),
+    ))
+    shown = rows[: max(0, args.top)]
+    for i, r in enumerate(shown, 1):
+        r["rank"] = i
+
+    payload = {
+        "format": fmt,
+        "filter": {
+            "ci": ci_label or None,
+            "ci_mode": effective_mode,
+            "min_sample": args.min_sample,
+            "sources": sorted(sources_filter) if sources_filter else None,
+            "quality": args.quality,
+            "confidence": args.confidence,
+            "include_no_winrate": bool(args.include_no_winrate),
+        },
+        "considered": len(paths),
+        "after_filters": len(rows),
+        "shown": len(shown),
+        "decks": shown,
+    }
+
+    if args.json:
+        _emit_json(payload)
+        return 0
+    _render_meta_rank_table(payload)
+    return 0
+
+
+def _render_meta_rank_table(payload: dict) -> None:
+    """Pretty-print a meta-rank payload."""
+    f = payload["filter"]
+    flt_bits = [
+        f"min_sample={f['min_sample']}",
+        f"quality={f['quality']}",
+        f"conf={f['confidence']:.2f}",
+    ]
+    if f.get("ci"):
+        flt_bits.insert(0, f"ci={f['ci']}({f['ci_mode']})")
+    if f.get("sources"):
+        flt_bits.append("sources=" + ",".join(f["sources"]))
+    if f.get("include_no_winrate"):
+        flt_bits.append("+nullwr")
+    print(
+        f"meta-rank {payload['format']}  "
+        f"considered={payload['considered']} "
+        f"matched={payload['after_filters']} "
+        f"shown={payload['shown']}  [{'  '.join(flt_bits)}]"
+    )
+    if not payload["decks"]:
+        print("  (no decks match)")
+        return
+    print()
+    print(
+        f"  {'#':>2} {'commander/archetype':<42} "
+        f"{'WR':>6} {'n':>5} {'Wilson-LB':>10} "
+        f"{'CI':<6} {'src':<10}"
+    )
+    print(
+        f"  {'-' * 2} {'-' * 42} {'-' * 6} {'-' * 5} {'-' * 10} "
+        f"{'-' * 6} {'-' * 10}"
+    )
+    for r in payload["decks"]:
+        cmd = r.get("commander") or "—"
+        arch = r.get("archetype") or ""
+        label = cmd if cmd != "—" else arch
+        if cmd != "—" and arch and arch.lower() != cmd.lower():
+            label = f"{cmd} ({arch})"
+        wr = r.get("winrate")
+        wr_s = f"{wr * 100:>5.1f}%" if isinstance(wr, (int, float)) else "  -  "
+        sample = r.get("sample") or 0
+        lb = r.get("wilson_lb")
+        lb_s = f"{lb * 100:>8.2f}%" if isinstance(lb, (int, float)) else "      -  "
+        ci = "".join(r.get("ci") or []) or "C"
+        src = r.get("source") or "—"
+        print(
+            f"  {r['rank']:>2} {label[:42]:<42} "
+            f"{wr_s:>6} {sample:>5} {lb_s:>10} "
+            f"{ci:<6} {src:<10}"
+        )
+        url = r.get("url")
+        if url:
+            print(f"     {url}")
+
+
+def cmd_corpus_stats(args: argparse.Namespace) -> int:
+    """Snapshot diagnostic of `data/corpus/<fmt>/`.
+
+    Pure read-only roll-up: source mix, winrate coverage, sample-size
+    histogram (n=31 bucket called out separately because aetherhub's
+    tier-list winrate window clusters there), and the top archetype
+    names. Useful for spotting corpus-quality issues that bias
+    `recommend` / `meta-rank` rankings.
+    """
+    fmt = args.format.lower()
+    if fmt not in ARENA_FORMATS:
+        print(
+            f"format must be one of: {', '.join(sorted(ARENA_FORMATS))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    sidecar = CORPUS / fmt / "meta.json"
+    meta: dict[str, dict] = {}
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text())
+            if isinstance(data, dict):
+                meta = {k: v for k, v in data.items() if isinstance(v, dict)}
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"[warn] {sidecar} unreadable ({exc})",
+                file=sys.stderr,
+            )
+
+    sources = collections.Counter(
+        (v.get("source") or "<unknown>") for v in meta.values()
+    )
+    with_wr = sum(
+        1 for v in meta.values()
+        if isinstance(v.get("winrate"), (int, float))
+    )
+    buckets = {
+        "<30": 0, "31": 0, "32-61": 0, "62-123": 0,
+        "124-500": 0, "500+": 0, "null": 0,
+    }
+    for v in meta.values():
+        s = v.get("sample")
+        if not isinstance(s, int):
+            buckets["null"] += 1
+        elif s < 30:
+            buckets["<30"] += 1
+        elif s == 31:
+            buckets["31"] += 1
+        elif s <= 61:
+            buckets["32-61"] += 1
+        elif s <= 123:
+            buckets["62-123"] += 1
+        elif s <= 500:
+            buckets["124-500"] += 1
+        else:
+            buckets["500+"] += 1
+
+    arch_counts = collections.Counter(
+        (v.get("archetype") or "").strip() for v in meta.values()
+    )
+    arch_counts.pop("", None)
+    top_arch = [
+        {"archetype": a, "count": c}
+        for a, c in arch_counts.most_common()
+        if len(a) > 2
+    ][:10]
+    garbage = sorted({a for a in arch_counts if 0 < len(a) <= 2})
+
+    total = len(meta)
+    payload = {
+        "format": fmt,
+        "total_decks": total,
+        "sources": dict(sources.most_common()),
+        "winrate_coverage": {
+            "with": with_wr,
+            "without": total - with_wr,
+            "pct": round(with_wr / total, 4) if total else 0.0,
+        },
+        "sample_histogram": buckets,
+        "top_archetypes": top_arch,
+        "garbage_archetypes": garbage,
+    }
+
+    if args.json:
+        _emit_json(payload)
+        return 0
+    _render_corpus_stats(payload)
+    return 0
+
+
+def _render_corpus_stats(payload: dict) -> None:
+    print(
+        f"corpus-stats {payload['format']}  total={payload['total_decks']}"
+    )
+    print()
+    print("  sources:")
+    for src, n in payload["sources"].items():
+        print(f"    {src:<14} {n:>4}")
+    wr = payload["winrate_coverage"]
+    print()
+    print(
+        f"  winrate coverage: with={wr['with']} without={wr['without']} "
+        f"({wr['pct'] * 100:.1f}%)"
+    )
+    print()
+    print("  sample histogram:")
+    for k, n in payload["sample_histogram"].items():
+        if n == 0:
+            continue
+        note = "  (aetherhub tier-window floor)" if k == "31" else ""
+        print(f"    {k:<8} {n:>4}{note}")
+    print()
+    print("  top archetypes:")
+    if not payload["top_archetypes"]:
+        print("    (none)")
+    else:
+        for row in payload["top_archetypes"]:
+            print(f"    {row['archetype'][:40]:<40} {row['count']:>4}")
+    if payload["garbage_archetypes"]:
+        print()
+        print(
+            "  garbage archetype labels (len<=2): "
+            + ", ".join(repr(a) for a in payload["garbage_archetypes"])
+        )
 
 
 # ---------- shells <-> corpus archetype matching --------------------------
@@ -11091,8 +11849,19 @@ def main(argv: list[str] | None = None) -> int:
         help="read-only: never auto-rebuild a stale index",
     )
     s.add_argument(
+        "--by", choices=("card", "commander", "archetype"), default="card",
+        help=(
+            "grouping dimension: card (default) = per-card popularity; "
+            "commander = per-commander deck count (brawl only); "
+            "archetype = per-archetype deck count (from meta.json)"
+        ),
+    )
+    s.add_argument(
         "--card", default=None, metavar="NAME",
-        help="show this card's row (deck_count, deck_pct, archetypes)",
+        help=(
+            "with --by card: single-card row lookup. With --by commander|"
+            "archetype: scope the per-card freq table to decks in NAME."
+        ),
     )
     s.add_argument(
         "--all", action="store_true",
@@ -11100,6 +11869,99 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_json_flag(s)
     s.set_defaults(func=cmd_freq)
+
+    s = sub.add_parser(
+        "meta-rank",
+        help=(
+            "rank corpus decks by Wilson-LB winrate (CI/source/quality "
+            "filters)"
+        ),
+        description=(
+            "Rank every deck in data/corpus/<fmt>/ by the Wilson lower "
+            "bound on its meta.json winrate. The lower bound prevents "
+            "the n=31 / 60%-winrate trap: a small-sample lucky deck "
+            "no longer outranks a large-sample reliable one. Honors "
+            "--ci (color identity), --quality, --source, --min-sample, "
+            "and --confidence filters. Default sort: Wilson-LB desc, "
+            "ties broken by sample desc, then archetype."
+        ),
+    )
+    s.add_argument(
+        "format",
+        help="Arena format (must have a corpus under data/corpus/<format>/)",
+    )
+    s.add_argument(
+        "--ci", default=None, metavar="SPEC",
+        help=(
+            "color-identity filter: '5c' / 'wubrg' (exactly all five), "
+            "'wubrg-mono' (mono only), or any WUBRG subset like 'uw' / "
+            "'wubg'. '5c' and 'wubrg' auto-flip to exact mode."
+        ),
+    )
+    s.add_argument(
+        "--ci-mode", choices=("subset", "exact"), default="subset",
+        help=(
+            "subset (default): deck CI must be ⊆ filter (shell-builder "
+            "view); exact: deck CI == filter (tribe view). '5c'/'wubrg' "
+            "always exact-match."
+        ),
+    )
+    s.add_argument(
+        "--min-sample", type=int, default=32, metavar="N",
+        help=(
+            "drop decks with sample < N (default 32; excludes the "
+            "aetherhub tier-window n=31 floor)"
+        ),
+    )
+    s.add_argument(
+        "--source", default=None, metavar="LIST",
+        help="comma-separated source whitelist (e.g. aetherhub,untapped)",
+    )
+    s.add_argument(
+        "--quality", choices=("loose", "strict"), default="loose",
+        help=(
+            "strict: only winrate-bearing sources (untapped, aetherhub); "
+            "loose (default): all"
+        ),
+    )
+    s.add_argument(
+        "--top", type=int, default=20,
+        help="cap shown rows (default: 20)",
+    )
+    s.add_argument(
+        "--confidence", type=float, default=0.95,
+        help="Wilson z-score confidence level (default 0.95 → z=1.96)",
+    )
+    s.add_argument(
+        "--include-no-winrate", action="store_true",
+        help=(
+            "keep decks with null winrate; they sort to the bottom with "
+            "Wilson-LB=null"
+        ),
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_meta_rank)
+
+    s = sub.add_parser(
+        "corpus-stats",
+        help=(
+            "snapshot diagnostic over data/corpus/<fmt>/meta.json "
+            "(sources, winrates, samples, archetypes)"
+        ),
+        description=(
+            "Read-only roll-up of meta.json: total decks, source mix, "
+            "winrate coverage, sample-size histogram (n=31 bucket "
+            "called out separately because aetherhub's tier-window "
+            "winrate sample clusters there), and the top archetype "
+            "labels by deck count. No filters — this is a snapshot."
+        ),
+    )
+    s.add_argument(
+        "format",
+        help="Arena format (must have a corpus under data/corpus/<format>/)",
+    )
+    _add_json_flag(s)
+    s.set_defaults(func=cmd_corpus_stats)
 
     s = sub.add_parser(
         "corpus-clean",
